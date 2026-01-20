@@ -1830,7 +1830,6 @@ def integrated_gradients_smoothed(vae, head, X, which="rna", batch=128, steps=32
                 else:
                     yhat, _ = head(z_other, z_this, fr, fp)
 
-                (yhat.sum()).backward()
                 g = torch.autograd.grad(yhat.sum(), xin, retain_graph=False, create_graph=False)[0]
                 grads += g.detach().cpu().numpy()
 
