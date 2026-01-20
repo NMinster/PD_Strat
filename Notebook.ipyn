@@ -2009,7 +2009,14 @@ for pid, df_pid in traj.groupby("participant_id"):
         "resid_sd": resid_sd,
     })
 
-traj_participants = pd.DataFrame(rows)
+traj_participants = pd.DataFrame(rows, columns=[
+    "participant_id",
+    "subtype",
+    "n_visits",
+    "baseline_updrs",
+    "slope_per_year",
+    "resid_sd",
+])
 traj_participants.to_csv(TAB / "longitudinal_participant_slopes.csv", index=False)
 
 def _iqr(series: pd.Series) -> float:
