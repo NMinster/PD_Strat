@@ -1,0 +1,2408 @@
+#!/usr/bin/env python3
+# PD–Deep Precision Suite — v1.9e (deterministic + global HC + feature manifest + signatures+figs+UPSIT)
+
+import os, json, random, warnings, argparse, re, hashlib
+from pathlib import Path
+from typing import Tuple, List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# -----------------------------
+# Paths & Config
+# -----------------------------
+ROOT   = Path(".")
+OUT    = ROOT/"results"
+TAB    = OUT/"tables"
+DEEP   = OUT/"deep"
+FIG    = OUT/"figures"
+for p in [OUT, TAB, DEEP, FIG]: p.mkdir(parents=True, exist_ok=True)
+
+CFG_PATH = "config.yaml"
+CFG: Dict = {}
+if os.path.exists(CFG_PATH):
+    import yaml
+    with open(CFG_PATH, "r", encoding="utf-8") as f:
+        CFG = yaml.safe_load(f) or {}
+
+TRAIN_PREFIX = (CFG.get("train_cohort_prefix","PP-") or "PP-").upper()
+TEST_PREFIX  = (CFG.get("test_cohort_prefix","PD-")  or "PD-").upper()
+
+# -----------------------------
+# Pre-specified (no-leak) TEST choice
+# -----------------------------
+# You can override via config.yaml: chosen_mode: "raw" | "ot-fused"
+CHOSEN_MODE = (CFG.get("chosen_mode") or "ot-fused").lower()
+assert CHOSEN_MODE in {"raw","ot-fused"}, "chosen_mode must be 'raw' or 'ot-fused'"
+
+# -----------------------------
+# Determinism
+# -----------------------------
+SEED = 42
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+random.seed(SEED); np.random.seed(SEED)
+import torch
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+try: torch.use_deterministic_algorithms(True, warn_only=True)
+except Exception: pass
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------
+# CLI (adds: --hc_mode)
+# -----------------------------
+def build_argparser():
+    ap = argparse.ArgumentParser(description="PD–Deep Precision Suite v1.9e")
+    ap.add_argument("--train_pd_grid", action="store_true", default=True)
+    ap.add_argument("--calibrate", action="store_true", default=True)
+    ap.add_argument("--prot_coral", action="store_true", default=True)
+    ap.add_argument("--ig_per_subtype", action="store_true", default=True)
+    ap.add_argument("--ig_severity_tiers", action="store_true", default=True)
+    ap.add_argument("--lincs", action="store_true", default=True)
+    ap.add_argument("--save_artifacts", action="store_true", default=True)
+    ap.add_argument("--epochs", type=int, default=int(CFG.get("epochs", 90)))
+    ap.add_argument("--batch", type=int, default=int(CFG.get("batch", 128)))
+    ap.add_argument("--mc_T", type=int, default=int(CFG.get("mc_T", 50)))
+    ap.add_argument("--gmm_k", type=int, default=int(CFG.get("gmm_k", 3)))
+    ap.add_argument("--hc_mode", choices=["auto","global","site"], default=(CFG.get("hc_mode") or "global").lower())
+    return ap
+
+try: FLAGS = build_argparser().parse_args([])
+except SystemExit: FLAGS = build_argparser().parse_args()
+HC_MODE = FLAGS.hc_mode
+
+# -----------------------------
+# Run summary helper
+# -----------------------------
+def summary_update(extra: dict):
+    global summary
+    if "summary" not in globals(): summary = {}
+    summary.update(extra)
+    with open(DEEP/"summary.json","w") as f: json.dump(summary, f, indent=2)
+
+# -----------------------------
+# -----------------------------
+# Load clinical & targets (+UPSIT merge helper) — REWRITTEN
+# -----------------------------
+import re
+import pandas as pd
+import numpy as np
+
+# --- SUPER-ROBUST ID + MONTHS CONSTRUCTION ---
+
+clin_path = TAB / "clinical_unified.csv"
+if not clin_path.exists():
+    raise FileNotFoundError("Missing results/tables/clinical_unified.csv. Run the assembly first.")
+
+clin = pd.read_csv(clin_path)
+
+def _to_str_index(idx) -> pd.Index:
+    if isinstance(idx, pd.MultiIndex):
+        idx = idx.to_flat_index()
+    return pd.Index(["" if (isinstance(x, float) and np.isnan(x)) or x is None else str(x) for x in idx])
+
+# 1) Pick the best participant ID column, then make it the index (string-normalized)
+ID_CANDIDATES = [
+    "participant_id","patno","patient_id","subject_id","subject","id","record_id",
+    "ppid","pdid","pid","participant"
+]
+present_ids = [c for c in ID_CANDIDATES if c in clin.columns]
+def _choose_id(df: pd.DataFrame) -> str:
+    # prefer the first present with repetition (i.e., longitudinal)
+    for c in present_ids:
+        s = df[c]
+        nunique = s.dropna().astype(str).nunique()
+        n = len(s.dropna())
+        # require at least some repeats
+        if n >= 2 and nunique <= max(0.9*n, n-1):
+            return c
+    # fallback: first present; else synthesize from sample_id
+    if present_ids:
+        return present_ids[0]
+    if "sample_id" in df.columns:
+        return "sample_id"
+    # as last resort create a flat ID so code runs (but will show 0 longitudinal)
+    df["_tmp_id"] = np.arange(len(df))
+    return "_tmp_id"
+
+id_key = _choose_id(clin)
+clin[id_key] = _to_str_index(clin[id_key])
+print(f"[Infer] Using id_key = '{id_key}' (unique IDs={clin[id_key].nunique()} / rows={len(clin)})")
+
+# Make participant ID the index and guarantee string dtype (prevents .str errors later)
+clin = clin.set_index(id_key, drop=True)
+clin.index = _to_str_index(clin.index)
+
+# 2) Ensure numeric UPDRS total (reuse your helper if defined)
+if "updrs_total" not in clin.columns or pd.to_numeric(clin["updrs_total"], errors="coerce").isna().all():
+    def _ensure_total(df):
+        c = {x.lower(): x for x in df.columns}
+        for k in ["updrs_total","mds_updrs_total","mds_updrs_total_score","mds_updrs_total__sum","total_updrs"]:
+            if k in c:
+                return pd.to_numeric(df[c[k]], errors="coerce")
+        parts = []
+        for aliases in [
+            ("mds_updrs_part_i_total","updrs_part_i_total","mds_updrs_part_i_score"),
+            ("mds_updrs_part_ii_total","updrs_part_ii_total","mds_updrs_part_ii_score"),
+            ("mds_updrs_part_iii_total","updrs_part_iii_total","mds_updrs_part_iii_score"),
+            ("mds_updrs_part_iv_total","updrs_part_iv_total","mds_updrs_part_iv_score"),
+        ]:
+            for a in aliases:
+                aL = a.lower()
+                if aL in c:
+                    parts.append(c[aL]); break
+        if parts:
+            return pd.to_numeric(df[parts].sum(axis=1, min_count=1), errors="coerce")
+        return pd.to_numeric(df.get("updrs_total", np.nan), errors="coerce")
+    clin["updrs_total"] = _ensure_total(clin)
+
+# 3) Build MONTHS two ways: (A) from dates; (B) from visit labels
+
+# (A) DATE → months since subject baseline
+DATE_CANDIDATES = [
+    "visit_date","assessment_date","exam_date","draw_date","date","visitdt",
+    "visit_datetime","assessment_datetime","collection_date","sample_date"
+]
+date_cols = [c for c in DATE_CANDIDATES if c in clin.columns]
+months_from_dates = None
+if date_cols:
+    # pick the first parseable date column
+    for dc in date_cols:
+        ts = pd.to_datetime(clin[dc], errors="coerce", infer_datetime_format=True, utc=False)
+        if ts.notna().sum() >= 2:
+            # baseline per id = min date
+            # (index is participant id already)
+            base = ts.groupby(clin.index).transform("min")
+            months_from_dates = (ts - base).dt.days / 30.4375
+            break
+    if months_from_dates is not None:
+        clin["months"] = months_from_dates.astype(float)
+
+# Cohort flags
+clin["cohort"] = clin.get("cohort", pd.Series(index=clin.index, dtype=object)).astype(str).str.upper()
+is_train = clin["cohort"].eq("TRAIN")
+is_test  = clin["cohort"].eq("TEST")
+
+# Build/repair UPDRS total if needed (second chance if parts exist)
+updrs = pd.to_numeric(clin.get("updrs_total"), errors="coerce")
+if np.isfinite(updrs).sum() < 20:
+    part_cols = [c for c in clin.columns if "updrs" in c.lower() and any(x in c.lower() for x in ["part_i","part_ii","part_iii","part_iv","total_i","total_ii","total_iii","total_iv"])]
+    if part_cols:
+        clin["updrs_total"] = pd.to_numeric(clin[part_cols].sum(1), errors="coerce")
+        updrs = pd.to_numeric(clin["updrs_total"], errors="coerce")
+        print(f"[Sanity] Rebuilt updrs_total from parts (used {len(part_cols)} columns)")
+
+# UPSIT helper (tries clin first, then CFG['upsit_path'])
+def _ensure_upsit(clin_df: pd.DataFrame) -> pd.Series:
+    # Prefer an existing total
+    for k in ["upsit_total","UPSIT_total","UPSITTOTAL","upsit_score","upsit"]:
+        if k in clin_df.columns:
+            s = pd.to_numeric(clin_df[k], errors="coerce")
+            if np.isfinite(s).sum()>0:
+                clin_df["upsit_total"] = s; return clin_df["upsit_total"]
+    # Try merging from CFG path
+    up_path = CFG.get("upsit_path","")
+    if up_path and os.path.exists(up_path):
+        try:
+            df = pd.read_csv(up_path, sep=None, engine="python")
+            # Find id & best UPSIT-like column
+            id_col = next((c for c in df.columns if c.lower() in {"participant_id","participant","subject","patno","id"}), None)
+            if id_col is None: raise ValueError("No participant id column in upsit file.")
+            df["participant_id"] = df[id_col].astype(str)
+            # Choose numeric col with 'upsit' and 'total' pref
+            cand_cols = [c for c in df.columns if "upsit" in c.lower()]
+            num_cols = [c for c in cand_cols if pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_float_dtype(df[c])]
+            pick = None
+            for pref in ["total","score","sum"]:
+                for c in num_cols:
+                    if pref in c.lower(): pick=c; break
+                if pick: break
+            if not pick and num_cols: pick = num_cols[0]
+            if pick:
+                s = pd.to_numeric(df[pick], errors="coerce")
+                m = s.groupby(df["participant_id"]).max()
+                # map using index which is already participant_id strings
+                clin_df["upsit_total"] = m.reindex(clin_df.index)
+                print(f"[UPSIT] Merged UPSIT totals from {Path(up_path).name} (col='{pick}').")
+                return pd.to_numeric(clin_df["upsit_total"], errors="coerce")
+        except Exception as e:
+            print("[UPSIT] WARN merge failed:", e)
+    # Fallback: empty
+    clin_df["upsit_total"] = np.nan
+    return clin_df["upsit_total"]
+
+upsit = _ensure_upsit(clin)
+
+# Case/control + PD flagging (NO .str on index; robust prefix test)
+if "case_control" not in clin.columns:
+    clin["case_control"] = np.where(is_test, "CASE", "UNKNOWN")
+
+cc = clin.get("case_control", pd.Series(index=clin.index, dtype=object)).astype(str).str.upper()
+is_control = cc.isin(["CONTROL","CNTL","HC","HEALTHY"])
+
+# Identify TEST prefix by iterating index safely (no .str)
+is_test_prefix = np.fromiter(
+    (str(x).upper().startswith(TEST_PREFIX) for x in clin.index),
+    dtype=bool,
+    count=len(clin.index)
+)
+
+# Combine labels for PD flag and remove controls
+is_pd_flag = cc.isin(["CASE","PD","PARKINSONS","PATIENT","DISEASE"]) | is_test_prefix
+is_pd_flag = is_pd_flag & ~is_control
+
+# -----------------------------
+# ID mapping helper
+# -----------------------------
+def _map_participant_id(s: str) -> str:
+    pat = ((CFG.get("data_patterns") or {}).get("participant_pattern") or "split:-:0:2")
+    s = str(s)
+    if pat.startswith("split:"):
+        try:
+            _, sep, lo, hi = pat.split(":"); lo, hi = int(lo), int(hi)
+            bits = s.split(sep); lo = max(0, min(lo, len(bits))); hi = max(lo+1, min(hi, len(bits)))
+            return sep.join(bits[lo:hi])
+        except Exception:
+            return s
+    return s
+
+# -----------------------------
+# TRAIN Healthy Control table (from config path)
+# -----------------------------
+def _normlower(s): return pd.Series(s, dtype="object").astype(str).str.strip().str.lower()
+def _is_hc_rows(df_case):
+    diag_bl = _normlower(df_case.get("diagnosis_at_baseline")); diag_lt = _normlower(df_case.get("diagnosis_latest"))
+    c_bl    = _normlower(df_case.get("case_control_other_at_baseline"))
+    c_lt    = _normlower(df_case.get("case_control_other_latest"))
+    is_hc_diag = diag_bl.str.contains("no pd nor other", na=False) | diag_lt.str.contains("no pd nor other", na=False)
+    is_hc_cc   = c_bl.eq("control") | c_lt.eq("control")
+    return (is_hc_diag | is_hc_cc).fillna(False)
+
+def _load_case_control_table():
+    cc_path = CFG.get("case_control_path", "")
+    if not cc_path or not os.path.exists(cc_path): return None
+    df = None
+    try: df = pd.read_csv(cc_path, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:
+        ext = Path(cc_path).suffix.lower()
+        trial_seps = ['\t', ',', ';', '|'] if ext in ('.tsv', '.txt') else [',', '\t', ';', '|']
+        for s in trial_seps:
+            try: df = pd.read_csv(cc_path, sep=s, encoding="utf-8-sig"); break
+            except Exception: df = None
+        if df is None: raise ValueError(f"Could not parse case_control file at {cc_path}. Try setting an explicit separator.")
+    if "participant_id" not in df.columns:
+        cand = next((c for c in df.columns if c.strip().lower() in {"participant_id","participant","subject","patno","id"}), None)
+        if cand is None: raise ValueError("case_control file must contain a 'participant_id' (or similar) column.")
+        df = df.rename(columns={cand: "participant_id"})
+    df["participant_id_mapped"] = df["participant_id"].astype(str).map(_map_participant_id)
+    df = df.set_index("participant_id_mapped")
+    return df
+
+CASE_DF = _load_case_control_table()
+if CASE_DF is not None: print(f"[HC] Loaded case_control table from config path with {len(CASE_DF)} rows.")
+
+def _select_train_hc_ids(raw_index: pd.Index, min_n_global:int=30, min_n_site:int=15, per_site:bool=True):
+    if CASE_DF is None: return pd.Index([]), False
+    hc_mask = _is_hc_rows(CASE_DF)
+    hc_ids_all = CASE_DF.index[hc_mask]
+    hc_ids = pd.Index(hc_ids_all).intersection(clin.index[is_train]).intersection(raw_index)
+    if len(hc_ids) < min_n_global: return pd.Index([]), False
+    if per_site and ("site" in clin.columns):
+        site_counts = clin.loc[hc_ids, "site"].astype(str).value_counts()
+        per_site_ok = (site_counts >= min_n_site).any()
+        return hc_ids, bool(per_site_ok)
+    return hc_ids, False
+
+# -----------------------------
+# Manifest & Meta helpers
+# -----------------------------
+MANIFEST_PATH = TAB/"feature_manifest.json"
+META_PATH     = TAB/"zmeta.json"
+def _short_sha(cols):
+    if cols is None or len(cols)==0: return "NA"
+    s = "\n".join(map(str, cols)).encode("utf-8")
+    return hashlib.sha1(s).hexdigest()[:12]
+def _load_manifest():
+    if MANIFEST_PATH.exists():
+        try: return json.load(open(MANIFEST_PATH))
+        except Exception: return {}
+    return {}
+def _save_manifest(rna_cols=None, prot_cols=None):
+    m = _load_manifest()
+    if rna_cols is not None:
+        m["rna_cols"]  = list(map(str, rna_cols)); m["rna_sha12"] = _short_sha(m["rna_cols"])
+    if prot_cols is not None:
+        m["prot_cols"] = list(map(str, prot_cols)); m["prot_sha12"] = _short_sha(m["prot_cols"])
+    json.dump(m, open(MANIFEST_PATH,"w"), indent=2)
+def _load_meta():
+    if META_PATH.exists():
+        try: return json.load(open(META_PATH))
+        except Exception: return {}
+    return {}
+def _save_meta(name_csv, hc_mode, shape, sha12):
+    meta = _load_meta(); meta[name_csv] = dict(hc_mode=hc_mode, shape=shape, sha12=sha12)
+    json.dump(meta, open(META_PATH,"w"), indent=2)
+def _apply_manifest(Z: pd.DataFrame, key: str) -> pd.DataFrame:
+    man = _load_manifest(); want = man.get(f"{key}_cols")
+    if not want: return Z
+    have = set(Z.columns.astype(str)); missing = [c for c in want if c not in have]
+    if missing: print(f"[Manifest/{key}] WARNING: {len(missing)} columns missing in raw; keeping intersection.")
+    inter = [c for c in want if c in have]
+    return Z.loc[:, inter]
+
+# -----------------------------
+# Stable feature freeze knobs
+# -----------------------------
+CFG_LOCKS = dict(
+    rna_target_n    = int(CFG.get("rna_target_feature_count", 17488)),
+    prot_target_n   = int(CFG.get("prot_target_feature_count", 1168)),
+    prot_min_unique = int(CFG.get("prot_min_unique_analytes", 50)),
+    prot_value_col  = str(CFG.get("prot_value_col", "NPX")),
+    prot_feat_prio  = list(CFG.get("prot_feature_cols_priority",
+                        ["OlinkID","Assay","Target","Analyte","Protein","UniProt"])),
+)
+def _choose_col(cols, priority):
+    cl = {c.lower(): c for c in cols}
+    for want in priority:
+        if want.lower() in cl: return cl[want.lower()]
+    return None
+def _stable_top_features(Z, target_n:int, name:str, train_mask=None):
+    if Z.empty or target_n <= 0 or Z.shape[1] <= target_n: return Z
+    X = Z.values if train_mask is None or len(train_mask)!=len(Z.index) else Z.values[train_mask]
+    mrate = 1.0 - np.mean(pd.isna(X), axis=0); Xn = np.nan_to_num(X, nan=0.0); var = np.var(Xn, axis=0)
+    keep = var > 0
+    if keep.sum()==0: print(f"[Freeze/{name}] WARNING: zero-variance across all features."); return Z
+    cols_k = np.array(Z.columns)[keep]; m_k = mrate[keep]; v_k = var[keep]
+    order = np.lexsort((cols_k.astype(str), -v_k, -m_k))
+    chosen = cols_k[order][:target_n].tolist(); Z2 = Z.loc[:, chosen]
+    print(f"[Freeze/{name}] {Z.shape[1]} → {Z2.shape[1]} features (target={target_n})"); return Z2
+def _pivot_protein_file(path: str) -> Optional[pd.DataFrame]:
+    df = pd.read_csv(path, low_memory=False)
+    id_col = next((c for c in df.columns if c.lower() in {"participant_id","participant","subject","patno","id"}), None)
+    if id_col is None: return None
+    val_col = _choose_col(df.columns, [CFG_LOCKS["prot_value_col"]]) or \
+              next((c for c in df.columns if c.upper()=="NPX" or c.lower()=="npx"), None)
+    if val_col is None: return None
+    feat_col = _choose_col(df.columns, CFG_LOCKS["prot_feat_prio"]) or \
+               next((c for c in df.columns if any(k in c.lower() for k in ["assay","target","analyte","protein","uniprot","olink"])), None)
+    if feat_col is None: return None
+    df["participant_id"] = [_map_participant_id(x) for x in df[id_col].astype(str)]
+    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+    if df[feat_col].nunique(dropna=True) < CFG_LOCKS["prot_min_unique"]:
+        print(f"[Prot] Skip {Path(path).name}: only {df[feat_col].nunique()} unique analytes (<{CFG_LOCKS['prot_min_unique']})."); return None
+    pv = df.pivot_table(index="participant_id", columns=feat_col, values=val_col, aggfunc="mean")
+    return pv.astype(np.float32)
+
+# -----------------------------
+# Load normative-z (HC-first, fallback pseudo-controls) + manifest/meta
+# -----------------------------
+def _load_or_fallback_z(name_csv: str, raw_path_key: str) -> pd.DataFrame:
+    csv_path = TAB/name_csv; meta = _load_meta().get(name_csv, {})
+    if csv_path.exists() and meta.get("hc_mode") == HC_MODE:
+        df = pd.read_csv(csv_path, index_col=0)
+        def _looks_like_pid(x):
+            x = str(x).upper(); return (x.startswith("PP-") or x.startswith("PD-") or x.startswith("PP") or x.startswith("PD"))
+        cols_like_id = sum(_looks_like_pid(c) for c in df.columns) > 0.6*len(df.columns) if len(df.columns) else False
+        idx_like_id  = sum(_looks_like_pid(i) for i in df.index)   > 0.6*len(df.index)   if len(df.index)   else False
+        if cols_like_id and not idx_like_id: df = df.T
+        df.index = [ _map_participant_id(i) for i in df.index.astype(str) ]
+        if df.index.has_duplicates: df = df[~df.index.duplicated(keep="first")]
+        df = df.reindex(clin.index)
+        key = "rna" if raw_path_key=="rna" else "prot"
+        df = _apply_manifest(df, key)
+        sha12 = _short_sha(df.columns); print(f"[Pin] {name_csv} shape={df.shape}, sha={sha12}")
+        return df
+
+    raw = None
+    if raw_path_key == "rna":
+        raw_path = CFG.get("rna_path","")
+        if raw_path and os.path.exists(raw_path):
+            tmp = pd.read_csv(raw_path, sep="\t", low_memory=False)
+            if tmp.columns[0].lower() not in {"participant_id","patno","subject","id"}:
+                tmp = tmp.rename(columns={tmp.columns[0]:"INDEX"}).set_index("INDEX")
+            if tmp.shape[0] > tmp.shape[1]: tmp = tmp.T
+            tmp.index = [ _map_participant_id(i) for i in tmp.index.astype(str) ]
+            raw = (tmp.groupby(tmp.index).mean(numeric_only=True).astype(np.float32))
+            print(f"[RNA/raw] samples={raw.shape[0]}, feats={raw.shape[1]}")
+    else:
+        mats=[]; paths = CFG.get("prot_paths",[]) or []
+        for p in paths:
+            if p and os.path.exists(p):
+                pv = _pivot_protein_file(p)
+                if pv is not None: mats.append(pv)
+        if mats:
+            raw = (pd.concat(mats, axis=1).groupby(level=0, axis=1).mean().astype(np.float32))
+            print(f"[PROT/raw] samples={raw.shape[0]}, feats={raw.shape[1]}")
+
+    if raw is None or raw.empty:
+        print(f"[{raw_path_key.upper()}/raw] EMPTY — returning empty Z.")
+        return pd.DataFrame(index=clin.index)
+
+    # HC anchoring
+    hc_ids, per_site_ok = _select_train_hc_ids(raw.index, min_n_global=30, min_n_site=15, per_site=True)
+    use_site = (HC_MODE=="site") or (HC_MODE=="auto" and per_site_ok and "site" in clin.columns)
+    if len(hc_ids) >= 30 and use_site:
+        site_series = clin["site"].astype(str)
+        mu_global = raw.loc[hc_ids].mean(0); sd_global = raw.loc[hc_ids].std(0).replace(0, np.nan).fillna(1.0)
+        mu_s, sd_s = {}, {}
+        for site, idxs in site_series.loc[hc_ids].groupby(site_series.loc[hc_ids]).groups.items():
+            idxs = pd.Index(idxs).intersection(raw.index)
+            if len(idxs) >= 15:
+                mu_s[site] = raw.loc[idxs].mean(0); sd_s[site] = raw.loc[idxs].std(0).replace(0, np.nan).fillna(1.0)
+        mu_rows, sd_rows = [], []
+        for pid in raw.index:
+            site = site_series.get(pid, np.nan)
+            if isinstance(site, str) and site in mu_s: mu_rows.append(mu_s[site]); sd_rows.append(sd_s[site])
+            else: mu_rows.append(mu_global); sd_rows.append(sd_global)
+        MU = pd.DataFrame(mu_rows, index=raw.index); SD = pd.DataFrame(sd_rows, index=raw.index)
+        Z = (raw - MU) / SD; print("[HC] Using per-site TRAIN Healthy Control anchoring.")
+    elif len(hc_ids) >= 30:
+        mu = raw.loc[hc_ids].mean(0); sd = raw.loc[hc_ids].std(0).replace(0, np.nan).fillna(1.0)
+        Z = (raw - mu) / sd; print("[HC] Using global TRAIN Healthy Control anchoring.")
+    else:
+        train_ids = clin.index[is_train]; y_train = pd.to_numeric(clin.loc[train_ids,"updrs_total"], errors="coerce")
+        pseudo_ctrl = y_train.nsmallest(max(20, int(0.2*len(y_train.dropna())))).index if y_train.notna().sum()>10 else train_ids
+        mu = raw.loc[raw.index.intersection(pseudo_ctrl)].mean(0)
+        sd = raw.loc[raw.index.intersection(pseudo_ctrl)].std(0).replace(0, np.nan).fillna(1.0)
+        Z = (raw - mu) / sd; print("[HC] Fallback to TRAIN pseudo-controls (insufficient HCs).")
+
+    Z = Z.clip(lower=-10, upper=10)
+    Z.index = [ _map_participant_id(i) for i in Z.index.astype(str) ]
+    Z = Z.reindex(clin.index).astype(np.float32)
+
+    # Feature freeze + manifest
+    if raw_path_key == "rna":
+        Z = _stable_top_features(Z, CFG_LOCKS["rna_target_n"], "RNA", train_mask=is_train.values)
+        man = _load_manifest()
+        if "rna_cols" in man: Z = _apply_manifest(Z, "rna")
+        else: _save_manifest(rna_cols=list(Z.columns))
+    else:
+        Z = _stable_top_features(Z, CFG_LOCKS["prot_target_n"], "PROT", train_mask=is_train.values)
+        man = _load_manifest()
+        if "prot_cols" in man: Z = _apply_manifest(Z, "prot")
+        else: _save_manifest(prot_cols=list(Z.columns))
+
+    Z.to_csv(TAB/name_csv)
+    sha12 = _short_sha(Z.columns); _save_meta(name_csv, HC_MODE, list(Z.shape), sha12)
+    print(f"[Pin] wrote {name_csv}: shape={Z.shape}"); print(f"[Pin] {name_csv} shape={Z.shape}, sha={sha12}")
+    return Z
+
+# -----------------------------
+# Build aligned matrices (zero-impute) + presence masks
+# -----------------------------
+z_rna  = _load_or_fallback_z("z_rna.csv", "rna")
+z_prot = _load_or_fallback_z("z_proteins.csv", "prot")
+
+all_ids = clin.index
+def prep_block(Z: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    if Z is None or Z.empty:
+        return (np.zeros((len(all_ids), 0), dtype=np.float32),
+                np.zeros((len(all_ids), 0), dtype=np.float32), [])
+    Z = Z.replace([np.inf, -np.inf], np.nan).reindex(all_ids)
+    X = Z.values.astype(np.float32); M = (~pd.isna(Z)).values.astype(np.float32)
+    X[np.isnan(X)] = 0.0; np.clip(X, -10, 10, out=X)
+    return X, M, list(Z.columns)
+
+Xr, Mr, rna_cols  = prep_block(z_rna)
+Xp, Mp, prot_cols = prep_block(z_prot)
+d_rna, d_prot = Xr.shape[1], Xp.shape[1]
+
+# -----------------------------
+# Targets, masks, and CV setup
+# -----------------------------
+y_all = pd.to_numeric(clin["updrs_total"], errors="coerce").values.astype(np.float32)
+upsit_all = pd.to_numeric(clin.get("upsit_total"), errors="coerce").values.astype(np.float32)
+is_train_vals = is_train.values; is_test_vals = is_test.values
+train_idx = np.where(is_train_vals)[0]; test_idx  = np.where(is_test_vals)[0]
+y_tr = y_all[train_idx]
+
+print(f"[Sanity] TRAIN with UPDRS: {int(np.isfinite(y_all[train_idx]).sum())} / {int(is_train.sum())} ; TEST with UPDRS: {int(np.isfinite(y_all[test_idx]).sum())} / {int(is_test.sum())}")
+has_any_omics = ((Mr.sum(1) > 0) | (Mp.sum(1) > 0)).astype(bool)
+have_y_tr     = np.isfinite(y_tr); have_omics_tr = has_any_omics[train_idx]
+valid_train   = have_y_tr & have_omics_tr
+print(f"[Sanity] TRAIN usable for CV (labels+omics): {int(valid_train.sum())}")
+
+from sklearn.model_selection import GroupKFold
+groups_all  = clin.index.to_numpy()
+train_idx_y  = train_idx[valid_train]; y_tr_nonan   = y_tr[valid_train]
+groups_train = groups_all[train_idx_y]
+unique_groups = pd.unique(groups_train); n_groups = len(unique_groups)
+n_splits = max(2, min(5, n_groups)) if n_groups>=2 else 5
+print(f"CV grouping by participant (patno): n_groups={n_groups}, n_splits={n_splits}")
+gkf = GroupKFold(n_splits=n_splits)
+
+# ---- Robust label bounds for clamping ----
+y_train_finite = y_all[train_idx][np.isfinite(y_all[train_idx])]
+if y_train_finite.size >= 10:
+    q1, q99 = np.percentile(y_train_finite, [1, 99]); span = max(1.0, q99 - q1)
+    Y_LO = float(q1 - 0.10 * span); Y_HI = float(q99 + 0.10 * span)
+else: Y_LO, Y_HI = -100.0, 200.0
+print(f"[Bounds] Clamp preds to [{Y_LO:.1f}, {Y_HI:.1f}]")
+
+# Ordinal staging helper
+def build_stage_fn(yvals: np.ndarray):
+    yv = yvals[np.isfinite(yvals)]
+    if yv.size < 60: return None
+    qs = np.quantile(yv, [1/6,2/6,3/6,4/6,5/6]); bins = [-np.inf]+list(qs)+[np.inf]
+    def f(arr):
+        t = (np.digitize(arr, bins) - 1).astype(float); t[~np.isfinite(arr)] = np.nan; return t
+    return f
+stage_fn = build_stage_fn(y_tr_nonan)
+
+# -----------------------------
+# Torch models & utils
+# -----------------------------
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from scipy.stats import spearmanr, kruskal
+
+class TabVAE(nn.Module):
+    def __init__(self, d_in:int, d_lat:int=32, d_hidden:int=384, p_drop:float=0.2):
+        super().__init__()
+        self.d_in = d_in
+        if d_in==0:
+            self.enc=None; self.mu=None; self.lv=None; self.dec=None; return
+        self.enc = nn.Sequential(
+            nn.Linear(d_in, d_hidden), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(d_hidden, d_hidden), nn.ReLU(), nn.Dropout(p_drop)
+        )
+        self.mu = nn.Linear(d_hidden, d_lat)
+        self.lv = nn.Linear(d_hidden, d_lat)
+        self.dec= nn.Sequential(nn.Linear(d_lat, d_hidden), nn.ReLU(), nn.Linear(d_hidden, d_in))
+    def encode(self, x):
+        if self.d_in==0:
+            B = x.shape[0]; z = torch.zeros(B,0, device=x.device); return z, z
+        h = self.enc(x); return self.mu(h), self.lv(h)
+    def reparam(self, mu, lv):
+        if mu.numel()==0: return mu
+        std = (0.5*lv).exp(); eps = torch.randn_like(std); return mu + eps*std
+    def decode(self, z):
+        if self.d_in==0: return torch.zeros(z.shape[0],0, device=z.device)
+        return self.dec(z)
+    def forward(self, x):
+        mu, lv = self.encode(x); z = self.reparam(mu, lv); xhat = self.decode(z); return z, mu, lv, xhat
+
+class FusionHead(nn.Module):
+    def __init__(self, d_r:int, d_p:int, n_stage:int=6, p_drop:float=0.2):
+        super().__init__()
+        d_in = d_r + d_p + 2
+        self.backbone = nn.Sequential(nn.Linear(d_in, 192), nn.ReLU(), nn.Dropout(p_drop),
+                                      nn.Linear(192, 96), nn.ReLU(), nn.Dropout(p_drop))
+        self.reg = nn.Linear(96,1)
+        self.cls = nn.Linear(96,n_stage) if n_stage is not None else None
+    def forward(self, zr, zp, fr, fp):
+        h = torch.cat([zr, zp, fr, fp], dim=1); h = self.backbone(h)
+        y_hat = self.reg(h).squeeze(1); y_stg = self.cls(h) if self.cls is not None else None
+        return y_hat, y_stg
+
+class PDDataset(Dataset):
+    def __init__(self, Xr, Xp, Mr=None, Mp=None, y=None, idx=None):
+        self.Xr = Xr if idx is None else Xr[idx]; self.Xp = Xp if idx is None else Xp[idx]
+        self.Mr = Mr if (Mr is None or idx is None) else Mr[idx]
+        self.Mp = Mp if (Mp is None or idx is None) else Mp[idx]
+        self.y  = None if y is None else (y if idx is None else y[idx])
+        self.idx = np.arange(len(self.Xr)) if idx is None else idx
+    def __len__(self): return len(self.Xr)
+    def __getitem__(self, i):
+        xr = torch.from_numpy(self.Xr[i]).float()
+        xp = torch.from_numpy(self.Xp[i]).float()
+        yv = torch.tensor(float(self.y[i])) if (self.y is not None and np.isfinite(self.y[i])) else torch.tensor(float("nan"))
+        fr = torch.tensor([1.0 if (self.Mr is not None and self.Mr[i].sum()>0) else 0.0])
+        fp = torch.tensor([1.0 if (self.Mp is not None and self.Mp[i].sum()>0) else 0.0])
+        return xr, xp, fr, fp, yv
+
+# Losses / metrics
+def reg_loss(pred, target, y_lo=None, y_hi=None, huber_beta=5.0):
+    if y_lo is not None and y_hi is not None: pred = pred.clamp(min=y_lo, max=y_hi)
+    m = torch.isfinite(target); 
+    if m.sum()==0: return torch.zeros((), device=pred.device)
+    return nn.functional.smooth_l1_loss(pred[m], target[m], beta=huber_beta)
+def ce_loss(logits, targets_np):
+    if logits is None or targets_np is None:
+        return torch.zeros((), device=logits.device if hasattr(logits, "device") else device)
+    t = torch.from_numpy(np.asarray(targets_np)).to(logits.device)
+    m = torch.isfinite(t)
+    if m.sum()==0: return torch.zeros((), device=logits.device)
+    return nn.functional.cross_entropy(logits[m], t[m].long())
+def kld(mu, lv):
+    if mu.numel()==0: return torch.zeros((), device=mu.device)
+    return -0.5*(1 + lv - mu.pow(2) - lv.exp()).sum(dim=1).mean()
+def spearman_np(a,b):
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum()<3: return np.nan
+    return spearmanr(a[m], b[m]).statistic
+
+# -----------------------------
+# Hyperparameters
+# -----------------------------
+HP = dict(
+    d_rna_lat = 32, d_prot_lat= 24, vae_hidden= 384, p_drop= 0.2, beta_kld= 3e-3,
+    epochs=int(getattr(FLAGS, "epochs", 90)), batch=int(getattr(FLAGS, "batch", 128)),
+    lr=5e-4, patience=18, mc_T=int(getattr(FLAGS, "mc_T", 50)), gmm_k=int(getattr(FLAGS, "gmm_k", 3)),
+    boot_B=50, boot_frac=0.8, ig_smooth_T=16, moddrop_p_rna=0.10, moddrop_p_prot=0.15
+)
+
+# -----------------------------
+# Seeded DataLoader
+# -----------------------------
+def _seeded_loader(dataset, batch, shuffle: bool):
+    gen = torch.Generator(device="cpu").manual_seed(SEED)
+    return DataLoader(dataset, batch_size=batch, shuffle=shuffle, generator=gen)
+
+# -----------------------------
+# Fallback helpers (Ridge/SVD)
+# -----------------------------
+from sklearn.linear_model import RidgeCV
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import StandardScaler
+
+def _encode_latents_for_ids(vae_r, vae_p, ids):
+    with torch.no_grad():
+        zr = vae_r.encode(torch.from_numpy(Xr[ids]).float().to(device))[0].cpu().numpy() if d_rna > 0 else np.zeros((len(ids), 0), dtype=np.float32)
+        zp = vae_p.encode(torch.from_numpy(Xp[ids]).float().to(device))[0].cpu().numpy() if d_prot> 0 else np.zeros((len(ids), 0), dtype=np.float32)
+    Z = np.concatenate([zr, zp], axis=1)
+    return np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+
+def _ridge_fallback_preds(vae_r, vae_p, tr_ids, tgt_ids):
+    Ztr = _encode_latents_for_ids(vae_r, vae_p, tr_ids)
+    Ztg = _encode_latents_for_ids(vae_r, vae_p, tgt_ids)
+    if Ztr.shape[1] == 0: return np.full(len(tgt_ids), np.nan, dtype=np.float32)
+    ytr = y_all[tr_ids]; mtr = np.isfinite(ytr)
+    if mtr.sum() < 5: return np.full(len(tgt_ids), np.nan, dtype=np.float32)
+    rid = RidgeCV(alphas=np.logspace(-2, 2, 9)).fit(Ztr[mtr], ytr[mtr])
+    preds = rid.predict(Ztg).astype(np.float32); np.clip(preds, Y_LO, Y_HI, out=preds); return preds
+
+def _svd_ridge_fallback_preds(tr_ids, tgt_ids, n_comp=128):
+    Xtr_raw = np.hstack([Xr[tr_ids], Xp[tr_ids]]); Xtg_raw = np.hstack([Xr[tgt_ids], Xp[tgt_ids]])
+    if Xtr_raw.shape[1] == 0: return np.full(len(tgt_ids), np.nan, dtype=np.float32)
+    scaler = StandardScaler(with_mean=False); Xtr_s = scaler.fit_transform(Xtr_raw); Xtg_s = scaler.transform(Xtg_raw)
+    n_comp = min(max(1, n_comp), max(1, Xtr_s.shape[1] - 1)) if Xtr_s.shape[1] > 1 else 1
+    svd = TruncatedSVD(n_components=n_comp, random_state=SEED)
+    Ztr = svd.fit_transform(Xtr_s); Ztg = svd.transform(Xtg_s)
+    ytr = y_all[tr_ids]; mtr = np.isfinite(ytr)
+    if mtr.sum() < 5: return np.full(len(tgt_ids), np.nan, dtype=np.float32)
+    rid = RidgeCV(alphas=np.logspace(-2, 2, 9)).fit(Ztr[mtr], ytr[mtr])
+    preds = rid.predict(Ztg).astype(np.float32); np.clip(preds, Y_LO, Y_HI, out=preds); return preds
+
+# -----------------------------
+# Train one fold (CV)
+# -----------------------------
+def train_one_fold(tr_ids, va_ids, stage_fn):
+    ds_tr = PDDataset(Xr, Xp, Mr, Mp, y=y_all, idx=tr_ids)
+    ds_va = PDDataset(Xr, Xp, Mr, Mp, y=y_all, idx=va_ids)
+    dl_tr = _seeded_loader(ds_tr, HP["batch"], shuffle=True)
+    dl_va = _seeded_loader(ds_va, HP["batch"], shuffle=False)
+
+    vae_r = TabVAE(d_rna, HP["d_rna_lat"], HP["vae_hidden"], HP["p_drop"]).to(device)
+    vae_p = TabVAE(d_prot,HP["d_prot_lat"],HP["vae_hidden"], HP["p_drop"]).to(device)
+    n_stage = 6 if stage_fn is not None else None
+    head = FusionHead(HP["d_rna_lat"], HP["d_prot_lat"], n_stage, HP["p_drop"]).to(device)
+    opt  = torch.optim.AdamW(list(vae_r.parameters())+list(vae_p.parameters())+list(head.parameters()),
+                             lr=HP["lr"], weight_decay=1e-4)
+
+    best = np.inf; bad=0
+    for epoch in range(HP["epochs"]):
+        vae_r.train(); vae_p.train(); head.train()
+        tot=0.0; steps=0
+        for xr,xp,fr,fp,y in dl_tr:
+            xr,xp,fr,fp,y = xr.to(device), xp.to(device), fr.to(device), fp.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            zr, mu_r, lv_r, _ = vae_r(xr); zp, mu_p, lv_p, _ = vae_p(xp)
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(SEED + steps)
+                if HP.get("moddrop_p_rna", 0) > 0 and torch.rand(()) < HP["moddrop_p_rna"]: zr = torch.zeros_like(zr)
+                if HP.get("moddrop_p_prot", 0) > 0 and torch.rand(()) < HP["moddrop_p_prot"]: zp = torch.zeros_like(zp)
+            y_hat, y_stg = head(zr, zp, fr, fp)
+            loss_reg = reg_loss(y_hat, y, y_lo=Y_LO, y_hi=Y_HI)
+            stg = None if stage_fn is None else stage_fn(y.detach().cpu().numpy())
+            loss_cls = ce_loss(y_stg, stg) if stage_fn is not None else torch.zeros((), device=device)
+            loss = loss_reg + 0.5*loss_cls + HP["beta_kld"]*(kld(mu_r,lv_r)+kld(mu_p,lv_p))
+            if not torch.isfinite(loss):  # safety
+                continue
+            loss.backward()
+            nn.utils.clip_grad_norm_(list(vae_r.parameters())+list(vae_p.parameters())+list(head.parameters()), 5.0)
+            opt.step()
+            tot += float(loss.item()); steps+=1
+        cur = tot/max(1,steps)
+        if cur < best: best=cur; bad=0
+        else: bad+=1
+        if bad>=HP["patience"]: break
+
+    # OOF predictions with deterministic MC-Dropout
+    head.train(); preds=[]
+    with torch.no_grad():
+        for xr,xp,fr,fp,y in dl_va:
+            xr,xp,fr,fp = xr.to(device), xp.to(device), fr.to(device), fp.to(device)
+            bag=[]
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(SEED)
+                for _ in range(HP["mc_T"]):
+                    zr, *_ = vae_r(xr); zp, *_ = vae_p(xp)
+                    yhat,_ = head(zr,zp,fr,fp); yhat = yhat.clamp(min=Y_LO, max=Y_HI)
+                    bag.append(yhat.detach().cpu().numpy())
+            preds.append(np.mean(np.stack(bag,0),0))
+    yh = np.concatenate(preds,0) if preds else np.array([])
+
+    # Fallbacks
+    if yh.size == len(va_ids):
+        bad = ~np.isfinite(yh)
+        if bad.any():
+            yfb = _ridge_fallback_preds(vae_r, vae_p, tr_ids, va_ids); use = bad & np.isfinite(yfb); yh[use] = yfb[use]
+        bad2 = ~np.isfinite(yh)
+        if bad2.any():
+            yfb2 = _svd_ridge_fallback_preds(tr_ids, va_ids, n_comp=128); use2 = bad2 & np.isfinite(yfb2); yh[use2] = yfb2[use2]
+        n_good = int(np.isfinite(yh).sum())
+        if n_good < len(va_ids): print(f"[Fold] WARNING: only {n_good}/{len(va_ids)} OOF preds finite after fallbacks.")
+    return yh, vae_r, vae_p, head
+
+# -----------------------------
+# Cross-validated OOF severity
+# -----------------------------
+oof_pred = np.full(train_idx.shape[0], np.nan, dtype=np.float32)
+idx_lookup = {idx:i for i,idx in enumerate(train_idx)}
+filled_total = 0
+if len(train_idx_y) >= max(2*n_splits, 20):
+    for f,(tr,va) in enumerate(gkf.split(train_idx_y, y_tr_nonan, groups_train), 1):
+        tr_ids = train_idx_y[tr]; va_ids = train_idx_y[va]
+        if len(va_ids)==0 or len(tr_ids)<20: continue
+        yh, _, _, _ = train_one_fold(tr_ids, va_ids, stage_fn)
+        if yh.size != len(va_ids): print(f"[Fold {f}] WARN: yh.size={yh.size} vs len(va_ids)={len(va_ids)}"); continue
+        for vid, pred in zip(va_ids.tolist(), yh.tolist()):
+            pos = idx_lookup.get(vid, None)
+            if pos is not None and np.isfinite(pred):
+                oof_pred[pos] = pred; filled_total += 1
+
+filled_mask = np.isfinite(oof_pred)
+print(f"[Sanity] OOF filled: {int(filled_mask.sum())} / {len(oof_pred)}; OOF std (finite): {float(np.nanstd(oof_pred)) if filled_mask.any() else 'NA'}")
+rho_oof = spearman_np(oof_pred, y_tr)
+print(f"OOF Spearman ρ: {rho_oof:.3f}" if np.isfinite(rho_oof) else "OOF Spearman ρ: NA")
+if np.isfinite(oof_pred).any():
+    m = np.isfinite(oof_pred) & np.isfinite(y_tr)
+    if m.any():
+        oof_mae = float(np.mean(np.abs(oof_pred[m] - y_tr[m])))
+        oof_rmse = float(np.sqrt(np.mean((oof_pred[m] - y_tr[m])**2)))
+        summary_update({"oof_mae": oof_mae, "oof_rmse": oof_rmse})
+
+# -----------------------------
+# Final fit on TRAIN, predict TEST (seed ensemble) + fallbacks
+# -----------------------------
+def fit_full_and_predict(tr_ids, te_ids, seed: Optional[int]=None):
+    if seed is not None:
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    ds_tr = PDDataset(Xr, Xp, Mr, Mp, y=y_all, idx=tr_ids)
+    ds_te = PDDataset(Xr, Xp, Mr, Mp, y=None,  idx=te_ids)
+    dl_tr = _seeded_loader(ds_tr, HP["batch"], shuffle=True)
+    dl_te = _seeded_loader(ds_te, HP["batch"], shuffle=False)
+
+    vae_r = TabVAE(d_rna, HP["d_rna_lat"], HP["vae_hidden"], HP["p_drop"]).to(device)
+    vae_p = TabVAE(d_prot,HP["d_prot_lat"],HP["vae_hidden"], HP["p_drop"]).to(device)
+    head  = FusionHead(HP["d_rna_lat"], HP["d_prot_lat"], 6 if stage_fn is not None else None, HP["p_drop"]).to(device)
+    opt   = torch.optim.AdamW(list(vae_r.parameters())+list(vae_p.parameters())+list(head.parameters()),
+                              lr=HP["lr"], weight_decay=1e-4)
+
+    best=np.inf; bad=0
+    for epoch in range(HP["epochs"]):
+        vae_r.train(); vae_p.train(); head.train()
+        tot=0; steps=0
+        for xr,xp,fr,fp,y in dl_tr:
+            xr,xp,fr,fp,y = xr.to(device), xp.to(device), fr.to(device), fp.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            zr, mu_r, lv_r, _ = vae_r(xr); zp, mu_p, lv_p, _ = vae_p(xp)
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(seed if seed is not None else SEED + steps)
+                if HP.get("moddrop_p_rna", 0) > 0 and torch.rand(()) < HP["moddrop_p_rna"]: zr = torch.zeros_like(zr)
+                if HP.get("moddrop_p_prot", 0) > 0 and torch.rand(()) < HP["moddrop_p_prot"]: zp = torch.zeros_like(zp)
+            y_hat, y_stg = head(zr, zp, fr, fp)
+            loss_reg = reg_loss(y_hat, y, y_lo=Y_LO, y_hi=Y_HI)
+            stg = None if stage_fn is None else stage_fn(y.detach().cpu().numpy())
+            loss_cls = ce_loss(y_stg, stg) if stage_fn is not None else torch.zeros((), device=device)
+            loss = loss_reg + 0.5*loss_cls + HP["beta_kld"]*(kld(mu_r,lv_r)+kld(mu_p,lv_p))
+            if not torch.isfinite(loss): continue
+            loss.backward(); nn.utils.clip_grad_norm_(list(vae_r.parameters())+list(vae_p.parameters())+list(head.parameters()), 5.0)
+            opt.step(); tot+=float(loss.item()); steps+=1
+        cur = tot/max(1,steps)
+        if cur<best: best=cur; bad=0
+        else: bad+=1
+        if bad>=HP["patience"]: break
+
+    # TEST predictions with deterministic MC-Dropout
+    vae_r.train(); vae_p.train(); head.train()
+    preds=[]
+    with torch.no_grad():
+        for xr,xp,fr,fp,_ in dl_te:
+            xr,xp,fr,fp = xr.to(device), xp.to(device), fr.to(device), fp.to(device)
+            bag=[]
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(seed if seed is not None else SEED)
+                for _ in range(HP["mc_T"]):
+                    zr, *_ = vae_r(xr); zp, *_ = vae_p(xp)
+                    yhat,_ = head(zr,zp,fr,fp); yhat = yhat.clamp(min=Y_LO, max=Y_HI)
+                    bag.append(yhat.detach().cpu().numpy())
+            preds.append(np.mean(np.stack(bag,0),0))
+    test_pred = (np.concatenate(preds,0) if preds else np.array([]))
+
+    # Fallbacks
+    if test_pred.size == len(te_ids):
+        bad = ~np.isfinite(test_pred)
+        if bad.any():
+            yfb = _ridge_fallback_preds(vae_r, vae_p, tr_ids, te_ids); test_pred[bad & np.isfinite(yfb)] = yfb[bad & np.isfinite(yfb)]
+        bad2 = ~np.isfinite(test_pred)
+        if bad2.any():
+            yfb2 = _svd_ridge_fallback_preds(tr_ids, te_ids, n_comp=128); test_pred[bad2 & np.isfinite(yfb2)] = yfb2[bad2 & np.isfinite(yfb2)]
+    else:
+        print("[Final] WARN: TEST preds length mismatch; partial fill performed.")
+    return test_pred, vae_r, vae_p, head
+
+tr_ids_full = train_idx[np.isfinite(y_tr) & has_any_omics[train_idx]]
+# *** Only predict for TEST with any omics ***
+test_idx_omics = test_idx[has_any_omics[test_idx]]
+test_pred = np.full(test_idx.shape[0], np.nan, dtype=np.float32)
+SEEDS_ENSEMBLE = [42, 777, 2027]
+if tr_ids_full.size>=20 and test_idx_omics.size>0:
+    test_bag = []
+    for s in SEEDS_ENSEMBLE:
+        tp, vae_r_final, vae_p_final, head_final = fit_full_and_predict(tr_ids_full, test_idx_omics, seed=s)
+        test_bag.append(tp)
+    test_pred_omics = np.nanmean(np.stack(test_bag,0), axis=0).astype(np.float32)
+    # place back only for omics participants; others remain NaN
+    test_pred[has_any_omics[test_idx]] = test_pred_omics
+else:
+    vae_r_final = TabVAE(d_rna, HP["d_rna_lat"]).to(device)
+    vae_p_final = TabVAE(d_prot,HP["d_prot_lat"]).to(device)
+    head_final  = FusionHead(HP["d_rna_lat"], HP["d_prot_lat"]).to(device)
+
+rho_test = np.nan
+if test_idx_omics.size>0 and test_pred.size>0:
+    y_te = y_all[test_idx_omics]
+    rho_test = spearman_np(test_pred[has_any_omics[test_idx]], y_te)
+    print(f"TEST Spearman ρ (severity vs UPDRS): {rho_test:.3f}" if np.isfinite(rho_test) else "TEST Spearman ρ: NA")
+else:
+    print("TEST Spearman ρ: NA (no TEST preds)")
+if test_idx_omics.size>0 and np.isfinite(test_pred).any():
+    m = np.isfinite(test_pred[has_any_omics[test_idx]]) & np.isfinite(y_all[test_idx_omics])
+    if m.any():
+        test_mae = float(np.mean(np.abs(test_pred[has_any_omics[test_idx]][m] - y_all[test_idx_omics][m])))
+        test_rmse = float(np.sqrt(np.mean((test_pred[has_any_omics[test_idx]][m] - y_all[test_idx_omics][m])**2)))
+        summary_update({"test_mae": test_mae, "test_rmse": test_rmse})
+
+# -----------------------------
+# CORAL/OT mapping (optional, as in v1.9d)
+# -----------------------------
+def ledoit_wolf_cov(Z: np.ndarray):
+    Zc = Z - Z.mean(0, keepdims=True); n, p = Zc.shape
+    sample = (Zc.T @ Zc) / n
+    mu = np.trace(sample) / p; S0 = mu * np.eye(p)
+    alpha = np.sum((sample - S0) ** 2)
+    Z2   = np.square(Zc)
+    beta = np.sum(Z2 @ Z2.T) / (n**2) - np.sum(sample**2); beta = max(float(beta), 0.0)
+    lam = 0.0 if alpha <= 1e-12 else min(1.0, beta / max(alpha, 1e-12))
+    return lam * S0 + (1 - lam) * sample
+def coral_fit_pair(Zs, Zt, shrink=True):
+    if Zs.shape[1] < 1 or Zs.shape[0] < 6 or Zt.shape[0] < 6: return None
+    if shrink:
+        Cs = ledoit_wolf_cov(Zs); Ct = ledoit_wolf_cov(Zt)
+    else:
+        Cs = np.cov(Zs, rowvar=False) + 1e-3*np.eye(Zs.shape[1])
+        Ct = np.cov(Zt, rowvar=False) + 1e-3*np.eye(Zt.shape[1])
+    Es, Vs = np.linalg.eigh(Cs); Et, Vt = np.linalg.eigh(Ct)
+    As = Vs @ np.diag(np.sqrt(np.maximum(Es,1e-6))) @ Vs.T
+    At_inv = Vt @ np.diag(1.0/np.sqrt(np.maximum(Et,1e-6))) @ Vt.T
+    return As, At_inv, Zs.mean(0), Zt.mean(0)
+def coral_recolor(Zt, As, At_inv, mu_s, mu_t):
+    return (Zt - mu_t) @ At_inv @ As + mu_s
+
+try:
+    import ot
+    from scipy.spatial.distance import cdist
+    HAVE_OT = True
+except Exception:
+    HAVE_OT = False
+    print("[OT] POT not installed; skipping Sinkhorn-OT.")
+
+def sinkhorn_ot_map(Zs: np.ndarray, Zt: np.ndarray, reg: float = 1.0, numItermax: int = 1000, stopThr: float = 1e-6, eps: float = 1e-12):
+    if not HAVE_OT or Zs.size==0 or Zt.size==0: return None, None
+    ns, nt = Zs.shape[0], Zt.shape[0]
+    a = np.full(ns, 1.0/ns, dtype=np.float64); b = np.full(nt, 1.0/nt, dtype=np.float64)
+    from scipy.spatial.distance import cdist
+    C = cdist(Zs, Zt, metric="sqeuclidean").astype(np.float64)
+    med = np.median(C[C>0]) if np.any(C>0) else 1.0
+    if np.isfinite(med) and med>0: C = C / med
+    try:
+        G = ot.bregman.sinkhorn(a, b, C, reg=reg, numItermax=numItermax, stopThr=stopThr, verbose=False)
+    except Exception as e:
+        print("[OT] Sinkhorn failed:", e); return None, None
+    G = np.asarray(G, dtype=np.float64); G = np.maximum(G, 0.0); GT = G.T
+    denom = np.clip(GT.sum(axis=1, keepdims=True), eps, None)
+    Zt_map = (GT @ Zs) / denom
+    Zt_map = np.nan_to_num(Zt_map, nan=0.0, posinf=0.0, neginf=0.0)
+    return Zt_map.astype(np.float32), G
+
+def get_mu_latents(vae_r, vae_p):
+    with torch.no_grad():
+        zr = vae_r.encode(torch.from_numpy(Xr).float().to(device))[0].cpu().numpy() if d_rna>0 else np.zeros((len(all_ids),0),dtype=np.float32)
+        zp = vae_p.encode(torch.from_numpy(Xp).float().to(device))[0].cpu().numpy() if d_prot>0 else np.zeros((len(all_ids),0),dtype=np.float32)
+    return zr, zp, np.concatenate([zr,zp], axis=1)
+
+rho_coral = np.nan; rho_coral_fused = np.nan
+yhat_te_rna = None; yhat_te_fused = None
+zr_all, zp_all, zf_all = get_mu_latents(vae_r_final, vae_p_final)
+
+# CORAL RNA
+if test_idx.size>0 and d_rna>0:
+    Ztr_rna, Zte_rna = zr_all[train_idx], zr_all[test_idx]
+    pars = coral_fit_pair(Ztr_rna, Zte_rna, shrink=True)
+    if pars is not None:
+        As, At_inv, mu_s, mu_t = pars
+        Zte_c = coral_recolor(Zte_rna, As, At_inv, mu_s, mu_t)
+        mtr = np.isfinite(y_tr) & np.isfinite(Ztr_rna).all(1)
+        rid = RidgeCV(alphas=np.logspace(-2,2,9)).fit(Ztr_rna[mtr], y_tr[mtr])
+        mte = np.isfinite(Zte_c).all(1)
+        yhat_te_rna = np.full(len(test_idx), np.nan, dtype=np.float32)
+        yhat_te_rna[mte] = rid.predict(np.nan_to_num(Zte_c[mte], 0.0)).astype(np.float32)
+        np.clip(yhat_te_rna, Y_LO, Y_HI, out=yhat_te_rna)
+        rho_coral = spearman_np(yhat_te_rna, y_all[test_idx])
+        print(f"TEST Spearman ρ after CORAL(RNA-only): {rho_coral:.3f}" if np.isfinite(rho_coral) else "TEST Spearman ρ after CORAL: NA")
+
+# CORAL FUSED
+if test_idx.size>0 and (d_rna+d_prot)>0:
+    Ztr_f, Zte_f = zf_all[train_idx], zf_all[test_idx]
+    pars_f = coral_fit_pair(Ztr_f, Zte_f, shrink=True)
+    if pars_f is not None:
+        As, At_inv, mu_s, mu_t = pars_f
+        Zte_fc = coral_recolor(Zte_f, As, At_inv, mu_s, mu_t)
+        ytr = y_all[train_idx]; mtr = np.isfinite(ytr) & np.isfinite(Ztr_f).all(1)
+        rid = RidgeCV(alphas=np.logspace(-2,2,9)).fit(np.nan_to_num(Ztr_f[mtr], 0.0), ytr[mtr])
+        yhat_te_fused = np.full(len(test_idx), np.nan, dtype=np.float32)
+        mte = np.isfinite(Zte_fc).all(1)
+        yhat_te_fused[mte] = rid.predict(np.nan_to_num(Zte_fc[mte], 0.0)).astype(np.float32)
+        np.clip(yhat_te_fused, Y_LO, Y_HI, out=yhat_te_fused)
+        rho_coral_fused = spearman_np(yhat_te_fused, y_all[test_idx])
+        print(f"TEST Spearman ρ after CORAL(FUSED): {rho_coral_fused:.3f}" if np.isfinite(rho_coral_fused) else "TEST ρ CORAL(FUSED): NA")
+
+# OT RNA
+rho_ot_rna = np.nan; yhat_te_rna_ot = None
+if test_idx.size>0 and d_rna>0 and ('ot' in globals() or 'ot' in locals()):
+    Ztr_rna, Zte_rna = zr_all[train_idx], zr_all[test_idx]
+    Zt_map, _ = sinkhorn_ot_map(Ztr_rna, Zte_rna, reg=1.0, numItermax=1200)
+    if Zt_map is not None:
+        ytr = y_all[train_idx]; mtr = np.isfinite(ytr) & np.isfinite(Ztr_rna).all(1)
+        rid = RidgeCV(alphas=np.logspace(-2,2,9)).fit(Ztr_rna[mtr], ytr[mtr])
+        yhat_te_rna_ot = rid.predict(np.nan_to_num(Zt_map, 0.0)).astype(np.float32)
+        np.clip(yhat_te_rna_ot, Y_LO, Y_HI, out=yhat_te_rna_ot)
+        rho_ot_rna = spearman_np(yhat_te_rna_ot, y_all[test_idx]); print(f"TEST Spearman ρ after Sinkhorn-OT(RNA): {rho_ot_rna:.3f}")
+
+# OT FUSED
+rho_ot_fused = np.nan; yhat_te_fused_ot = None
+if test_idx.size>0 and (d_rna+d_prot)>0 and ('ot' in globals() or 'ot' in locals()):
+    Ztr_f, Zte_f = zf_all[train_idx], zf_all[test_idx]
+    Zt_map_f, _ = sinkhorn_ot_map(Ztr_f, Zte_f, reg=1.0, numItermax=1200)
+    if Zt_map_f is not None:
+        ytr = y_all[train_idx]; mtr = np.isfinite(ytr) & np.isfinite(Ztr_f).all(1)
+        rid = RidgeCV(alphas=np.logspace(-2,2,9)).fit(np.nan_to_num(Ztr_f[mtr],0.0), ytr[mtr])
+        yhat_te_fused_ot = rid.predict(np.nan_to_num(Zt_map_f, 0.0)).astype(np.float32)
+        np.clip(yhat_te_fused_ot, Y_LO, Y_HI, out=yhat_te_fused_ot)
+        rho_ot_fused = spearman_np(yhat_te_fused_ot, y_all[test_idx]); print(f"TEST Spearman ρ after Sinkhorn-OT(FUSED): {rho_ot_fused:.3f}")
+
+# -----------------------------
+# Non-leaky RAW–CORAL blend weight from TRAIN OOF
+# -----------------------------
+def coral_oof_on_train(train_idx_y, groups_train):
+    oof_coral = np.full(len(train_idx), np.nan, dtype=np.float32)
+    pos_map = {idx:i for i,idx in enumerate(train_idx)}
+    for tr, va in gkf.split(train_idx_y, y_tr_nonan, groups_train):
+        tr_ids = train_idx_y[tr]; va_ids = train_idx_y[va]
+        yh_raw, vae_r_f, vae_p_f, _ = train_one_fold(tr_ids, va_ids, stage_fn)
+        with torch.no_grad():
+            zr_tr = vae_r_f.encode(torch.from_numpy(Xr[tr_ids]).float().to(device))[0].cpu().numpy()
+            zr_va = vae_r_f.encode(torch.from_numpy(Xr[va_ids]).float().to(device))[0].cpu().numpy()
+        pars = coral_fit_pair(zr_tr, zr_va, shrink=True)
+        if pars is None: continue
+        As, At_inv, mu_s, mu_t = pars
+        zr_va_rec = coral_recolor(zr_va, As, At_inv, mu_s, mu_t)
+        ytr = y_all[tr_ids]; mtr = np.isfinite(ytr) & np.isfinite(zr_tr).all(1)
+        if mtr.sum()<10: continue
+        rid = RidgeCV(alphas=np.logspace(-2,2,9)).fit(zr_tr[mtr], ytr[mtr])
+        y_va_coral = rid.predict(np.nan_to_num(zr_va_rec, 0.0)).astype(np.float32)
+        np.clip(y_va_coral, Y_LO, Y_HI, out=y_va_coral)
+        for vid, pred in zip(va_ids.tolist(), y_va_coral.tolist()):
+            pos = pos_map.get(vid, None); 
+            if pos is not None: oof_coral[pos] = pred
+    mask = np.isfinite(oof_pred) & np.isfinite(y_tr)
+    return oof_coral[mask], oof_pred[mask], y_tr[mask]
+
+oof_coral_tr, oof_raw_tr, y_tr_masked = coral_oof_on_train(train_idx_y, groups_train)
+best_w_train, best_r_train = 1.0, spearman_np(oof_raw_tr, y_tr_masked)
+if np.isfinite(oof_coral_tr).any():
+    for w in np.linspace(0,1,21):
+        yb = w*oof_raw_tr + (1.0-w)*oof_coral_tr; r  = spearman_np(yb, y_tr_masked)
+        if np.isfinite(r) and r > best_r_train: best_r_train, best_w_train = r, w
+print(f"[Blend-Train] best w={best_w_train:.2f} with TRAIN-OOF ρ={best_r_train:.3f}")
+
+# *** NO TEST-SELECTION: Pre-specify chosen mode to avoid leakage ***
+best_mode = CHOSEN_MODE
+best_w = best_w_train if best_mode.startswith("blend") else 1.0
+if best_mode == "raw":
+    best_rho = rho_test
+elif best_mode == "ot-fused":
+    best_rho = rho_ot_fused
+else:
+    best_rho = rho_test  # fallback
+print(f"[Select] Using pre-specified mode: {best_mode.upper()} (no TEST-driven selection)")
+
+# -----------------------------
+# Subtyping: TRAIN-PD grid + default K_choice + confounders
+# -----------------------------
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import adjusted_mutual_info_score, silhouette_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler as _SS
+
+def _eta2(groups, values):
+    df = pd.DataFrame({"g":groups, "x":values})
+    df = df[np.isfinite(df["x"])]
+    if df["g"].nunique() < 2: return np.nan
+    grand = df["x"].mean()
+    ssb = df.groupby("g")["x"].apply(lambda v: len(v) * (v.mean()-grand)**2).sum()
+    sst = ((df["x"]-grand)**2).sum()
+    return float(ssb / sst) if sst>0 else np.nan
+
+def _safe_gmm_fit(Zsub, K, seed, reg0=1e-3):
+    reg = reg0
+    for _ in range(3):
+        try:
+            gmm = GaussianMixture(n_components=K, covariance_type="diag", reg_covar=reg,
+                                  n_init=5, init_params="kmeans", max_iter=500, random_state=seed)
+            gmm.fit(Zsub); return gmm, "gmm"
+        except Exception: reg *= 10.0
+    km = KMeans(n_clusters=K, n_init=10, random_state=seed); km.fit(Zsub)
+    class _KMWrap: 
+        def __init__(self, km): self.km = km
+        def predict(self, X):   return self.km.predict(X)
+    return _KMWrap(km), "kmeans"
+
+zr_all, zp_all, zf_all = get_mu_latents(vae_r_final, vae_p_final)
+is_pd_train = (is_train.values) & (is_pd_flag.values)
+is_pd_test  = (is_test.values)  & (is_pd_flag.values)
+
+def read_k_choice(path, default_k=3, lo=2, hi=8):
+    if not os.path.exists(path): return default_k
+    txt = open(path, "r").read(); m = re.search(r"K_choice\s*=\s*(\d+)", txt)
+    if not m: return default_k
+    k = int(m.group(1)); return int(max(lo, min(hi, k)))
+
+if getattr(FLAGS, "train_pd_grid", False):
+    pd_train_ids = np.where(is_pd_train)[0]
+    Z = zf_all[pd_train_ids]; y_pd = y_all[pd_train_ids]
+    mZ = np.isfinite(Z).all(1) & np.isfinite(y_pd)
+    Z = Z[mZ].astype(np.float64, copy=False); y_pd = y_pd[mZ]
+    pd_train_ids_clean = pd.Series(clin.index[pd_train_ids][mZ])
+    Zs = _SS(with_mean=True, with_std=True).fit_transform(Z)
+    rows=[]; rng = np.random.default_rng(SEED)
+    for K in range(2, 7):
+        min_n = max(60, 8*K)
+        if Zs.shape[0] < min_n:
+            rows.append({"K":K, "silhouette":np.nan, "eta2_UPDRS":np.nan,
+                         "AMI_boot_mean":np.nan, "counts":"{}", "fallbacks_base":0, "fallbacks_boot":0})
+            continue
+        base_model, base_method = _safe_gmm_fit(Zs, K, SEED, reg0=1e-3)
+        labs = base_model.predict(Zs)
+        try: sil = silhouette_score(Zs, labs) if len(np.unique(labs))>1 else np.nan
+        except Exception: sil = np.nan
+        eta = _eta2(labs, y_pd)
+        B = HP["boot_B"]; frac = HP["boot_frac"]; amis=[]; fb_boot=0
+        for _ in range(B):
+            bs_size = max(2, int(frac * Zs.shape[0])); idx = rng.integers(0, Zs.shape[0], size=bs_size)
+            model_b, method_b = _safe_gmm_fit(Zs[idx], K, int(rng.integers(1_000_000_000)), reg0=1e-3)
+            if method_b != "gmm": fb_boot += 1
+            labs_b = model_b.predict(Zs[idx]); amis.append(adjusted_mutual_info_score(labs[idx], labs_b))
+        rows.append({"K": K, "silhouette": float(sil), "eta2_UPDRS": float(eta) if np.isfinite(eta) else np.nan,
+                     "AMI_boot_mean": float(np.nanmean(amis)), "counts": pd.Series(labs).value_counts().sort_index().to_dict(),
+                     "fallbacks_base": 0 if base_method=="gmm" else 1, "fallbacks_boot": int(fb_boot)})
+    sub_df_train = pd.DataFrame(rows)
+    for col in ["silhouette","AMI_boot_mean","eta2_UPDRS"]:
+        mu = np.nanmean(sub_df_train[col]); sd = np.nanstd(sub_df_train[col]); sub_df_train[f"z_{col}"] = (sub_df_train[col] - mu) / (sd if sd>0 else 1.0)
+    sub_df_train["zsum"] = sub_df_train[["z_silhouette","z_AMI_boot_mean","z_eta2_UPDRS"]].sum(1)
+    sub_df_train.to_csv(TAB/"subtype_grid_TRAINPD.csv", index=False)
+    best_row = sub_df_train.iloc[sub_df_train["zsum"].idxmax()]
+    with open(TAB/"subtype_K_choice.txt","w") as f:
+        f.write(f"K_choice={int(best_row['K'])} via zsum score (sil={best_row['silhouette']:.3f}, AMI={best_row['AMI_boot_mean']:.3f}, eta2={best_row['eta2_UPDRS']:.3f})\n")
+    print("[SUBTYPE GRID — TRAIN-PD only]\n", sub_df_train[["K","silhouette","AMI_boot_mean","eta2_UPDRS","zsum"]])
+
+HP["gmm_k"] = read_k_choice(TAB/"subtype_K_choice.txt", default_k=HP.get("gmm_k",3))
+K = HP["gmm_k"]
+
+# Fit on TRAIN-PD and order labels by UPDRS
+pd_idx_train = np.where(is_pd_train)[0]
+Z_trpd = zf_all[pd_idx_train]; y_trpd_all = y_all[pd_idx_train]
+mZ = np.isfinite(Z_trpd).all(1) & np.isfinite(y_trpd_all)
+Z_trpd = Z_trpd[mZ].astype(np.float64, copy=False); y_pd_clean = y_trpd_all[mZ]
+pd_ids_clean = clin.index[pd_idx_train][mZ]
+Zs_trpd = StandardScaler(with_mean=True, with_std=True).fit_transform(Z_trpd)
+def _gmm_for_K(Zs, K, seed=SEED): gmm, _ = _safe_gmm_fit(Zs, K, seed, reg0=1e-3); return gmm
+model_k = _gmm_for_K(Zs_trpd, K, seed=SEED)
+labs_raw = model_k.predict(Zs_trpd)
+meds = {k: float(np.median(y_pd_clean[labs_raw==k])) for k in range(K)}
+order = [k for k,_ in sorted(meds.items(), key=lambda kv: kv[1])]
+remap = {old:new for new,old in enumerate(order)}
+labs_trpd = np.array([remap[k] for k in labs_raw], dtype=int)
+
+# Persist TRAIN-PD assignments
+assign_col = f"subtype_K{K}_byUPDRS_TRAINPD"
+sub_ser = pd.Series(labs_trpd, index=pd_ids_clean, name=assign_col)
+assign_df = pd.DataFrame(index=clin.index); assign_df[sub_ser.name] = sub_ser
+assign_df.to_csv(TAB/f"subtypes_TRAINPD_K{K}_assignments.csv")
+
+# Also assign ALL PD (TRAIN+TEST) using same scaler/model and remap
+pd_idx_all = np.where(is_pd_flag.values)[0]
+Z_pd_all = zf_all[pd_idx_all]
+m_all = np.isfinite(Z_pd_all).all(1)
+Z_pd_all_s = (Z_pd_all[m_all] - Z_trpd.mean(0)) / (Z_trpd.std(0) + 1e-8)
+labs_all = model_k.predict(Z_pd_all_s)
+labs_all = np.array([remap.get(k, k) for k in labs_all], dtype=int)
+assign_all = pd.Series(np.nan, index=clin.index, name=f"subtype_K{K}_byUPDRS_ALLPD")
+assign_all.iloc[pd_idx_all[m_all]] = labs_all
+assign_all.to_csv(TAB/f"subtypes_ALLPD_K{K}_assignments.csv")
+
+
+##################################################################################################################################################################################################################################################
+
+
+# --- NEW: export a clean participant -> VAE cluster map ---
+K = int(HP["gmm_k"])
+allpd_path = TAB / f"subtypes_ALLPD_K{K}_assignments.csv"
+if allpd_path.exists():
+    sub_all = pd.read_csv(allpd_path, index_col=0)
+    # Find the column that holds the ALL-PD labels
+    col = next(c for c in sub_all.columns if c.lower().startswith("subtype_k") and "allpd" in c.lower())
+    vae_clusters = (sub_all[[col]]
+        .rename(columns={col: "vae_cluster"})
+        .reset_index()
+        .rename(columns={"index": "participant_id"}))
+    vae_clusters["participant_id"] = vae_clusters["participant_id"].astype(str)
+    vae_clusters.to_csv(DEEP / "vae_clusters.csv", index=False)
+    print(f"[Subtypes] Wrote clean VAE cluster map: {DEEP/'vae_clusters.csv'}")
+
+
+##################################################################################################################################################################################################################################################
+
+# Per-cluster summary (TRAIN-PD)
+rows = []
+for k in range(K):
+    mk = (labs_trpd==k); up = y_pd_clean[mk]
+    rows.append({"cluster": k, "n": int(mk.sum()),
+                 "UPDRS_mean": float(np.mean(up)) if up.size else np.nan,
+                 "UPDRS_median": float(np.median(up)) if up.size else np.nan,
+                 "UPDRS_IQR": float(np.percentile(up,75)-np.percentile(up,25)) if up.size else np.nan})
+summ = pd.DataFrame(rows).sort_values("cluster")
+summ.to_csv(TAB/f"subtypes_TRAINPD_K{K}_summary.csv", index=False)
+print("\n[Subtypes TRAIN-PD K=%d] per-cluster UPDRS summary:\n%s" % (K, summ))
+
+# Confounders on TRAIN-PD only
+from scipy.stats import chi2_contingency
+
+def cramers_v(table):
+    chi2 = chi2_contingency(table, correction=False)[0]
+    n = table.values.sum()
+    r, k = table.shape
+    return float(np.sqrt((chi2 / max(n, 1e-12)) / max(1, min(k-1, r-1))))
+    
+# Ensure pd_ids_clean and labs_trpd align
+pd_ids_clean = pd.Index(pd_ids_clean.astype(str))
+labs_series = pd.Series(labs_trpd, index=pd_ids_clean, name="cluster")
+
+def _safe_reindex_series(df: pd.DataFrame, col: str, idx: pd.Index) -> pd.Series:
+    """Return df[col] reindexed to idx, even if df's index isn't participant_id yet or col is missing."""
+    if col not in df.columns:
+        return pd.Series(index=idx, dtype=object)
+    s = df[col]
+    # If df's current index doesn't contain participant IDs, try to set it
+    if not df.index.isin(idx).any():
+        id_cands = ["participant_id","patno","patient_id","subject_id","subject","id","record_id","ppid","pdid","pid","participant"]
+        id_col = next((c for c in id_cands if c in df.columns), None)
+        if id_col is not None:
+            df_idxed = df.set_index(df[id_col].astype(str), drop=False)
+            s = df_idxed[col]
+    return s.reindex(idx)
+
+conf_rows = []
+
+# site
+site_ser = _safe_reindex_series(clin, "site", pd_ids_clean).astype(str)
+if site_ser.notna().sum() > 0 and site_ser.nunique(dropna=True) > 1:
+    tbl = pd.crosstab(labs_series, site_ser)
+    if tbl.shape[1] > 1 and tbl.values.sum() > 0:
+        conf_rows.append({"metric": "cluster x site CramérV", "value": cramers_v(tbl)})
+    else:
+        conf_rows.append({"metric": "cluster x site CramérV", "value": 0.0})
+
+# sex
+sex_ser = _safe_reindex_series(clin, "sex", pd_ids_clean).astype(str)
+if sex_ser.notna().sum() > 0 and sex_ser.nunique(dropna=True) > 1:
+    tbl = pd.crosstab(labs_series, sex_ser)
+    if tbl.shape[1] > 1 and tbl.values.sum() > 0:
+        conf_rows.append({"metric": "cluster x sex CramérV", "value": cramers_v(tbl)})
+    else:
+        conf_rows.append({"metric": "cluster x sex CramérV", "value": 0.0})
+
+# age (η²)
+def _eta2(groups, values):
+    df_local = pd.DataFrame({"g": groups, "x": values})
+    df_local = df_local[np.isfinite(df_local["x"])]
+    if df_local["g"].nunique() < 2:
+        return np.nan
+    grand = df_local["x"].mean()
+    ssb = df_local.groupby("g")["x"].apply(lambda v: len(v) * (v.mean() - grand) ** 2).sum()
+    sst = ((df_local["x"] - grand) ** 2).sum()
+    return float(ssb / sst) if sst > 0 else np.nan
+
+age_ser = pd.to_numeric(_safe_reindex_series(clin, "age", pd_ids_clean), errors="coerce")
+if age_ser.notna().sum() > 0:
+    eta_age = _eta2(labs_trpd, age_ser.values)
+    conf_rows.append({"metric": "age η² across clusters", "value": float(eta_age) if np.isfinite(eta_age) else 0.0})
+
+pd.DataFrame(conf_rows).to_csv(TAB / f"subtypes_TRAINPD_K{K}_confounders.csv", index=False)
+
+# -----------------------------
+# Integrated Gradients (global)
+# -----------------------------
+def integrated_gradients_smoothed(vae, head, X, which="rna", batch=128, steps=32, T=16, noise_sigma=0.1):
+    """
+    Deterministic IG for your encoder->latent->head path:
+      - encoder path uses mu (no sampling)
+      - head is set to eval() to disable dropout
+      - SmoothGrad-style input noise supported via T, noise_sigma
+    """
+    if vae is None or head is None or X is None or X.shape[1] == 0:
+        return np.array([], dtype=np.float32)
+    vae.eval(); head.eval()
+
+    # determine the "other" latent dim given 'which'
+    other_dim = HP["d_prot_lat"] if which == "rna" else HP["d_rna_lat"]
+    agg = np.zeros(X.shape[1], dtype=np.float64)
+    n_batches = 0
+
+    for start in range(0, len(all_ids), batch):
+        sl = slice(start, min(len(all_ids), start+batch))
+        x = torch.from_numpy(X[sl]).float().to(device)
+        baseline = torch.zeros_like(x)
+        grads_sum = np.zeros((x.shape[0], x.shape[1]), dtype=np.float64)
+
+        TT = max(1, int(T))
+        for _ in range(TT):
+            x_noisy = x + (noise_sigma*torch.randn_like(x) if noise_sigma>0 else 0.0)
+            grads = np.zeros_like(x_noisy.detach().cpu().numpy())
+
+            for alpha in np.linspace(0.0, 1.0, steps, endpoint=True):
+                xin = baseline + alpha * (x_noisy - baseline)
+                xin.requires_grad_(True)
+
+                # deterministic mean latents (no sampling)
+                mu, lv = vae.encode(xin)
+                z_this = mu
+                z_other = torch.zeros((xin.shape[0], other_dim), device=device)
+
+                # modality flags as in your original code
+                fr = torch.ones((xin.shape[0],1), device=device) if which=="rna" else torch.zeros((xin.shape[0],1), device=device)
+                fp = torch.ones((xin.shape[0],1), device=device) if which!="rna" else torch.zeros((xin.shape[0],1), device=device)
+
+                if which == "rna":
+                    yhat, _ = head(z_this, z_other, fr, fp)
+                else:
+                    yhat, _ = head(z_other, z_this, fr, fp)
+
+                (yhat.sum()).backward()
+                grads += xin.grad.detach().cpu().numpy()
+
+            ig = (x_noisy.detach().cpu().numpy() - baseline.detach().cpu().numpy()) * (grads / steps)
+            grads_sum += ig
+
+        ig_batch = grads_sum / TT
+        agg += np.nanmean(np.abs(ig_batch), axis=0)
+        n_batches += 1
+
+    out = (agg / max(1, n_batches)).astype(np.float32)
+    return out
+
+rna_ig  = integrated_gradients_smoothed(vae_r_final, head_final, Xr, which="rna", T=HP["ig_smooth_T"])  if d_rna>0 else np.array([])
+prot_ig = integrated_gradients_smoothed(vae_p_final, head_final, Xp, which="prot", T=HP["ig_smooth_T"]) if d_prot>0 else np.array([])
+if rna_ig.size>0:  pd.Series(rna_ig, index=rna_cols).sort_values(ascending=False).to_csv(DEEP/"drivers_rna_IG.csv")
+if prot_ig.size>0: pd.Series(prot_ig, index=prot_cols).sort_values(ascending=False).to_csv(DEEP/"drivers_proteins_IG.csv")
+
+# -----------------------------
+# Isotonic calibration (optional)
+# -----------------------------
+from sklearn.isotonic import IsotonicRegression
+calibration_results = {}
+if getattr(FLAGS, "calibrate", False):
+    mask_oof = np.isfinite(oof_pred) & np.isfinite(y_tr); iso = None
+    if mask_oof.sum() >= 100: iso = IsotonicRegression(out_of_bounds='clip').fit(oof_pred[mask_oof], y_tr[mask_oof])
+    def _eval_cal(pred_raw, y_truth):
+        if pred_raw is None or (isinstance(pred_raw, np.ndarray) and pred_raw.size == 0):
+            return None
+    
+        # Handle NaN values before prediction
+        if iso is not None:
+            pred_cal = np.full_like(pred_raw, np.nan)
+            mask_finite = np.isfinite(pred_raw)
+            if mask_finite.any():
+                # Predict only on the non-NaN values
+                pred_cal[mask_finite] = iso.predict(pred_raw[mask_finite])
+        else:
+            pred_cal = pred_raw
+    
+        # The rest of the function remains the same, as it already handles NaNs correctly
+        m = np.isfinite(pred_cal) & np.isfinite(y_truth)
+        if not m.any():
+            return None
+        mae = float(np.mean(np.abs(pred_cal[m] - y_truth[m])))
+        rmse = float(np.sqrt(np.mean((pred_cal[m] - y_truth[m])**2)))
+        return dict(mae=mae, rmse=rmse)
+    y_te_truth = y_all[test_idx] if test_idx.size>0 else np.array([])
+    cal_raw   = _eval_cal(test_pred, y_te_truth)
+    cal_coral = _eval_cal(yhat_te_rna, y_te_truth) if (yhat_te_rna is not None) else None
+    if yhat_te_rna is not None and test_pred.size>0:
+        y_blend = best_w*test_pred + (1.0-best_w)*yhat_te_rna if "blend" in best_mode else test_pred
+    else: y_blend = None
+    cal_blend = _eval_cal(y_blend, y_te_truth) if y_blend is not None else None
+    calibration_results = {"raw":cal_raw, "coral_rna":cal_coral, "blend_or_raw":cal_blend}
+    summary_update({"calibration": calibration_results})
+
+
+# -----------------------------
+# Visit code inference helper
+# -----------------------------
+def infer_visit_code(df: pd.DataFrame) -> pd.Series:
+    """Infer visit code 'M<num>' per row from visit_name / sample_id / months."""
+    idx = df.index
+    vc = pd.Series(pd.NA, index=idx, dtype="object")
+
+    # 1) From visit_name (e.g., 'M0', 'M6', 'Month 12', etc.)
+    if "visit_name" in df.columns:
+        v = df["visit_name"].astype(str).str.upper()
+        # Prefer explicit M### tokens
+        tok = v.str.extract(r"\b(M\d{1,3})\b", expand=False)
+        # If not found, try 'Month 12' → M12
+        fallback = v.str.extract(r"\bMONTH\s*(\d{1,3})\b", expand=False)
+        vc = tok.fillna(fallback.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
+
+    # 2) From sample_id (e.g., '...-BLM0T1-...' or '...-M6-...')
+    if "sample_id" in df.columns:
+        s = df["sample_id"].astype(str)
+        # BLM0T1 → M0 (take the number after 'BLM')
+        m_blm = s.str.extract(r"\bBLM(\d{1,3})", flags=re.IGNORECASE, expand=False)
+        # Any standalone -M6- / _M12_ / ... → capture the number after M
+        m_plain = s.str.extract(r"(?<![A-Z0-9])M(\d{1,3})(?![A-Z0-9])", flags=re.IGNORECASE, expand=False)
+        vc = vc.fillna(m_blm.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
+        vc = vc.fillna(m_plain.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
+
+    # 3) From months numeric (round to nearest integer)
+    if "months" in df.columns:
+        mn = pd.to_numeric(df["months"], errors="coerce")
+        vc = vc.fillna(mn.round().astype("Int64").map(lambda z: f"M{int(z)}" if pd.notna(z) else pd.NA))
+
+    # Clean and standardize
+    vc = vc.astype("string")
+    return vc
+
+
+# -----------------------------
+# Save predictions & summary + artifacts
+# -----------------------------
+pred = pd.DataFrame(index=all_ids)
+pred.loc[clin.index[is_train], "severity_oof"] = oof_pred
+if test_idx.size>0 and test_pred.size>0:
+    pred.loc[clin.index[is_test],  "severity_pred_test_raw"] = test_pred
+if (yhat_te_rna is not None) and len(yhat_te_rna)==len(test_idx):
+    pred.loc[clin.index[is_test],  "severity_pred_test_coral_rna"] = yhat_te_rna
+if (yhat_te_fused is not None) and len(yhat_te_fused)==len(test_idx):
+    pred.loc[clin.index[is_test],  "severity_pred_test_coral_fused"] = yhat_te_fused
+if ('yhat_te_rna_ot' in locals()) and (yhat_te_rna_ot is not None) and len(yhat_te_rna_ot)==len(test_idx):
+    pred.loc[clin.index[is_test],  "severity_pred_test_ot_rna"] = yhat_te_rna_ot
+if ('yhat_te_fused_ot' in locals()) and (yhat_te_fused_ot is not None) and len(yhat_te_fused_ot)==len(test_idx):
+    pred.loc[clin.index[is_test],  "severity_pred_test_ot_fused"] = yhat_te_fused_ot
+
+best_series = np.full_like(test_pred, np.nan, dtype=np.float32)
+if best_mode == "raw":
+    best_series = test_pred.copy()
+elif best_mode == "ot-fused" and ('yhat_te_fused_ot' in locals()) and (yhat_te_fused_ot is not None) and test_idx_omics.size>0:
+    tmp = np.full(test_idx.shape[0], np.nan, dtype=np.float32)
+    # Use the mask on BOTH sides of the assignment to align the dimensions
+    mask = has_any_omics[test_idx]
+    tmp[mask] = yhat_te_fused_ot[mask]
+    best_series = tmp
+
+pred["severity_pred_TEST_chosen"] = np.nan
+if test_idx.size>0 and best_series.size>0:
+    pred.loc[clin.index[is_test], "severity_pred_TEST_chosen"] = best_series
+# Add visit_code column aligned to clin rows (index is already clin.index)
+pred["visit_code"] = infer_visit_code(clin)
+
+pred["cohort"] = clin["cohort"]
+pred.to_csv(DEEP/"predictions.csv")
+print(f"[Predictions] Added visit_code; value counts (top 10):\n{pred['visit_code'].value_counts(dropna=False).head(10)}")
+
+
+# Add pin fingerprints to summary
+man = _load_manifest(); meta = _load_meta()
+summary_update({
+    "n_train": int(is_train.sum()), "n_test": int(is_test.sum()),
+    "d_rna": int(d_rna), "d_prot": int(d_prot),
+    "latent_total_dim": int(HP["d_rna_lat"]+HP["d_prot_lat"]),
+    "oof_spearman": float(rho_oof) if np.isfinite(rho_oof) else None,
+    "test_spearman": float(rho_test) if np.isfinite(rho_test) else None,
+    "test_spearman_coral_rna": float(rho_coral) if np.isfinite(rho_coral) else None,
+    "test_spearman_coral_fused": float(rho_coral_fused) if np.isfinite(rho_coral_fused) else None,
+    "test_spearman_ot_rna": float(rho_ot_rna) if np.isfinite(rho_ot_rna) else None,
+    "test_spearman_ot_fused": float(rho_ot_fused) if np.isfinite(rho_ot_fused) else None,
+    "test_choice": best_mode, "test_spearman_chosen": float(best_rho) if np.isfinite(best_rho) else None,
+    "blend_train_w": float(best_w) if "blend" in best_mode else None,
+    "subtype_K": int(HP["gmm_k"]),
+    "drivers_rna_IG_csv": str(DEEP/"drivers_rna_IG.csv") if rna_ig.size>0 else None,
+    "drivers_proteins_IG_csv": str(DEEP/"drivers_proteins_IG.csv") if prot_ig.size>0 else None,
+    "calibration": calibration_results if getattr(FLAGS,"calibrate",False) else None,
+    "z_rna_sha12": meta.get("z_rna.csv",{}).get("sha12"), "z_proteins_sha12": meta.get("z_proteins.csv",{}).get("sha12"),
+    "hc_mode": meta.get("z_rna.csv",{}).get("hc_mode") or HC_MODE,
+})
+
+# -----------------------------
+# NEW: Signatures for drug/pathway analysis (TRAIN-PD only)
+# -----------------------------
+def _nanstats_no_warn(A: np.ndarray, axis=0):
+    """Column-wise mean/std/count without RuntimeWarnings on empty slices."""
+    A = np.asarray(A, dtype=np.float64)
+    mask = np.isfinite(A)
+    cnt  = mask.sum(axis=axis)
+
+    sumv  = np.nansum(np.where(mask, A,    0.0), axis=axis)
+    sqsum = np.nansum(np.where(mask, A*A,  0.0), axis=axis)
+
+    # means only where cnt>0
+    mean = np.divide(sumv, cnt, out=np.full(sumv.shape, np.nan), where=(cnt > 0))
+
+    # variance with ddof=1 only where cnt>=2
+    var_num = sqsum - (sumv * sumv) / np.clip(cnt, 1, None)
+    denom   = np.clip(cnt - 1, 1, None)
+    var = np.divide(var_num, denom, out=np.full(sumv.shape, np.nan), where=(cnt >= 2))
+    std = np.sqrt(np.maximum(var, 0.0))
+
+    return mean, std, cnt
+
+
+SIG_DIR = DEEP/"signatures"; SIG_DIR.mkdir(parents=True, exist_ok=True)
+
+def _effect_scores_matrix(Z_df: pd.DataFrame, ids: pd.Index, labs: np.ndarray, k: int) -> pd.Series:
+    # Signal-to-noise: (mean_k - mean_rest) / (sd_k + sd_rest + 1e-6), NaN-safe & warning-free
+    idx = pd.Index(ids)
+    Z = Z_df.reindex(idx)
+    X = Z.values.astype(np.float64)
+    mk = (labs == k)
+
+    # tiny clusters produce unstable stats; bail early
+    if mk.sum() < 5 or (~mk).sum() < 5:
+        return pd.Series(dtype=float, index=Z.columns)
+
+    mean_k, sd_k, n_k = _nanstats_no_warn(X[mk, :],  axis=0)
+    mean_o, sd_o, n_o = _nanstats_no_warn(X[~mk, :], axis=0)
+
+    ok_cols = (n_k > 0) & (n_o > 0)
+    num   = (mean_k - mean_o)
+    denom = (sd_k + sd_o + 1e-6)
+
+    snr = np.zeros(X.shape[1], dtype=np.float64)
+    np.divide(num, denom, out=snr, where=ok_cols & np.isfinite(denom))
+    snr = np.nan_to_num(snr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return pd.Series(snr, index=Z.columns)
+
+def _write_signature_files(base_name: str, ranked: pd.Series, topN:int=250):
+    ranked = ranked.sort_values(ascending=False)
+    up = ranked.head(topN); dn = ranked.tail(topN)  # dn are most negative
+    # CSV (ranked)
+    ranked.to_csv(SIG_DIR/f"{base_name}.rnk.csv", header=["score"])
+    # RNK (two columns)
+    (ranked.reset_index().rename(columns={"index":"feature", 0:"score"})
+           .to_csv(SIG_DIR/f"{base_name}.rnk", sep="\t", header=False, index=False))
+    # TXT (lists)
+    up.index.to_series().to_csv(SIG_DIR/f"{base_name}_UP.txt", index=False, header=False)
+    dn.index[::-1].to_series().to_csv(SIG_DIR/f"{base_name}_DOWN.txt", index=False, header=False)
+    # GMT (single-term)
+    def to_gmt(feats, tag):
+        with open(SIG_DIR/f"{base_name}_{tag}.gmt","w") as f:
+            f.write(f"{base_name}_{tag}\tNA\t" + "\t{feats}\n".format(feats="\t".join(map(str, feats))))
+    to_gmt(up.index, "UP"); to_gmt(list(dn.index[::-1]), "DOWN")
+
+# Build TRAIN-PD id order used in labs_trpd
+trainpd_ids_ser = pd.Series(pd_ids_clean, index=np.arange(len(pd_ids_clean)))
+for k_ in range(K):
+    # RNA
+    if d_rna>0:
+        r_snr = _effect_scores_matrix(z_rna, pd_ids_clean, labs_trpd, k_)
+        if not r_snr.empty:
+            _write_signature_files(f"K{K}_cluster{k_}_RNA", r_snr)
+    # PROT
+    if d_prot>0:
+        p_snr = _effect_scores_matrix(z_prot, pd_ids_clean, labs_trpd, k_)
+        if not p_snr.empty:
+            _write_signature_files(f"K{K}_cluster{k_}_PROT", p_snr)
+
+# Convenience bundle manifest + "first three" pointers
+sig_manifest = []
+for k_ in range(K):
+    row = {"cluster": int(k_), "RNA_rnk": str(SIG_DIR/f"K{K}_cluster{k_}_RNA.rnk"),
+           "RNA_up": str(SIG_DIR/f"K{K}_cluster{k_}_RNA_UP.txt"),
+           "RNA_down": str(SIG_DIR/f"K{K}_cluster{k_}_RNA_DOWN.txt"),
+           "PROT_rnk": str(SIG_DIR/f"K{K}_cluster{k_}_PROT.rnk"),
+           "PROT_up": str(SIG_DIR/f"K{K}_cluster{k_}_PROT_UP.txt"),
+           "PROT_down": str(SIG_DIR/f"K{K}_cluster{k_}_PROT_DOWN.txt")}
+    sig_manifest.append(row)
+pd.DataFrame(sig_manifest).to_csv(SIG_DIR/f"signature_manifest_K{K}.csv", index=False)
+
+# -----------------------------
+# NEW: Correlation analyses with UPSIT (OOF/TEST + per-cluster)
+# -----------------------------
+def _spearman_series(a: pd.Series, b: pd.Series) -> float:
+    return spearman_np(a.values.astype(float), b.values.astype(float))
+
+# OOF vs UPSIT (TRAIN)
+oof_ser = pd.Series(np.nan, index=clin.index); oof_ser.iloc[train_idx] = oof_pred
+upsit_ser = pd.to_numeric(clin["upsit_total"], errors="coerce")
+mtr = is_train & oof_ser.notna() & upsit_ser.notna()
+rho_oof_upsit = spearman_np(oof_ser[mtr].values, upsit_ser[mtr].values) if mtr.any() else np.nan
+print(f"[UPSIT] TRAIN OOF severity ~ UPSIT Spearman ρ: {rho_oof_upsit:.3f}" if np.isfinite(rho_oof_upsit) else "[UPSIT] TRAIN OOF: insufficient data")
+
+# TEST chosen vs UPSIT — only among TEST with omics
+chosen_ser = pred.loc[clin.index[is_test], "severity_pred_TEST_chosen"]
+upsit_te = upsit_ser[is_test]
+mte = chosen_ser.notna() & upsit_te.notna() & pd.Series(has_any_omics[is_test.values], index=chosen_ser.index)
+rho_test_upsit = spearman_np(chosen_ser[mte].values.astype(float), upsit_te[mte].values.astype(float)) if mte.any() else np.nan
+if np.isfinite(rho_test_upsit): print(f"[UPSIT] TEST chosen severity ~ UPSIT Spearman ρ: {rho_test_upsit:.3f}")
+
+# Per-cluster UPSIT summary on TRAIN-PD
+upsit_pd_train = upsit_ser.reindex(pd_ids_clean)
+rows_u = []
+for k_ in range(K):
+    mk = (labs_trpd==k_)
+    uu = pd.to_numeric(upsit_pd_train[mk], errors="coerce")
+    rows_u.append({"cluster":k_, "UPSIT_n": int(uu.notna().sum()),
+                   "UPSIT_mean": float(np.nanmean(uu)) if uu.notna().sum()>0 else np.nan,
+                   "UPSIT_median": float(np.nanmedian(uu)) if uu.notna().sum()>0 else np.nan})
+upsit_summary = pd.DataFrame(rows_u); upsit_summary.to_csv(TAB/f"subtypes_TRAINPD_K{K}_UPSIT_summary.csv", index=False)
+
+# Kruskal-Wallis for UPSIT across clusters (TRAIN-PD)
+try:
+    groups = [pd.to_numeric(upsit_pd_train[labs_trpd==k_], errors="coerce").dropna().values for k_ in range(K)]
+    groups = [g for g in groups if g.size>0]
+    if len(groups)>=2:
+        kw_stat, kw_p = kruskal(*groups)
+        print(f"[UPSIT] Kruskal-Wallis across clusters: H={kw_stat:.3f}, p={kw_p:.3e}")
+except Exception as e:
+    print("[UPSIT] KW WARN:", e)
+
+summary_update({"rho_oof_upsit": float(rho_oof_upsit) if np.isfinite(rho_oof_upsit) else None,
+                "rho_test_upsit": float(rho_test_upsit) if np.isfinite(rho_test_upsit) else None})
+
+
+# -----------------------------
+# COMBINED (RNA+PROT) ranked lists per subtype (UP/DOWN)
+# -----------------------------
+def _load_rnk_series(p: Path) -> pd.Series:
+    if not p.exists(): 
+        return pd.Series(dtype=float)
+    s = pd.read_csv(p, index_col=0).iloc[:, 0]
+    # Ensure numeric & drop all-NaN safely
+    s = pd.to_numeric(s, errors="coerce")
+    return s.dropna()
+
+def _z_within_mod(x: pd.Series) -> pd.Series:
+    # Z-score within each modality to make RNA/PROT comparable
+    mu, sd = float(x.mean()), float(x.std(ddof=0))
+    if not np.isfinite(sd) or sd == 0.0:
+        return pd.Series(np.zeros(len(x), dtype=float), index=x.index)
+    return (x - mu) / sd
+
+def _write_combo_files(k_: int, use_topN: Optional[int] = None):
+    base_rna = SIG_DIR / f"K{K}_cluster{k_}_RNA.rnk.csv"
+    base_pro = SIG_DIR / f"K{K}_cluster{k_}_PROT.rnk.csv"
+
+    sr = _load_rnk_series(base_rna)
+    sp = _load_rnk_series(base_pro)
+
+    # Build combined frame with modality & prefixed feature IDs to avoid name collisions
+    rows = []
+    if not sr.empty:
+        rows.append(pd.DataFrame({"feature": ["RNA:"+str(i) for i in sr.index],
+                                  "modality": "RNA", "score": sr.values}))
+    if not sp.empty:
+        rows.append(pd.DataFrame({"feature": ["PROT:"+str(i) for i in sp.index],
+                                  "modality": "PROT", "score": sp.values}))
+    if not rows:
+        return  # nothing to do for this cluster
+
+    df = pd.concat(rows, axis=0, ignore_index=True)
+
+    # Z within each modality
+    df["z_mod"] = df.groupby("modality", observed=True)["score"].transform(_z_within_mod)
+    # Signed magnitude for ranking (you can switch to abs if you prefer)
+    df["z_signed"] = df["z_mod"]
+
+    # Split UP/DOWN
+    up = df[df["z_signed"] > 0].copy()
+    dn = df[df["z_signed"] < 0].copy()
+
+    # Sort (UP: largest positive first; DOWN: most negative first)
+    up.sort_values("z_signed", ascending=False, inplace=True)
+    dn.sort_values("z_signed", ascending=True,  inplace=True)
+
+    # Optional topN clip (None = full list)
+    if isinstance(use_topN, int) and use_topN > 0:
+        up = up.head(use_topN)
+        dn = dn.head(use_topN)
+
+    # Add 1-based rank
+    up["rank"] = np.arange(1, len(up)+1, dtype=int)
+    dn["rank"] = np.arange(1, len(dn)+1, dtype=int)
+
+    # Filenames
+    tag = f"K{K}_cluster{k_}_COMBO"
+    up_csv  = SIG_DIR / f"{tag}_UP.rnk.csv"
+    up_rnk  = SIG_DIR / f"{tag}_UP.rnk"
+    up_txt  = SIG_DIR / f"{tag}_UP.txt"
+    dn_csv  = SIG_DIR / f"{tag}_DOWN.rnk.csv"
+    dn_rnk  = SIG_DIR / f"{tag}_DOWN.rnk"
+    dn_txt  = SIG_DIR / f"{tag}_DOWN.txt"
+
+    # Save CSVs with rich columns
+    cols = ["feature","modality","score","z_mod","z_signed","rank"]
+    up.to_csv(up_csv, index=False, columns=cols)
+    dn.to_csv(dn_csv, index=False, columns=cols)
+
+    # GSEA-style RNK (feature \t score): use z_signed so modalities are comparable
+    up[["feature","z_signed"]].to_csv(up_rnk, sep="\t", header=False, index=False)
+    dn[["feature","z_signed"]].to_csv(dn_rnk, sep="\t", header=False, index=False)
+
+    # Plain TXT lists (ordered)
+    up["feature"].to_csv(up_txt, index=False, header=False)
+    dn["feature"].to_csv(dn_txt, index=False, header=False)
+
+    return {
+        "cluster": int(k_),
+        "COMBO_up_csv":  str(up_csv),
+        "COMBO_up_rnk":  str(up_rnk),
+        "COMBO_up_txt":  str(up_txt),
+        "COMBO_down_csv":str(dn_csv),
+        "COMBO_down_rnk":str(dn_rnk),
+        "COMBO_down_txt":str(dn_txt),
+    }
+
+# Write combined files for all clusters
+combo_rows = []
+for k_ in range(K):
+    info = _write_combo_files(k_, use_topN=None)  # set topN (e.g., 250) if you want to cap length
+    if info: combo_rows.append(info)
+
+# Optional: a small manifest for the combined outputs
+if combo_rows:
+    pd.DataFrame(combo_rows).to_csv(SIG_DIR / f"signature_manifest_K{K}_COMBO.csv", index=False)
+    print(f"[Signatures/COMBO] Wrote combined RNA+PROT UP/DOWN ranked lists for K={K} to {SIG_DIR}")
+
+# ------------------------------------------------------------------
+# NEW: Perturbation lists (vs HC) as Entrez IDs
+# ------------------------------------------------------------------
+try:
+    from scipy.stats import ttest_ind
+    from statsmodels.stats.multitest import multipletests
+    import mygene
+    HAVE_PERT_LIBS = True
+except ImportError:
+    HAVE_PERT_LIBS = False
+    print("[PERT] `scipy`, `statsmodels`, or `mygene` not installed; skipping Entrez perturbation lists.")
+
+
+def _one_vs_group_stats(Z_df, ids1, ids2, name_prefix=None):
+    """Plausible implementation of stats helper for perturbation lists."""
+    X1 = Z_df.reindex(ids1).values.astype(np.float64)
+    X2 = Z_df.reindex(ids2).values.astype(np.float64)
+
+    m1, s1, n1 = _nanstats_no_warn(X1, axis=0)
+    m2, s2, n2 = _nanstats_no_warn(X2, axis=0)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        t_stat, p_val = ttest_ind(X1, X2, axis=0, nan_policy='omit', equal_var=False)
+
+    p_val[np.isnan(p_val)] = 1.0
+    q_val = multipletests(p_val, alpha=0.25, method='fdr_bh')[1]
+
+    delta = m1 - m2
+    snr = np.divide(delta, (s1 + s2 + 1e-6), where=(s1+s2)>0, out=np.zeros_like(delta))
+    agg_score = np.abs(delta) * -np.log10(np.clip(p_val, 1e-10, 1.0))
+
+    df = pd.DataFrame({
+        "feature": Z_df.columns, "delta": delta, "pvalue": p_val,
+        "qval": q_val, "snr": snr, "agg_score": agg_score,
+    })
+    if name_prefix:
+        df = df.add_prefix(name_prefix)
+    return df
+
+ENSEMBL_RX = re.compile(r'^(ENS[A-Z]*G[0-9]+)')
+UNIPROT_RX = re.compile(r'^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9][A-Z0-9]{3}[0-9])$')
+
+def _clean_id_local(x):
+    s = str(x).strip()
+    s = re.sub(r'^(RNA:|PROT:)', '', s, flags=re.I)
+    core = s.split('.')[0]
+    m = ENSEMBL_RX.match(core) or ENSEMBL_RX.match(s)
+    if m: return m.group(1), "ensembl"
+    if UNIPROT_RX.match(core): return core, "uniprot"
+    return core, "symbol"
+
+def map_any_to_entrez(ids_with_types):
+    mg = mygene.MyGeneInfo()
+    mapping = {}
+    def do_query(queries, scopes):
+        if not queries: return
+        try:
+            res = mg.querymany(queries, scopes=scopes, fields="entrezgene,taxid", species="human",
+                               as_dataframe=False, batch_size=1000, verbose=False)
+            for r in res:
+                if not r or r.get("notfound"): continue
+                if "entrezgene" in r and r.get("taxid") in (9606, "9606", None):
+                    mapping[r["query"]] = str(r["entrezgene"])
+        except Exception as e:
+            print(f"[PERT] Mapping failed for scopes={scopes}: {e}")
+
+    ens = sorted(set(ids_with_types.loc[ids_with_types["id_type"]=="ensembl","id_clean"]))
+    uni = sorted(set(ids_with_types.loc[ids_with_types["id_type"]=="uniprot","id_clean"]))
+    sym = sorted(set(ids_with_types.loc[ids_with_types["id_type"]=="symbol","id_clean"]))
+    do_query(ens, "ensembl.gene"); do_query(uni, "uniprot"); do_query(sym, "symbol")
+    return mapping
+
+def _write_pert_lists_mixed_ENTREZ(df, base):
+    alpha = 0.25; topn = 250
+    pos = df[df["delta"] > 0].copy(); neg = df[df["delta"] < 0].copy()
+    up = pos[pos["qval"] <= alpha].sort_values("agg_score", ascending=False)
+    dn = neg[neg["qval"] <= alpha].sort_values("agg_score", ascending=False)
+    if len(up) < topn:
+        up = pd.concat([up, pos.sort_values("agg_score", ascending=False).head(topn)]).drop_duplicates("feature").sort_values("agg_score", ascending=False).head(topn)
+    else: up = up.head(topn)
+    if len(dn) < topn:
+        dn = pd.concat([dn, neg.sort_values("agg_score", ascending=False).head(topn)]).drop_duplicates("feature").sort_values("agg_score", ascending=False).head(topn)
+    else: dn = dn.head(topn)
+
+    def prep(df_dir):
+        ids = df_dir["feature"].map(lambda x: _clean_id_local(x)[0]).astype(str)
+        types = df_dir["feature"].map(lambda x: _clean_id_local(x)[1])
+        meta = pd.DataFrame({"id_clean": ids, "id_type": types})
+        m = map_any_to_entrez(meta)
+        entrez = ids.map(m).dropna().astype(str)
+        return pd.Index(entrez).drop_duplicates()
+
+    up_entrez = prep(up); dn_entrez = prep(dn)
+    up_txt = SIG_DIR / f"{base}_UP_for_perturbation.txt"
+    dn_txt = SIG_DIR / f"{base}_DOWN_for_perturbation.txt"
+    up_entrez.to_series().to_csv(up_txt, index=False, header=False)
+    dn_entrez.to_series().to_csv(dn_txt, index=False, header=False)
+    print(f"[PERT] Wrote Entrez-only lists: {up_txt.name} (n={len(up_entrez)}), {dn_txt.name} (n={len(dn_entrez)})")
+
+
+def _write_ranked_DE_lists_symbol(df, base, score_col="snr", topN=250):
+    """
+    Build a single mixed RNA+PROT ranked list (subtype vs HC) in gene symbols,
+    plus UP/DOWN symbol sets for GSEA.
+    """
+    if df.empty or score_col not in df.columns:
+        return
+
+    # Keep only finite scores
+    score = pd.to_numeric(df[score_col], errors="coerce")
+    feat  = df["feature"].astype(str)
+    mask  = np.isfinite(score)
+    score = score[mask]
+    feat  = feat[mask]
+
+    # Clean IDs to (id_clean, id_type)
+    ids = feat.map(lambda x: _clean_id_local(x)[0])
+    types = feat.map(lambda x: _clean_id_local(x)[1])
+    meta = pd.DataFrame({"id_clean": ids, "id_type": types, "score": score})
+
+    # Map to gene symbols
+    sym_map = map_any_to_symbol(meta)
+    symbols = meta["id_clean"].map(sym_map)
+    meta2 = meta.loc[symbols.notna()].copy()
+    meta2["symbol"] = symbols[symbols.notna()]
+
+    if meta2.empty:
+        print(f"[DE] No mappable symbols for {base}")
+        return
+
+    # Collapse duplicates per symbol: keep score with largest |score|
+    idx_best = meta2["score"].abs().groupby(meta2["symbol"]).idxmax()
+    tmp = meta2.loc[idx_best].set_index("symbol")
+    s = tmp["score"].sort_values(ascending=False)
+
+    # --- Full ranked list (.rnk) ---
+    rnk_path = SIG_DIR / f"{base}.rnk"
+    s.to_csv(rnk_path, sep="\t", header=False)
+
+    # --- UP/DOWN symbol sets ---
+    up = s[s > 0].sort_values(ascending=False).head(topN).index
+    dn = s[s < 0].sort_values(ascending=True).head(topN).index
+
+    up.to_series().to_csv(SIG_DIR / f"{base}_UP.txt", index=False, header=False)
+    dn.to_series().to_csv(SIG_DIR / f"{base}_DOWN.txt", index=False, header=False)
+
+    print(f"[DE] {base}: ranked={len(s)}, UP={len(up)}, DOWN={len(dn)}")
+    return {
+        "rank_rnk": str(rnk_path),
+        "up_txt":   str(SIG_DIR / f"{base}_UP.txt"),
+        "down_txt": str(SIG_DIR / f"{base}_DOWN.txt"),
+    }
+
+
+
+def map_any_to_symbol(ids_with_types):
+    mg = mygene.MyGeneInfo()
+    mapping = {}
+
+    def do_query(queries, scopes):
+        if not queries:
+            return
+        try:
+            res = mg.querymany(
+                queries,
+                scopes=scopes,
+                fields="symbol,taxid",
+                species="human",
+                as_dataframe=False,
+                batch_size=1000,
+                verbose=False,
+            )
+            for r in res:
+                if not r or r.get("notfound"):
+                    continue
+                sym = r.get("symbol")
+                if sym and r.get("taxid") in (9606, "9606", None):
+                    mapping[r["query"]] = sym
+        except Exception as e:
+            print(f"[PERT] Mapping to symbol failed for scopes={scopes}: {e}")
+
+    ens = sorted(set(ids_with_types.loc[ids_with_types["id_type"]=="ensembl","id_clean"]))
+    uni = sorted(set(ids_with_types.loc[ids_with_types["id_type"]=="uniprot","id_clean"]))
+    sym = sorted(set(ids_with_types.loc[ids_with_types["id_type"]=="symbol","id_clean"]))
+
+    do_query(ens, "ensembl.gene")
+    do_query(uni, "uniprot")
+    do_query(sym, "symbol")
+    return mapping
+
+
+
+if HAVE_PERT_LIBS:
+    train_pd_ids = pd.Index(pd_ids_clean)
+    train_hc_ids = clin.index[(is_train.values) & (is_control.values)]
+
+    Z_mix_frames = []
+    if not z_rna.empty: Z_mix_frames.append(z_rna.add_prefix("RNA:"))
+    if not z_prot.empty: Z_mix_frames.append(z_prot.add_prefix("PROT:"))
+    if Z_mix_frames:
+        Z_mix = pd.concat(Z_mix_frames, axis=1, join="outer")
+        for k_ in range(K):
+            in_ids = pd.Index(pd_ids_clean[labs_trpd == k_])
+            hc_ids_avail = train_hc_ids.intersection(Z_mix.index)
+            if len(in_ids) < 5 or len(hc_ids_avail) < 5:
+                continue
+
+            # Subtype vs HC stats on mixed RNA+PROT z-scores
+            df_drug = _one_vs_group_stats(Z_mix, in_ids, hc_ids_avail)
+
+            # (1) Entrez perturbation lists (as before)
+            base_pert = f"K{K}_cluster{k_}_MIXED.PERT_vsHC"
+            _write_pert_lists_mixed_ENTREZ(df_drug, base_pert)
+
+            # (2) GSEA-style ranked lists in gene symbols (subtype vs HC)
+            base_de = f"K{K}_cluster{k_}_MIXED_vsHC"
+            _write_ranked_DE_lists_symbol(df_drug, base_de, score_col="snr", topN=250)
+
+    else:
+        print("[PERT] No RNA or Protein data to build mixed perturbation lists.")
+
+# -----------------------------
+# Publication-style figures (existing + new)
+# -----------------------------
+try:
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"figure.dpi": 300})
+    # OOF
+    mask_oof = np.isfinite(oof_pred) & np.isfinite(y_tr)
+    if mask_oof.any():
+        plt.figure(figsize=(4,4))
+        plt.scatter(y_tr[mask_oof], oof_pred[mask_oof], s=6, alpha=0.3)
+        plt.xlabel("UPDRS (true)"); plt.ylabel("Severity (OOF)")
+        plt.title(f"OOF ρ={spearman_np(oof_pred, y_tr):.3f}")
+        m1 = min(y_tr[mask_oof].min(), oof_pred[mask_oof].min()); m2 = max(y_tr[mask_oof].max(), oof_pred[mask_oof].max())
+        plt.plot([m1,m2],[m1,m2], linewidth=1)
+        plt.tight_layout(); plt.savefig(FIG/"oof_scatter.png", dpi=300); plt.close()
+    # TEST raw (omics-only)
+    if test_idx_omics.size>0 and test_pred.size>0:
+        y_te = y_all[test_idx_omics]
+        mask_te_full = np.isfinite(test_pred) & np.isfinite(y_all[test_idx])
+        mask_te = np.zeros_like(mask_te_full, dtype=bool)
+        mask_te[has_any_omics[test_idx]] = mask_te_full[has_any_omics[test_idx]]
+        if mask_te.any():
+            plt.figure(figsize=(4,4))
+            plt.scatter(y_all[test_idx][mask_te], test_pred[mask_te], s=6, alpha=0.3)
+            plt.xlabel("UPDRS (true)"); plt.ylabel("Severity (TEST raw)")
+            plt.title(f"TEST raw (omics-only) ρ={spearman_np(test_pred[has_any_omics[test_idx]], y_te):.3f}")
+            m1 = min(y_all[test_idx][mask_te].min(), test_pred[mask_te].min()); m2 = max(y_all[test_idx][mask_te].max(), test_pred[mask_te].max())
+            plt.plot([m1,m2],[m1,m2], linewidth=1)
+            plt.tight_layout(); plt.savefig(FIG/"test_scatter_raw.png", dpi=300); plt.close()
+    # TEST chosen (omics-only)
+    if test_idx.size>0:
+        y_te = y_all[test_idx]
+        chosen = pred.loc[clin.index[is_test], "severity_pred_TEST_chosen"].values
+        mask_te2 = np.isfinite(chosen) & np.isfinite(y_te) & has_any_omics[test_idx]
+        if mask_te2.any():
+            plt.figure(figsize=(4,4))
+            plt.scatter(y_te[mask_te2], chosen[mask_te2], s=6, alpha=0.3)
+            plt.xlabel("UPDRS (true)"); plt.ylabel("Severity (TEST chosen)")
+            plt.title(f"TEST chosen (omics-only) — ρ={float(best_rho) if np.isfinite(best_rho) else np.nan:.3f}")
+            m1 = min(y_te[mask_te2].min(), chosen[mask_te2].min()); m2 = max(y_te[mask_te2].max(), chosen[mask_te2].max())
+            plt.plot([m1,m2],[m1,m2], linewidth=1)
+            plt.tight_layout(); plt.savefig(FIG/"test_scatter_chosen.png", dpi=300); plt.close()
+    # K-grid composite z-sum
+    grid_csv = TAB/"subtype_grid_TRAINPD.csv"
+    if grid_csv.exists():
+        gdf = pd.read_csv(grid_csv)
+        if "zsum" in gdf.columns:
+            plt.figure(figsize=(4.5,3.2))
+            Kvals = gdf["K"].values; plt.plot(Kvals, gdf["zsum"], marker="o"); plt.xticks(Kvals)
+            plt.xlabel("K (clusters)"); plt.ylabel("Composite z-score (sil+AMI+η²)")
+            bestK = int(Kvals[np.nanargmax(gdf["zsum"].values)]); plt.title(f"K-choice={bestK} via z-sum")
+            plt.tight_layout(); plt.savefig(FIG/"subtype_K_zsum.png", dpi=300); plt.close()
+    # Confounders
+    conf_csv = TAB/f"subtypes_TRAINPD_K{K}_confounders.csv"
+    if conf_csv.exists():
+        cdf = pd.read_csv(conf_csv)
+        plt.figure(figsize=(4.5,3.2))
+        plt.barh(cdf["metric"], cdf["value"])
+        plt.xlabel("Effect size"); plt.title("TRAIN-PD confounders")
+        plt.tight_layout(); plt.savefig(FIG/"trainpd_confounders.png", dpi=300); plt.close()
+    # Calibration bars
+    if "calibration" in summary and isinstance(summary["calibration"], dict):
+        cal = summary["calibration"]; labels, maes, rmses = [], [], []
+        for k in ["raw","coral_rna","blend_or_raw"]:
+            v = cal.get(k); 
+            if v is None: continue
+            labels.append(k); maes.append(v["mae"]); rmses.append(v["rmse"])
+        if labels:
+            x = np.arange(len(labels))
+            plt.figure(figsize=(5,3.2))
+            plt.bar(x-0.15, maes, width=0.3, label="MAE")
+            plt.bar(x+0.15, rmses, width=0.3, label="RMSE")
+            plt.xticks(x, labels); plt.ylabel("Error"); plt.title("Calibration (TEST)")
+            plt.legend(frameon=False)
+            plt.tight_layout(); plt.savefig(FIG/"calibration_bars.png", dpi=300); plt.close()
+
+    # NEW: Latent PCA & t-SNE on TRAIN-PD (colored by cluster)
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    Z_for_plot = Zs_trpd  # standardized fused latents for TRAIN-PD
+    labs_for_plot = labs_trpd
+    # PCA
+    if Z_for_plot.shape[1] >= 2 and Z_for_plot.shape[0] >= 10:
+        pca = PCA(n_components=2, random_state=SEED).fit(Z_for_plot)
+        P = pca.transform(Z_for_plot)
+        plt.figure(figsize=(4.2,4.0))
+        for k_ in range(K):
+            mk = (labs_for_plot==k_)
+            plt.scatter(P[mk,0], P[mk,1], s=8, alpha=0.6, label=f"C{k_}")
+        plt.xlabel("PC1"); plt.ylabel("PC2"); plt.title("Latent PCA (TRAIN-PD)")
+        plt.legend(frameon=False, ncol=min(K,3))
+        plt.tight_layout(); plt.savefig(FIG/f"latent_pca_trainpd_K{K}.png", dpi=300); plt.close()
+    # t-SNE
+    if Z_for_plot.shape[0] >= 50:
+        perp = int(np.clip(Z_for_plot.shape[0]//10, 5, 35))
+        T = TSNE(n_components=2, perplexity=perp, learning_rate='auto', init='pca', random_state=SEED)
+        Tproj = T.fit_transform(Z_for_plot)
+        plt.figure(figsize=(4.2,4.0))
+        for k_ in range(K):
+            mk = (labs_for_plot==k_)
+            plt.scatter(Tproj[mk,0], Tproj[mk,1], s=8, alpha=0.6, label=f"C{k_}")
+        plt.xlabel("t-SNE 1"); plt.ylabel("t-SNE 2"); plt.title("Latent t-SNE (TRAIN-PD)")
+        plt.legend(frameon=False, ncol=min(K,3))
+        plt.tight_layout(); plt.savefig(FIG/f"latent_tsne_trainpd_K{K}.png", dpi=300); plt.close()
+
+    # NEW: Cluster boxplots for UPDRS and UPSIT (TRAIN-PD)
+    def _box_from_groups(values, labs, title, ylab, fname):
+        data = [pd.to_numeric(values[labs==k_], errors="coerce") for k_ in range(K)]
+        plt.figure(figsize=(4.6,3.6))
+        plt.boxplot([d[~np.isnan(d)] for d in data], labels=[f"C{k_}" for k_ in range(K)], showfliers=False)
+        plt.ylabel(ylab); plt.title(title)
+        plt.tight_layout(); plt.savefig(FIG/fname, dpi=300); plt.close()
+    _box_from_groups(pd.Series(y_pd_clean, index=pd_ids_clean), labs_trpd, "UPDRS by cluster (TRAIN-PD)", "UPDRS", f"box_updrs_trainpd_K{K}.png")
+    if upsit_pd_train.notna().sum()>0:
+        _box_from_groups(upsit_pd_train, labs_trpd, "UPSIT by cluster (TRAIN-PD)", "UPSIT", f"box_upsit_trainpd_K{K}.png")
+
+    # NEW: IG bars (top 20)
+    def _bar_top(series_csv_path, title, fname, top=20):
+        if not Path(series_csv_path).exists(): return
+        s = pd.read_csv(series_csv_path, index_col=0).iloc[:,0].sort_values(ascending=False).head(top)
+        plt.figure(figsize=(6,4))
+        plt.barh(range(len(s))[::-1], s.values[::-1])
+        plt.yticks(range(len(s))[::-1], s.index[::-1], fontsize=7)
+        plt.xlabel("Integrated Gradients (abs, mean)"); plt.title(title)
+        plt.tight_layout(); plt.savefig(FIG/fname, dpi=300); plt.close()
+    _bar_top(DEEP/"drivers_rna_IG.csv",  "Top RNA drivers (IG)",  "ig_top_rna.png")
+    _bar_top(DEEP/"drivers_proteins_IG.csv","Top Protein drivers (IG)","ig_top_prot.png")
+
+    # NEW: Cluster heatmaps (mean z per cluster, RNA/PROT top features)
+    def _cluster_heatmap(Z_df, feature_rank_csv, outname, per_mod="RNA", max_feats_per_cluster=10):
+        if not Path(feature_rank_csv).exists() or Z_df.empty: return
+        scores = pd.read_csv(feature_rank_csv, index_col=0).iloc[:,0]
+        # take top N unique across clusters by reading our per-cluster files
+        means = []
+        feat_sel = []
+        for k_ in range(K):
+            base = f"K{K}_cluster{k_}_{'RNA' if per_mod=='RNA' else 'PROT'}"
+            rnk_path = SIG_DIR/f"{base}.rnk.csv"
+            if not rnk_path.exists(): continue
+            rnk = pd.read_csv(rnk_path, index_col=0).iloc[:,0].sort_values(ascending=False)
+            take = [f for f in rnk.index if f in Z_df.columns][:max_feats_per_cluster]
+            feat_sel.extend(take)
+        feat_sel = list(dict.fromkeys(feat_sel))  # unique, preserve order
+        if len(feat_sel)==0: return
+        M = []
+        for k_ in range(K):
+            in_k = Z_df.reindex(pd_ids_clean[labs_trpd==k_])[feat_sel].astype(float)
+            # Use errstate to ignore expected warnings from all-NaN slices
+            with np.errstate(invalid='ignore'):
+                mvals = np.ma.masked_invalid(in_k.values).mean(axis=0).filled(np.nan)
+                M.append(mvals)
+        plt.figure(figsize=(max(5, len(feat_sel)*0.22), 2.2 + 0.25*K))
+        im = plt.imshow(M, aspect='auto', interpolation='nearest')
+        plt.colorbar(im, fraction=0.025, pad=0.02)
+        plt.yticks(range(K), [f"C{k_}" for k_ in range(K)])
+        plt.xticks(range(len(feat_sel)), feat_sel, rotation=90, fontsize=6)
+        plt.title(f"{per_mod} mean z per cluster (selected features)")
+        plt.tight_layout(); plt.savefig(FIG/outname, dpi=300); plt.close()
+    if d_rna>0:
+        _cluster_heatmap(z_rna, DEEP/"drivers_rna_IG.csv", f"cluster_heatmap_rna_K{K}.png", per_mod="RNA")
+    if d_prot>0:
+        _cluster_heatmap(z_prot, DEEP/"drivers_proteins_IG.csv", f"cluster_heatmap_prot_K{K}.png", per_mod="PROT")
+
+    # NEW: Severity vs UPSIT scatter (TEST, omics-only)
+    if np.isfinite(rho_test_upsit):
+        plt.figure(figsize=(4,4))
+        xx = chosen_ser[mte].values.astype(float); yy = upsit_te[mte].values.astype(float)
+        plt.scatter(xx, yy, s=8, alpha=0.35)
+        plt.xlabel("Predicted severity (TEST chosen)"); plt.ylabel("UPSIT")
+        plt.title(f"TEST: severity vs UPSIT (ρ={rho_test_upsit:.3f})")
+        plt.tight_layout(); plt.savefig(FIG/"test_severity_vs_upsit.png", dpi=300); plt.close()
+
+    # NEW: Modality coverage counts
+    r_has = (Mr.sum(1)>0); p_has = (Mp.sum(1)>0)
+    cnts = [int((r_has & ~p_has).sum()), int((~r_has & p_has).sum()), int((r_has & p_has).sum())]
+    plt.figure(figsize=(4.3,3.2))
+    plt.bar(["RNA only","PROT only","Both"], cnts)
+    plt.ylabel("# participants"); plt.title("Modality coverage")
+    plt.tight_layout(); plt.savefig(FIG/"modality_coverage.png", dpi=300); plt.close()
+
+except Exception as e:
+    print("[Figures] WARN:", e)
+
+# -----------------------------
+# Artifacts
+# -----------------------------
+if getattr(FLAGS, "save_artifacts", False):
+    try:
+        import joblib
+        torch.save({
+            "vae_r_state_dict": vae_r_final.state_dict() if 'vae_r_final' in globals() else None,
+            "vae_p_state_dict": vae_p_final.state_dict() if 'vae_p_final' in globals() else None,
+            "head_state_dict":  head_final.state_dict()  if 'head_final'  in globals() else None,
+        }, DEEP/"torch_models.pt")
+        joblib.dump({"HP": HP, "d_rna": d_rna, "d_prot": d_prot}, DEEP/"sk_models.joblib")
+        print("Artifacts saved: results/deep/torch_models.pt, results/deep/sk_models.joblib")
+    except Exception as e:
+        print("[Artifacts] WARN:", e)
+
+print("\n✅ v1.9e complete — outputs in results/deep/ and results/figures/")
+try:
+    for k in ["n_train","n_test","d_rna","d_prot","latent_total_dim","oof_spearman",
+              "test_spearman","test_spearman_coral_rna","test_spearman_coral_fused",
+              "test_spearman_ot_rna","test_spearman_ot_fused",
+              "test_choice","test_spearman_chosen","blend_train_w","rho_oof_upsit","rho_test_upsit"]:
+        print(f"{k}: {summary.get(k)}")
+except Exception:
+    pass
+
+
+# %% ========== GSEA (GSEAPreranked) post-processing + publication-quality plots ==========
+from __future__ import annotations
+import re, math, os
+from pathlib import Path
+from typing import List
+import pandas as pd
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --------------------------- CONFIG: EDIT THESE TWO PATHS --------------------------------
+ROOT = Path(r"C:\Users\NM\gsea_home\output\sep19")             # folder that contains the GSEA result folders
+OUT  = Path(r"C:\Users\NM\gsea_home\output\sep19\figs")        # output folder for figures and tables
+FDR_CUTOFF = 0.25
+TOPN_BARS  = 25
+TOPN_PER_SUBTYPE_FOR_BUBBLE = 15
+# -----------------------------------------------------------------------------------------
+
+sns.set_context("talk", font_scale=0.9)
+sns.set_style("whitegrid")
+mpl.rcParams["figure.dpi"] = 120
+mpl.rcParams["savefig.dpi"] = 300
+
+def _cmap(name: str):
+    """Modern Matplotlib colormap accessor (avoids deprecation)."""
+    return mpl.colormaps.get_cmap(name)
+
+def _detect_collection(name: str) -> str:
+    if name.startswith("GOBP_"): return "GO:BP"
+    if name.startswith("GOCC_"): return "GO:CC"
+    if name.startswith("GOMF_"): return "GO:MF"
+    if name.startswith("HP_"):   return "HPO"
+    return "Other"
+
+def _clean_term(name: str) -> str:
+    # remove namespace prefix + underscores -> space, title casing
+    cleaned = re.sub(r"^(GOBP_|GOCC_|GOMF_|HP_)", "", name)
+    cleaned = cleaned.replace("_", " ").strip()
+    # Title-case but keep roman numerals/acronyms
+    cleaned = " ".join([w if w.isupper() else w.capitalize() for w in cleaned.split()])
+    return cleaned
+
+def _subtype_from_path(p: Path) -> str:
+    """
+    Derive a nice label from the GSEA result folder name.
+
+    Supports:
+      - Old style: my_analysis.GseaPreranked.Subtype_0  -> "Subtype 0"
+      - New style: K3_cluster2_MIXED_vsHC.GseaPreranked.* -> "Cluster 2"
+    """
+    s = p.name
+
+    # New pattern: K3_cluster2_MIXED_vsHC.GseaPreranked...
+    m_cluster = re.search(r"K\d+_cluster(\d+)_MIXED_vsHC", s, flags=re.IGNORECASE)
+    if m_cluster:
+        return f"Cluster {m_cluster.group(1)}"
+
+    # Old pattern: Subtype_0, Subtype-1, Subtype 2, etc.
+    m_sub = re.search(r"(Subtype[_\s-]*\d+)", s, flags=re.IGNORECASE)
+    if m_sub:
+        # Normalize: "Subtype_0" -> "Subtype 0"
+        label = m_sub.group(1)
+        label = label.replace("-", " ").replace("_", " ")
+        label = re.sub(r"\s+", " ", label).strip().title()  # "Subtype 0"
+        return label
+
+    # Fallback: use folder name directly
+    return s
+
+def _load_one_report(tsv: Path, subtype_label: str) -> pd.DataFrame:
+    df = pd.read_csv(tsv, sep="\t")
+    # Normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    # Direction from file name (pos/neg)
+    fn = tsv.name.lower()
+    direction = "pos" if "_pos_" in fn else ("neg" if "_neg_" in fn else ("pos" if df.get("NES", pd.Series([0])).iloc[0] >= 0 else "neg"))
+    # Collection & clean term
+    df["collection"] = df["NAME"].map(_detect_collection)
+    df["term_clean"] = df["NAME"].map(_clean_term)
+    df["direction"] = direction
+    df["subtype"] = subtype_label   # already pretty ("Cluster 0", "Subtype 1", etc.)
+    # helpful transform
+    if "FDR q-val" in df.columns:
+        with np.errstate(divide="ignore"):
+            df["neglog10_FDR"] = -np.log10(df["FDR q-val"].replace(0, 1e-300))
+    if "NES" in df.columns:
+        df["NES"] = pd.to_numeric(df["NES"], errors="coerce")
+    return df
+
+def load_all(root: Path) -> pd.DataFrame:
+    """Find GSEAPreranked result folders (clusters/subtypes) and ingest both pos/neg reports."""
+    all_rows = []
+
+    # Look for any *.GseaPreranked* folder under ROOT
+    candidates = sorted(
+        p for p in root.glob("**/*.GseaPreranked*")
+        if p.is_dir()
+    )
+
+    # Optionally, restrict to cluster/Subtype patterns so we ignore random GSEA runs
+    candidates = [
+        p for p in candidates
+        if re.search(r"K\d+_cluster\d+_MIXED_vsHC", p.name, re.IGNORECASE)  # K3_cluster*_MIXED_vsHC
+        or re.search(r"Subtype[_\s-]*\d+", p.name, re.IGNORECASE)           # Subtype_*
+    ]
+
+    if not candidates:
+        raise FileNotFoundError(f"No cluster/subtype GSEAPreranked folders found under: {root}")
+
+    for subdir in candidates:
+        subtype_label = _subtype_from_path(subdir)
+        for tsv in sorted(subdir.glob("gsea_report_for_*_*.tsv")):
+            try:
+                all_rows.append(_load_one_report(tsv, subtype_label))
+            except Exception as e:
+                print(f"(!) Skipped {tsv}: {e}")
+
+    if not all_rows:
+        raise FileNotFoundError("No GSEA report TSVs were found (pattern gsea_report_for_*_*.tsv).")
+    df = pd.concat(all_rows, ignore_index=True)
+    # Deduplicate: keep best FDR (then highest NES) per subtype × term × direction
+    df = (df
+          .sort_values(["subtype","term_clean","direction","FDR q-val","NES"],
+                       ascending=[True, True, True, True, False])
+          .drop_duplicates(subset=["subtype","term_clean","direction"], keep="first"))
+    return df
+
+# ------------------------------ PLOTS ----------------------------------------------------
+
+def plot_top_positive_bars(df: pd.DataFrame, outdir: Path, subtype: str, topn: int, fdr_cut: float):
+    sub = df.query("subtype == @subtype and direction == 'pos' and `FDR q-val` <= @fdr_cut and NES.notnull()")
+    if sub.empty: return
+    top = (sub.sort_values(["NES","FDR q-val"], ascending=[False, True]).head(topn)
+             .assign(label=lambda d: d["term_clean"].str.slice(0, 80)))
+    fig, ax = plt.subplots(figsize=(6.0, max(3, 0.26*len(top)+1)))
+    cmap = _cmap("viridis")
+    # Color by FDR (log scale), reverse so most significant is darkest
+    vmin = max(min(sub["FDR q-val"].min(), fdr_cut/100), 1e-4)
+    norm = mpl.colors.LogNorm(vmin=vmin, vmax=fdr_cut)
+    colors = cmap(norm(top["FDR q-val"].values))
+    ax.barh(top["label"][::-1], top["NES"][::-1], color=colors[::-1], edgecolor="none")
+    ax.set_xlabel("Normalized Enrichment Score (NES)")
+    ax.set_ylabel("")
+    ax.set_title(f"{subtype} • Top positively enriched (FDR ≤ {fdr_cut})")
+    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+    cbar = fig.colorbar(sm, ax=ax, pad=0.01)
+    cbar.set_label("FDR q-value (log scale)")
+    outdir.mkdir(parents=True, exist_ok=True)
+    for ext in (".png",".pdf"):
+        fig.savefig(outdir / f"{subtype.replace(' ','_')}_topNES_pos_bars{ext}", bbox_inches="tight")
+    plt.close(fig)
+
+def plot_rank_at_max(df: pd.DataFrame, outdir: Path, subtype: str, fdr_cut: float):
+    sub = df.query("subtype == @subtype and `FDR q-val` <= @fdr_cut and `RANK AT MAX`.notnull()")
+    if sub.empty: return
+    x = sub["RANK AT MAX"].astype(float)
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    if x.nunique(dropna=True) <= 1:
+        # variance 0: draw a vertical marker
+        val = float(x.iloc[0])
+        ax.axvline(val, color="black", lw=2, alpha=0.75)
+        ax.text(val, 0.95, f"all at {int(val)}", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=8)
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+    else:
+        sns.kdeplot(x, ax=ax, fill=True, lw=1, alpha=0.6, warn_singular=False)
+    ax.set_xlabel("Rank at ES max"); ax.set_ylabel("Density")
+    ax.set_title(f"{subtype} • Distribution of peak enrichment positions (FDR ≤ {fdr_cut})")
+    outdir.mkdir(parents=True, exist_ok=True)
+    for ext in (".png",".pdf"):
+        fig.savefig(outdir / f"{subtype.replace(' ','_')}_rank_at_max_density{ext}", bbox_inches="tight")
+    plt.close(fig)
+
+def plot_cross_subtype_bubble(df: pd.DataFrame, outdir: Path, topn_per_subtype: int, fdr_cut: float):
+    # pick top terms per subtype by combined score
+    picks = []
+    for st, g in df.groupby("subtype"):
+        gsig = g.query("`FDR q-val` <= @fdr_cut").copy()
+        if gsig.empty: 
+            continue
+        gsig["score"] = gsig["neglog10_FDR"] * gsig["NES"].abs()
+        picks.append(gsig.sort_values("score", ascending=False).head(topn_per_subtype))
+    if not picks:
+        return
+    M = pd.concat(picks, ignore_index=True)
+    M = M[["subtype", "term_clean", "NES", "neglog10_FDR"]].drop_duplicates(["subtype","term_clean"])
+    # Orders
+    term_order = M.groupby("term_clean")["NES"].mean().sort_values(ascending=False).index.tolist()
+    try:
+        subtype_order = sorted(M["subtype"].unique(), key=lambda s: int(re.search(r"\d+", s).group()))
+    except Exception:
+        subtype_order = list(M["subtype"].unique())
+    # Plot
+    fig, ax = plt.subplots(figsize=(7.8, max(3.2, 0.25*len(term_order))))
+    vabs = max(2.0, float(M["NES"].abs().max()))
+    norm = mpl.colors.TwoSlopeNorm(vmin=-vabs, vcenter=0.0, vmax=vabs)
+    cmap = _cmap("coolwarm")
+    x = pd.Categorical(M["subtype"], categories=subtype_order, ordered=True)
+    y = pd.Categorical(M["term_clean"], categories=term_order, ordered=True)
+    sizes = (M["neglog10_FDR"].clip(0, 20) + 1.0) ** 1.1 * 10
+    sc = ax.scatter(x.codes, y.codes, s=sizes, c=M["NES"], cmap=cmap, norm=norm,
+                    alpha=0.85, edgecolor="k", linewidths=0.2)
+    ax.set_xticks(range(len(subtype_order))); ax.set_xticklabels(subtype_order)
+    ax.set_yticks(range(len(term_order)));   ax.set_yticklabels(term_order)
+    ax.set_title("Cross-subtype enrichment (size = −log10 FDR; color = NES)")
+    ax.set_xlabel(""); ax.set_ylabel("")
+    cbar = fig.colorbar(sc, ax=ax, pad=0.01); cbar.set_label("NES (blue=negative, red=positive)")
+    outdir.mkdir(parents=True, exist_ok=True)
+    for ext in (".png",".pdf"):
+        fig.savefig(outdir / f"cross_subtype_bubble_matrix{ext}", bbox_inches="tight")
+    plt.close(fig)
+
+# ------------------------------ RUN ------------------------------------------------------
+
+OUT.mkdir(parents=True, exist_ok=True)
+(OUT / "tables").mkdir(exist_ok=True)
+print(f"Scanning: {ROOT}")
+
+df_all = load_all(ROOT)
+
+# Save a tidy table
+tidy_csv = OUT / "tables" / "gsea_combined_tidy.csv"
+df_all.to_csv(tidy_csv, index=False)
+print(f"✓ Combined tidy table: {tidy_csv}")
+
+# Quick, de-duplicated preview table (best FDR per subtype×term×direction)
+preview_cols = ["term_clean","NES","FDR q-val","collection","direction","subtype"]
+preview = (df_all
+           .query("`FDR q-val` <= @FDR_CUTOFF and NES.notnull()")
+           [preview_cols]
+           .sort_values(["subtype","direction","FDR q-val","NES"], ascending=[True, True, True, False])
+           .groupby(["subtype","direction"])
+           .head(12))
+preview_path = OUT / "tables" / "quick_preview_top.csv"
+preview.to_csv(preview_path, index=False)
+print(f"✓ Preview table: {preview_path}")
+
+# Per-subtype (per-cluster) plots
+subtypes = sorted(
+    df_all["subtype"].unique(),
+    key=lambda s: int(re.search(r"\d+", s).group()) if re.search(r"\d+", s) else 999
+)
+for st in subtypes:
+    plot_top_positive_bars(df_all, OUT, st, TOPN_BARS, FDR_CUTOFF)
+    plot_rank_at_max(df_all, OUT, st, FDR_CUTOFF)
+
+# Cross-subtype bubble matrix
+plot_cross_subtype_bubble(df_all, OUT, TOPN_PER_SUBTYPE_FOR_BUBBLE, FDR_CUTOFF)
+
+print(f"✓ Wrote figures to: {OUT}")
+try:
+    from IPython.display import display
+    display(preview.head(20))
+except Exception:
+    pass
+# =========================================================================================
+
+
