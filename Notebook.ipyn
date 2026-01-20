@@ -2058,8 +2058,14 @@ def _ols_metrics(y: np.ndarray, X: np.ndarray) -> dict:
     aic = n * np.log(sse / n) + 2 * k if sse > 0 else np.nan
     return {"r2": r2, "aic": aic, "sse": sse, "n": n, "k": k}
 
-prog_df = traj_participants.dropna(subset=["baseline_updrs", "slope_per_year"])
-prog_df = prog_df[np.isfinite(prog_df["baseline_updrs"]) & np.isfinite(prog_df["slope_per_year"])]
+prog_df = traj_participants.copy()
+prog_df["baseline_updrs"] = pd.to_numeric(prog_df["baseline_updrs"], errors="coerce")
+prog_df["slope_per_year"] = pd.to_numeric(prog_df["slope_per_year"], errors="coerce")
+prog_df = prog_df.dropna(subset=["baseline_updrs", "slope_per_year"])
+prog_df = prog_df[
+    np.isfinite(prog_df["baseline_updrs"].to_numpy())
+    & np.isfinite(prog_df["slope_per_year"].to_numpy())
+]
 prognostic_rows = []
 if not prog_df.empty:
     y = prog_df["slope_per_year"].to_numpy()
