@@ -13,6 +13,7 @@ import seaborn as sns
 ROOT = Path(r"C:\Users\NM\gsea_home\output\sep19")             # folder that contains the GSEA result folders
 OUT  = Path(r"C:\Users\NM\gsea_home\output\sep19\figs")        # output folder for figures and tables
 FDR_CUTOFF = 0.25
+NOMINAL_P_CUTOFF = 0.05
 TOPN_BARS  = 25
 TOPN_PER_SUBTYPE_FOR_BUBBLE = 15
 # -----------------------------------------------------------------------------------------
@@ -212,6 +213,58 @@ def plot_cross_subtype_bubble(df: pd.DataFrame, outdir: Path, topn_per_subtype: 
         fig.savefig(outdir / f"cross_subtype_bubble_matrix{ext}", bbox_inches="tight")
     plt.close(fig)
 
+def summarize_subtypes(df: pd.DataFrame, outdir: Path, fdr_cut: float, nominal_cut: float):
+    cols = ["subtype", "collection", "NES", "FDR q-val", "NOM p-val", "FWER p-val"]
+    available = [c for c in cols if c in df.columns]
+    df_use = df[available].copy()
+    df_use["is_fdr_sig"] = df_use["FDR q-val"] <= fdr_cut
+    if "NOM p-val" in df_use.columns:
+        df_use["is_nominal_sig"] = df_use["NOM p-val"] <= nominal_cut
+    else:
+        df_use["is_nominal_sig"] = False
+
+    summary = (df_use
+               .groupby("subtype", as_index=False)
+               .agg(
+                   n_terms=("NES", "size"),
+                   n_fdr_sig=("is_fdr_sig", "sum"),
+                   n_nominal_sig=("is_nominal_sig", "sum"),
+                   best_fdr=("FDR q-val", "min"),
+                   best_nominal=("NOM p-val", "min") if "NOM p-val" in df_use.columns else ("FDR q-val", "min"),
+                   median_abs_nes=("NES", lambda s: float(np.nanmedian(np.abs(s))))
+               ))
+    summary["fdr_sig_fraction"] = summary["n_fdr_sig"] / summary["n_terms"]
+    summary["nominal_sig_fraction"] = summary["n_nominal_sig"] / summary["n_terms"]
+
+    collection_summary = (df_use
+                          .groupby(["subtype", "collection"], as_index=False)
+                          .agg(
+                              n_terms=("NES", "size"),
+                              n_fdr_sig=("is_fdr_sig", "sum"),
+                              n_nominal_sig=("is_nominal_sig", "sum"),
+                              median_abs_nes=("NES", lambda s: float(np.nanmedian(np.abs(s))))
+                          ))
+
+    summary_path = outdir / "tables" / "subtype_summary.csv"
+    collection_path = outdir / "tables" / "subtype_collection_summary.csv"
+    summary.to_csv(summary_path, index=False)
+    collection_summary.to_csv(collection_path, index=False)
+    print(f"✓ Subtype summary table: {summary_path}")
+    print(f"✓ Subtype × collection summary table: {collection_path}")
+
+    # Provide a nominally significant (or top NES) list for subtypes lacking FDR signals
+    top_nominal = []
+    for st, g in df_use.groupby("subtype"):
+        g_nom = g.query("is_nominal_sig").copy()
+        if g_nom.empty:
+            g_nom = g.copy()
+        g_nom["rank_score"] = g_nom["NES"].abs()
+        top_nominal.append(g_nom.sort_values("rank_score", ascending=False).head(20))
+    top_nominal_df = pd.concat(top_nominal, ignore_index=True)
+    top_nominal_path = outdir / "tables" / "subtype_top_nominal_or_nes.csv"
+    top_nominal_df.to_csv(top_nominal_path, index=False)
+    print(f"✓ Subtype nominal/top-NES table: {top_nominal_path}")
+
 # ------------------------------ RUN ------------------------------------------------------
 
 OUT.mkdir(parents=True, exist_ok=True)
@@ -249,6 +302,8 @@ for st in subtypes:
 # Cross-subtype bubble matrix
 plot_cross_subtype_bubble(df_all, OUT, TOPN_PER_SUBTYPE_FOR_BUBBLE, FDR_CUTOFF)
 
+summarize_subtypes(df_all, OUT, FDR_CUTOFF, NOMINAL_P_CUTOFF)
+
 print(f"✓ Wrote figures to: {OUT}")
 try:
     from IPython.display import display
@@ -256,5 +311,3 @@ try:
 except Exception:
     pass
 # =========================================================================================
-
-
