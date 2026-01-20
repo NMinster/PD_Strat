@@ -1966,7 +1966,10 @@ print(f"[Predictions] Added visit_code; value counts (top 10):\n{pred['visit_cod
 # Longitudinal trajectory analysis (within-subtype heterogeneity + baseline-only prognostic value)
 # -----------------------------
 def _ensure_months_for_traj(df: pd.DataFrame) -> pd.Series:
-    months_raw = pd.to_numeric(df.get("months"), errors="coerce")
+    if "months" in df.columns:
+        months_raw = pd.to_numeric(df["months"], errors="coerce")
+    else:
+        months_raw = pd.Series(index=df.index, dtype=float)
     if months_raw.notna().sum() >= 2:
         return months_raw
     vc = infer_visit_code(df)
