@@ -1,3 +1,4 @@
+# %%
 #!/usr/bin/env python3
 # PD–Deep Precision Suite — v1.9e (deterministic + global HC + feature manifest + signatures+figs+UPSIT)
 
@@ -11,6 +12,7 @@ import pandas as pd
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# %%
 # -----------------------------
 # Paths & Config
 # -----------------------------
@@ -31,6 +33,7 @@ if os.path.exists(CFG_PATH):
 TRAIN_PREFIX = (CFG.get("train_cohort_prefix","PP-") or "PP-").upper()
 TEST_PREFIX  = (CFG.get("test_cohort_prefix","PD-")  or "PD-").upper()
 
+# %%
 # -----------------------------
 # Pre-specified (no-leak) TEST choice
 # -----------------------------
@@ -38,6 +41,7 @@ TEST_PREFIX  = (CFG.get("test_cohort_prefix","PD-")  or "PD-").upper()
 CHOSEN_MODE = (CFG.get("chosen_mode") or "ot-fused").lower()
 assert CHOSEN_MODE in {"raw","ot-fused"}, "chosen_mode must be 'raw' or 'ot-fused'"
 
+# %%
 # -----------------------------
 # Determinism
 # -----------------------------
@@ -55,6 +59,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# %%
 # -----------------------------
 # CLI (adds: --hc_mode)
 # -----------------------------
@@ -78,6 +83,7 @@ try: FLAGS = build_argparser().parse_args([])
 except SystemExit: FLAGS = build_argparser().parse_args()
 HC_MODE = FLAGS.hc_mode
 
+# %%
 # -----------------------------
 # Run summary helper
 # -----------------------------
@@ -87,7 +93,9 @@ def summary_update(extra: dict):
     summary.update(extra)
     with open(DEEP/"summary.json","w") as f: json.dump(summary, f, indent=2)
 
+# %%
 # -----------------------------
+# %%
 # -----------------------------
 # Load clinical & targets (+UPSIT merge helper) — REWRITTEN
 # -----------------------------
@@ -258,6 +266,7 @@ is_test_prefix = np.fromiter(
 is_pd_flag = cc.isin(["CASE","PD","PARKINSONS","PATIENT","DISEASE"]) | is_test_prefix
 is_pd_flag = is_pd_flag & ~is_control
 
+# %%
 # -----------------------------
 # ID mapping helper
 # -----------------------------
@@ -273,6 +282,7 @@ def _map_participant_id(s: str) -> str:
             return s
     return s
 
+# %%
 # -----------------------------
 # TRAIN Healthy Control table (from config path)
 # -----------------------------
@@ -320,6 +330,7 @@ def _select_train_hc_ids(raw_index: pd.Index, min_n_global:int=30, min_n_site:in
         return hc_ids, bool(per_site_ok)
     return hc_ids, False
 
+# %%
 # -----------------------------
 # Manifest & Meta helpers
 # -----------------------------
@@ -357,6 +368,7 @@ def _apply_manifest(Z: pd.DataFrame, key: str) -> pd.DataFrame:
     inter = [c for c in want if c in have]
     return Z.loc[:, inter]
 
+# %%
 # -----------------------------
 # Stable feature freeze knobs
 # -----------------------------
@@ -400,6 +412,7 @@ def _pivot_protein_file(path: str) -> Optional[pd.DataFrame]:
     pv = df.pivot_table(index="participant_id", columns=feat_col, values=val_col, aggfunc="mean")
     return pv.astype(np.float32)
 
+# %%
 # -----------------------------
 # Load normative-z (HC-first, fallback pseudo-controls) + manifest/meta
 # -----------------------------
@@ -494,6 +507,7 @@ def _load_or_fallback_z(name_csv: str, raw_path_key: str) -> pd.DataFrame:
     print(f"[Pin] wrote {name_csv}: shape={Z.shape}"); print(f"[Pin] {name_csv} shape={Z.shape}, sha={sha12}")
     return Z
 
+# %%
 # -----------------------------
 # Build aligned matrices (zero-impute) + presence masks
 # -----------------------------
@@ -514,6 +528,7 @@ Xr, Mr, rna_cols  = prep_block(z_rna)
 Xp, Mp, prot_cols = prep_block(z_prot)
 d_rna, d_prot = Xr.shape[1], Xp.shape[1]
 
+# %%
 # -----------------------------
 # Targets, masks, and CV setup
 # -----------------------------
@@ -556,6 +571,7 @@ def build_stage_fn(yvals: np.ndarray):
     return f
 stage_fn = build_stage_fn(y_tr_nonan)
 
+# %%
 # -----------------------------
 # Torch models & utils
 # -----------------------------
@@ -639,6 +655,7 @@ def spearman_np(a,b):
     if m.sum()<3: return np.nan
     return spearmanr(a[m], b[m]).statistic
 
+# %%
 # -----------------------------
 # Hyperparameters
 # -----------------------------
@@ -649,6 +666,7 @@ HP = dict(
     boot_B=50, boot_frac=0.8, ig_smooth_T=16, moddrop_p_rna=0.10, moddrop_p_prot=0.15
 )
 
+# %%
 # -----------------------------
 # Seeded DataLoader
 # -----------------------------
@@ -656,6 +674,7 @@ def _seeded_loader(dataset, batch, shuffle: bool):
     gen = torch.Generator(device="cpu").manual_seed(SEED)
     return DataLoader(dataset, batch_size=batch, shuffle=shuffle, generator=gen)
 
+# %%
 # -----------------------------
 # Fallback helpers (Ridge/SVD)
 # -----------------------------
@@ -691,6 +710,7 @@ def _svd_ridge_fallback_preds(tr_ids, tgt_ids, n_comp=128):
     rid = RidgeCV(alphas=np.logspace(-2, 2, 9)).fit(Ztr[mtr], ytr[mtr])
     preds = rid.predict(Ztg).astype(np.float32); np.clip(preds, Y_LO, Y_HI, out=preds); return preds
 
+# %%
 # -----------------------------
 # Train one fold (CV)
 # -----------------------------
@@ -762,6 +782,7 @@ def train_one_fold(tr_ids, va_ids, stage_fn):
         if n_good < len(va_ids): print(f"[Fold] WARNING: only {n_good}/{len(va_ids)} OOF preds finite after fallbacks.")
     return yh, vae_r, vae_p, head
 
+# %%
 # -----------------------------
 # Cross-validated OOF severity
 # -----------------------------
@@ -790,6 +811,7 @@ if np.isfinite(oof_pred).any():
         oof_rmse = float(np.sqrt(np.mean((oof_pred[m] - y_tr[m])**2)))
         summary_update({"oof_mae": oof_mae, "oof_rmse": oof_rmse})
 
+# %%
 # -----------------------------
 # Final fit on TRAIN, predict TEST (seed ensemble) + fallbacks
 # -----------------------------
@@ -893,6 +915,7 @@ if test_idx_omics.size>0 and np.isfinite(test_pred).any():
         test_rmse = float(np.sqrt(np.mean((test_pred[has_any_omics[test_idx]][m] - y_all[test_idx_omics][m])**2)))
         summary_update({"test_mae": test_mae, "test_rmse": test_rmse})
 
+# %%
 # -----------------------------
 # CORAL/OT mapping (optional, as in v1.9d)
 # -----------------------------
@@ -1011,6 +1034,7 @@ if test_idx.size>0 and (d_rna+d_prot)>0 and ('ot' in globals() or 'ot' in locals
         np.clip(yhat_te_fused_ot, Y_LO, Y_HI, out=yhat_te_fused_ot)
         rho_ot_fused = spearman_np(yhat_te_fused_ot, y_all[test_idx]); print(f"TEST Spearman ρ after Sinkhorn-OT(FUSED): {rho_ot_fused:.3f}")
 
+# %%
 # -----------------------------
 # Non-leaky RAW–CORAL blend weight from TRAIN OOF
 # -----------------------------
@@ -1057,6 +1081,7 @@ else:
     best_rho = rho_test  # fallback
 print(f"[Select] Using pre-specified mode: {best_mode.upper()} (no TEST-driven selection)")
 
+# %%
 # -----------------------------
 # Subtyping: TRAIN-PD grid + default K_choice + confounders
 # -----------------------------
@@ -1139,6 +1164,7 @@ if getattr(FLAGS, "train_pd_grid", False):
 HP["gmm_k"] = read_k_choice(TAB/"subtype_K_choice.txt", default_k=HP.get("gmm_k",3))
 K = HP["gmm_k"]
 
+# %%
 # -----------------------------
 # Subtyping: Fit on TRAIN-PD (BASELINE ONLY - M0)
 # -----------------------------
@@ -1402,6 +1428,7 @@ if age_ser.notna().sum() > 0:
 
 pd.DataFrame(conf_rows).to_csv(TAB / f"subtypes_TRAINPD_K{K}_confounders.csv", index=False)
 
+# %%
 # -----------------------------
 # Integrated Gradients (global)
 # -----------------------------
@@ -1468,6 +1495,7 @@ prot_ig = integrated_gradients_smoothed(vae_p_final, head_final, Xp, which="prot
 if rna_ig.size>0:  pd.Series(rna_ig, index=rna_cols).sort_values(ascending=False).to_csv(DEEP/"drivers_rna_IG.csv")
 if prot_ig.size>0: pd.Series(prot_ig, index=prot_cols).sort_values(ascending=False).to_csv(DEEP/"drivers_proteins_IG.csv")
 
+# %%
 # -----------------------------
 # Isotonic calibration (optional)
 # -----------------------------
@@ -1508,6 +1536,7 @@ if getattr(FLAGS, "calibrate", False):
     summary_update({"calibration": calibration_results})
 
 
+# %%
 # -----------------------------
 # Visit code inference helper
 # -----------------------------
@@ -1545,6 +1574,7 @@ def infer_visit_code(df: pd.DataFrame) -> pd.Series:
     return vc
 
 
+# %%
 # -----------------------------
 # Save predictions & summary + artifacts
 # -----------------------------
@@ -1604,6 +1634,7 @@ summary_update({
     "hc_mode": meta.get("z_rna.csv",{}).get("hc_mode") or HC_MODE,
 })
 
+# %%
 # -----------------------------
 # NEW: Signatures for drug/pathway analysis (TRAIN-PD only)
 # -----------------------------
@@ -1697,6 +1728,7 @@ for k_ in range(K):
     sig_manifest.append(row)
 pd.DataFrame(sig_manifest).to_csv(SIG_DIR/f"signature_manifest_K{K}.csv", index=False)
 
+# %%
 # -----------------------------
 # NEW: Correlation analyses with UPSIT (OOF/TEST + per-cluster)
 # -----------------------------
@@ -1752,6 +1784,7 @@ summary_update({"rho_oof_upsit": float(rho_oof_upsit) if np.isfinite(rho_oof_ups
                 "rho_test_upsit": float(rho_test_upsit) if np.isfinite(rho_test_upsit) else None})
 
 
+# %%
 # -----------------------------
 # COMBINED (RNA+PROT) ranked lists per subtype (UP/DOWN)
 # -----------------------------
@@ -1855,6 +1888,7 @@ if combo_rows:
     pd.DataFrame(combo_rows).to_csv(SIG_DIR / f"signature_manifest_K{K}_COMBO.csv", index=False)
     print(f"[Signatures/COMBO] Wrote combined RNA+PROT UP/DOWN ranked lists for K={K} to {SIG_DIR}")
 
+# %%
 # ------------------------------------------------------------------
 # NEW: Perturbation lists (vs HC) as Entrez IDs
 # ------------------------------------------------------------------
@@ -2077,6 +2111,7 @@ if HAVE_PERT_LIBS:
     else:
         print("[PERT] No RNA or Protein data to build mixed perturbation lists.")
 
+# %%
 # -----------------------------
 # Publication-style figures (existing + new)
 # -----------------------------
@@ -2261,6 +2296,7 @@ try:
 except Exception as e:
     print("[Figures] WARN:", e)
 
+# %%
 # -----------------------------
 # Artifacts
 # -----------------------------
