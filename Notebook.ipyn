@@ -103,19 +103,6 @@ if not clin_path.exists():
 
 clin = pd.read_csv(clin_path)
 
-def _by_pid_first(col: str) -> pd.Series:
-    """Return a participant-level series even if clin.index is duplicated."""
-    if col not in clin.columns:
-        return pd.Series(dtype="object")
-    s = clin[col]
-    # groupby(level=0) works because index is participant_id
-    return s.groupby(level=0).first()
-
-site_by_pid = _by_pid_first("site").astype(str)
-sex_by_pid  = _by_pid_first("sex").astype(str)
-cohort_by_pid = _by_pid_first("cohort").astype(str).str.upper()
-
-
 def _to_str_index(idx) -> pd.Index:
     if isinstance(idx, pd.MultiIndex):
         idx = idx.to_flat_index()
@@ -328,8 +315,7 @@ def _select_train_hc_ids(raw_index: pd.Index, min_n_global:int=30, min_n_site:in
     hc_ids = pd.Index(hc_ids_all).intersection(clin.index[is_train]).intersection(raw_index)
     if len(hc_ids) < min_n_global: return pd.Index([]), False
     if per_site and ("site" in clin.columns):
-        # count per participant, not per visit row
-        site_counts = site_by_pid.reindex(hc_ids).value_counts()
+        site_counts = clin.loc[hc_ids, "site"].astype(str).value_counts()
         per_site_ok = (site_counts >= min_n_site).any()
         return hc_ids, bool(per_site_ok)
     return hc_ids, False
@@ -463,7 +449,7 @@ def _load_or_fallback_z(name_csv: str, raw_path_key: str) -> pd.DataFrame:
     hc_ids, per_site_ok = _select_train_hc_ids(raw.index, min_n_global=30, min_n_site=15, per_site=True)
     use_site = (HC_MODE=="site") or (HC_MODE=="auto" and per_site_ok and "site" in clin.columns)
     if len(hc_ids) >= 30 and use_site:
-        site_series = site_by_pid  # unique participant -> site
+        site_series = clin["site"].astype(str)
         mu_global = raw.loc[hc_ids].mean(0); sd_global = raw.loc[hc_ids].std(0).replace(0, np.nan).fillna(1.0)
         mu_s, sd_s = {}, {}
         for site, idxs in site_series.loc[hc_ids].groupby(site_series.loc[hc_ids]).groups.items():
@@ -571,179 +557,6 @@ def build_stage_fn(yvals: np.ndarray):
 stage_fn = build_stage_fn(y_tr_nonan)
 
 # -----------------------------
-# BASELINE BENCHMARKS (Comment #2)
-# -----------------------------
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import RidgeCV
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from scipy.stats import spearmanr
-
-def _metrics(y_true, y_pred):
-    m = np.isfinite(y_true) & np.isfinite(y_pred)
-    if m.sum() < 5:
-        return dict(n=int(m.sum()), spearman=np.nan, mae=np.nan, rmse=np.nan)
-    rho = spearmanr(y_true[m], y_pred[m]).statistic
-    mae = float(mean_absolute_error(y_true[m], y_pred[m]))
-    rmse = float(np.sqrt(mean_squared_error(y_true[m], y_pred[m])))
-    return dict(n=int(m.sum()), spearman=float(rho), mae=mae, rmse=rmse)
-
-def _group_bootstrap_ci(y_true, y_pred, groups, metric_fn, B=2000, seed=42):
-    # bootstrap participants (groups) with replacement
-    rng = np.random.default_rng(seed)
-    groups = np.asarray(groups).astype(str)
-    uniq = np.unique(groups)
-    m0 = np.isfinite(y_true) & np.isfinite(y_pred)
-    if m0.sum() < 10 or len(uniq) < 10:
-        return (np.nan, np.nan)
-    vals = []
-    for _ in range(B):
-        samp = rng.choice(uniq, size=len(uniq), replace=True)
-        mask = np.isin(groups, samp) & m0
-        if mask.sum() < 10:
-            continue
-        vals.append(metric_fn(y_true[mask], y_pred[mask]))
-    if len(vals) < 50:
-        return (np.nan, np.nan)
-    lo, hi = np.quantile(vals, [0.025, 0.975])
-    return (float(lo), float(hi))
-
-def _oof_groupkfold_predict(model, X, y, groups, splitter):
-    # returns oof preds aligned to X rows
-    oof = np.full(len(X), np.nan, dtype=np.float32)
-    for tr, va in splitter.split(X, y, groups):
-        Xtr, Xva = X.iloc[tr], X.iloc[va]
-        ytr = y[tr]
-        model.fit(Xtr, ytr)
-        oof[va] = model.predict(Xva).astype(np.float32)
-    return oof
-
-# --- Build clinical dataframe (train/test subsets) ---
-clin_feat = clin.copy()
-
-# Robust disease duration column discovery (edit candidates to match your schema)
-DUR_CANDS = ["disease_duration", "disease_duration_years", "years_since_dx", "time_since_dx",
-            "dx_duration", "duration", "pd_duration"]
-dur_col = next((c for c in DUR_CANDS if c in clin_feat.columns), None)
-
-# If duration not present, you can still run age-only, but the reviewer asked for duration.
-if dur_col is None:
-    print("[Baseline] WARNING: no disease duration column found; baseline will be age-only unless you add duration.")
-    clin_feat["disease_duration_fallback"] = np.nan
-    dur_col = "disease_duration_fallback"
-
-# Feature sets
-feat_min = ["age", dur_col]
-feat_plus = ["age", dur_col, "sex", "site"]
-
-# Keep only existing columns
-feat_min  = [c for c in feat_min if c in clin_feat.columns]
-feat_plus = [c for c in feat_plus if c in clin_feat.columns]
-
-def make_ridge_pipeline(feature_cols):
-    num_cols = [c for c in feature_cols if c not in ("sex", "site")]
-    cat_cols = [c for c in feature_cols if c in ("sex", "site")]
-
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline([("imp", SimpleImputer(strategy="median"))]), num_cols),
-            ("cat", Pipeline([
-                ("imp", SimpleImputer(strategy="most_frequent")),
-                ("oh", OneHotEncoder(handle_unknown="ignore"))
-            ]), cat_cols),
-        ],
-        remainder="drop"
-    )
-
-    model = RidgeCV(alphas=np.logspace(-3, 3, 25))
-    return Pipeline([("pre", pre), ("model", model)])
-
-# Align to the SAME evaluation subset as your deep model (omics+labels) for apples-to-apples:
-tr_mask_deep = np.isfinite(y_all[train_idx]) & has_any_omics[train_idx]
-te_mask_deep = np.isfinite(y_all[test_idx])  & has_any_omics[test_idx]
-
-Xtr_clin = clin_feat.iloc[train_idx][tr_mask_deep][feat_min]
-ytr_clin = y_all[train_idx][tr_mask_deep]
-gtr_clin = groups_all[train_idx][tr_mask_deep]
-
-Xte_clin = clin_feat.iloc[test_idx][te_mask_deep][feat_min]
-yte_clin = y_all[test_idx][te_mask_deep]
-
-# Baseline 1: age + duration
-pipe1 = make_ridge_pipeline(feat_min)
-oof1 = _oof_groupkfold_predict(pipe1, Xtr_clin, ytr_clin, gtr_clin, gkf)
-pipe1.fit(Xtr_clin, ytr_clin)
-pred1 = pipe1.predict(Xte_clin).astype(np.float32)
-pred1 = np.clip(pred1, Y_LO, Y_HI)
-
-m1_oof = _metrics(ytr_clin, oof1)
-m1_te  = _metrics(yte_clin, pred1)
-ci1_rho = _group_bootstrap_ci(yte_clin, pred1, groups_all[test_idx][te_mask_deep],
-                              lambda yt, yp: spearmanr(yt, yp).statistic)
-ci1_mae = _group_bootstrap_ci(yte_clin, pred1, groups_all[test_idx][te_mask_deep],
-                              lambda yt, yp: mean_absolute_error(yt, yp))
-
-print("[Baseline age+dur] OOF:", m1_oof, " TEST:", m1_te, " TEST rho CI:", ci1_rho, " TEST MAE CI:", ci1_mae)
-
-# Baseline 2: age + duration + sex + site (if available)
-if len(feat_plus) >= len(feat_min) + 1:
-    Xtr2 = clin_feat.iloc[train_idx][tr_mask_deep][feat_plus]
-    Xte2 = clin_feat.iloc[test_idx][te_mask_deep][feat_plus]
-    pipe2 = make_ridge_pipeline(feat_plus)
-    oof2 = _oof_groupkfold_predict(pipe2, Xtr2, ytr_clin, gtr_clin, gkf)
-    pipe2.fit(Xtr2, ytr_clin)
-    pred2 = np.clip(pipe2.predict(Xte2).astype(np.float32), Y_LO, Y_HI)
-
-    m2_oof = _metrics(ytr_clin, oof2)
-    m2_te  = _metrics(yte_clin, pred2)
-    print("[Baseline age+dur+sex+site] OOF:", m2_oof, " TEST:", m2_te)
-
-# Baseline 3: simple omics (SVD + Ridge) using same subset
-from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-
-Xtr_omics = np.hstack([Xr[train_idx][tr_mask_deep], Xp[train_idx][tr_mask_deep]])
-Xte_omics = np.hstack([Xr[test_idx][te_mask_deep],  Xp[test_idx][te_mask_deep]])
-
-if Xtr_omics.shape[1] > 0:
-    p = Xtr_omics.shape[1]
-    if p <= 1:
-        n_comp = 1  # but TruncatedSVD cannot run; fall back to Ridge on raw features or skip
-    else:
-        n_comp = min(256, min(64, p - 1))
-        n_comp = max(2, n_comp)
-        
-        if Xtr_omics.shape[1] >= 3:
-            # run SVD+Ridge
-            omics_model = make_pipeline(
-                StandardScaler(with_mean=False),
-                TruncatedSVD(n_components=n_comp, random_state=SEED),
-                RidgeCV(alphas=np.logspace(-3, 3, 25))
-            )
-            
-            # OOF
-            oof3 = np.full(len(ytr_clin), np.nan, dtype=np.float32)
-            for tr, va in gkf.split(np.zeros(len(ytr_clin)), ytr_clin, gtr_clin):
-                omics_model.fit(Xtr_omics[tr], ytr_clin[tr])
-                oof3[va] = omics_model.predict(Xtr_omics[va]).astype(np.float32)
-            
-            # TEST
-            omics_model.fit(Xtr_omics, ytr_clin)
-            pred3 = np.clip(omics_model.predict(Xte_omics).astype(np.float32), Y_LO, Y_HI)
-        
-            m3_oof = _metrics(ytr_clin, oof3)
-            m3_te  = _metrics(yte_clin, pred3)
-            print("[Baseline SVD+Ridge omics] OOF:", m3_oof, " TEST:", m3_te)
-            
-        else:
-            # fallback: RidgeCV directly on sparse/high-dim without SVD (or skip baseline 3)
-            pass
-
-
-# -----------------------------
 # Torch models & utils
 # -----------------------------
 import torch.nn as nn
@@ -837,12 +650,11 @@ HP = dict(
 )
 
 # -----------------------------
-# Seeded DataLoader (PATCH: seed-aware)
+# Seeded DataLoader
 # -----------------------------
-def _seeded_loader(dataset, batch, shuffle: bool, seed: int):
-    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+def _seeded_loader(dataset, batch, shuffle: bool):
+    gen = torch.Generator(device="cpu").manual_seed(SEED)
     return DataLoader(dataset, batch_size=batch, shuffle=shuffle, generator=gen)
-
 
 # -----------------------------
 # Fallback helpers (Ridge/SVD)
@@ -882,29 +694,11 @@ def _svd_ridge_fallback_preds(tr_ids, tgt_ids, n_comp=128):
 # -----------------------------
 # Train one fold (CV)
 # -----------------------------
-
-from contextlib import contextmanager
-
-@contextmanager
-def seeded_fork_rng(seed: int, step: int = 0):
-    """Version-safe RNG fork for CPU + current CUDA device (if present)."""
-    devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
-    with torch.random.fork_rng(devices=devices, enabled=True):
-        s = int(seed) + int(step)
-        torch.manual_seed(s)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(s)
-        yield
-
-def train_one_fold(tr_ids, va_ids, stage_fn, seed: int):
-    stage_fn_fold = None
-    if stage_fn is not None:
-        # rebuild from training fold labels only
-        stage_fn_fold = build_stage_fn(y_all[tr_ids])
+def train_one_fold(tr_ids, va_ids, stage_fn):
     ds_tr = PDDataset(Xr, Xp, Mr, Mp, y=y_all, idx=tr_ids)
     ds_va = PDDataset(Xr, Xp, Mr, Mp, y=y_all, idx=va_ids)
-    dl_tr = _seeded_loader(ds_tr, HP["batch"], shuffle=True,  seed=seed)
-    dl_va = _seeded_loader(ds_va, HP["batch"], shuffle=False, seed=seed)
+    dl_tr = _seeded_loader(ds_tr, HP["batch"], shuffle=True)
+    dl_va = _seeded_loader(ds_va, HP["batch"], shuffle=False)
 
     vae_r = TabVAE(d_rna, HP["d_rna_lat"], HP["vae_hidden"], HP["p_drop"]).to(device)
     vae_p = TabVAE(d_prot,HP["d_prot_lat"],HP["vae_hidden"], HP["p_drop"]).to(device)
@@ -921,36 +715,34 @@ def train_one_fold(tr_ids, va_ids, stage_fn, seed: int):
             xr,xp,fr,fp,y = xr.to(device), xp.to(device), fr.to(device), fp.to(device), y.to(device)
             opt.zero_grad(set_to_none=True)
             zr, mu_r, lv_r, _ = vae_r(xr); zp, mu_p, lv_p, _ = vae_p(xp)
-
-            # PATCH: seed-aware fork_rng
-            with seeded_fork_rng(seed, step=steps): 
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(SEED + steps)
                 if HP.get("moddrop_p_rna", 0) > 0 and torch.rand(()) < HP["moddrop_p_rna"]: zr = torch.zeros_like(zr)
                 if HP.get("moddrop_p_prot", 0) > 0 and torch.rand(()) < HP["moddrop_p_prot"]: zp = torch.zeros_like(zp)
-
             y_hat, y_stg = head(zr, zp, fr, fp)
             loss_reg = reg_loss(y_hat, y, y_lo=Y_LO, y_hi=Y_HI)
-            stg = None if stage_fn_fold is None else stage_fn_fold(y.detach().cpu().numpy())
+            stg = None if stage_fn is None else stage_fn(y.detach().cpu().numpy())
             loss_cls = ce_loss(y_stg, stg) if stage_fn is not None else torch.zeros((), device=device)
             loss = loss_reg + 0.5*loss_cls + HP["beta_kld"]*(kld(mu_r,lv_r)+kld(mu_p,lv_p))
-            if not torch.isfinite(loss):
+            if not torch.isfinite(loss):  # safety
                 continue
             loss.backward()
             nn.utils.clip_grad_norm_(list(vae_r.parameters())+list(vae_p.parameters())+list(head.parameters()), 5.0)
             opt.step()
             tot += float(loss.item()); steps+=1
-
         cur = tot/max(1,steps)
         if cur < best: best=cur; bad=0
         else: bad+=1
         if bad>=HP["patience"]: break
 
-    # OOF predictions with deterministic MC-Dropout (PATCH: seed-aware)
+    # OOF predictions with deterministic MC-Dropout
     head.train(); preds=[]
     with torch.no_grad():
         for xr,xp,fr,fp,y in dl_va:
             xr,xp,fr,fp = xr.to(device), xp.to(device), fr.to(device), fp.to(device)
             bag=[]
-            with seeded_fork_rng(seed, step=steps): 
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(SEED)
                 for _ in range(HP["mc_T"]):
                     zr, *_ = vae_r(xr); zp, *_ = vae_p(xp)
                     yhat,_ = head(zr,zp,fr,fp); yhat = yhat.clamp(min=Y_LO, max=Y_HI)
@@ -980,7 +772,7 @@ if len(train_idx_y) >= max(2*n_splits, 20):
     for f,(tr,va) in enumerate(gkf.split(train_idx_y, y_tr_nonan, groups_train), 1):
         tr_ids = train_idx_y[tr]; va_ids = train_idx_y[va]
         if len(va_ids)==0 or len(tr_ids)<20: continue
-        yh, _, _, _ = train_one_fold(tr_ids, va_ids, stage_fn, seed=SEED)
+        yh, _, _, _ = train_one_fold(tr_ids, va_ids, stage_fn)
         if yh.size != len(va_ids): print(f"[Fold {f}] WARN: yh.size={yh.size} vs len(va_ids)={len(va_ids)}"); continue
         for vid, pred in zip(va_ids.tolist(), yh.tolist()):
             pos = idx_lookup.get(vid, None)
@@ -1007,8 +799,8 @@ def fit_full_and_predict(tr_ids, te_ids, seed: Optional[int]=None):
         if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     ds_tr = PDDataset(Xr, Xp, Mr, Mp, y=y_all, idx=tr_ids)
     ds_te = PDDataset(Xr, Xp, Mr, Mp, y=None,  idx=te_ids)
-    dl_tr = _seeded_loader(ds_tr, HP["batch"], shuffle=True,  seed=seed if seed is not None else SEED)
-    dl_te = _seeded_loader(ds_te, HP["batch"], shuffle=False, seed=seed if seed is not None else SEED)
+    dl_tr = _seeded_loader(ds_tr, HP["batch"], shuffle=True)
+    dl_te = _seeded_loader(ds_te, HP["batch"], shuffle=False)
 
     vae_r = TabVAE(d_rna, HP["d_rna_lat"], HP["vae_hidden"], HP["p_drop"]).to(device)
     vae_p = TabVAE(d_prot,HP["d_prot_lat"],HP["vae_hidden"], HP["p_drop"]).to(device)
@@ -1024,7 +816,8 @@ def fit_full_and_predict(tr_ids, te_ids, seed: Optional[int]=None):
             xr,xp,fr,fp,y = xr.to(device), xp.to(device), fr.to(device), fp.to(device), y.to(device)
             opt.zero_grad(set_to_none=True)
             zr, mu_r, lv_r, _ = vae_r(xr); zp, mu_p, lv_p, _ = vae_p(xp)
-            with seeded_fork_rng(seed, step=steps): 
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(seed if seed is not None else SEED + steps)
                 if HP.get("moddrop_p_rna", 0) > 0 and torch.rand(()) < HP["moddrop_p_rna"]: zr = torch.zeros_like(zr)
                 if HP.get("moddrop_p_prot", 0) > 0 and torch.rand(()) < HP["moddrop_p_prot"]: zp = torch.zeros_like(zp)
             y_hat, y_stg = head(zr, zp, fr, fp)
@@ -1040,9 +833,6 @@ def fit_full_and_predict(tr_ids, te_ids, seed: Optional[int]=None):
         else: bad+=1
         if bad>=HP["patience"]: break
 
-    if len(te_ids) == 0:
-        return np.array([], dtype=np.float32), vae_r, vae_p, head
-
     # TEST predictions with deterministic MC-Dropout
     vae_r.train(); vae_p.train(); head.train()
     preds=[]
@@ -1050,7 +840,8 @@ def fit_full_and_predict(tr_ids, te_ids, seed: Optional[int]=None):
         for xr,xp,fr,fp,_ in dl_te:
             xr,xp,fr,fp = xr.to(device), xp.to(device), fr.to(device), fp.to(device)
             bag=[]
-            with seeded_fork_rng(seed, step=steps): 
+            with torch.random.fork_rng(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                torch.manual_seed(seed if seed is not None else SEED)
                 for _ in range(HP["mc_T"]):
                     zr, *_ = vae_r(xr); zp, *_ = vae_p(xp)
                     yhat,_ = head(zr,zp,fr,fp); yhat = yhat.clamp(min=Y_LO, max=Y_HI)
@@ -1101,16 +892,6 @@ if test_idx_omics.size>0 and np.isfinite(test_pred).any():
         test_mae = float(np.mean(np.abs(test_pred[has_any_omics[test_idx]][m] - y_all[test_idx_omics][m])))
         test_rmse = float(np.sqrt(np.mean((test_pred[has_any_omics[test_idx]][m] - y_all[test_idx_omics][m])**2)))
         summary_update({"test_mae": test_mae, "test_rmse": test_rmse})
-
-def within_band(y_true, y_pred, band):
-    m = np.isfinite(y_true) & np.isfinite(y_pred)
-    if m.sum() == 0: return np.nan
-    return float(np.mean(np.abs(y_true[m] - y_pred[m]) <= band))
-
-bands = [10, 20, 30, 40, 55]
-for b in bands:
-    print(f"[Utility] % within ±{b}: {100*within_band(yte_clin, pred1, b):.1f}%")
-
 
 # -----------------------------
 # CORAL/OT mapping (optional, as in v1.9d)
@@ -1238,7 +1019,7 @@ def coral_oof_on_train(train_idx_y, groups_train):
     pos_map = {idx:i for i,idx in enumerate(train_idx)}
     for tr, va in gkf.split(train_idx_y, y_tr_nonan, groups_train):
         tr_ids = train_idx_y[tr]; va_ids = train_idx_y[va]
-        yh_raw, vae_r_f, vae_p_f, _ = train_one_fold(tr_ids, va_ids, stage_fn, seed=SEED)
+        yh_raw, vae_r_f, vae_p_f, _ = train_one_fold(tr_ids, va_ids, stage_fn)
         with torch.no_grad():
             zr_tr = vae_r_f.encode(torch.from_numpy(Xr[tr_ids]).float().to(device))[0].cpu().numpy()
             zr_va = vae_r_f.encode(torch.from_numpy(Xr[va_ids]).float().to(device))[0].cpu().numpy()
@@ -1357,296 +1138,6 @@ if getattr(FLAGS, "train_pd_grid", False):
 
 HP["gmm_k"] = read_k_choice(TAB/"subtype_K_choice.txt", default_k=HP.get("gmm_k",3))
 K = HP["gmm_k"]
-
-# =====================================================================
-# NEW: Cluster stability & reproducibility suite (multi-seed + modalities)
-# =====================================================================
-from itertools import combinations
-from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score, silhouette_score
-from scipy.stats import kruskal
-
-RUN_CLUSTER_STABILITY = bool(CFG.get("run_cluster_stability", True))
-
-STABILITY_SEEDS = CFG.get("cluster_stability_seeds", None)
-if STABILITY_SEEDS is None:
-    # Use more than the 3 ensemble seeds for a credible stability statement.
-    STABILITY_SEEDS = [42, 777, 2027, 17, 123, 999, 31415, 27182, 8888, 54321]
-
-STABILITY_MODALITIES = ["rna", "prot", "fused"]  # compare all three
-
-def _eta2_np(groups, values):
-    df = pd.DataFrame({"g": groups, "x": values})
-    df = df[np.isfinite(df["x"])]
-    if df["g"].nunique() < 2:
-        return np.nan
-    grand = df["x"].mean()
-    ssb = df.groupby("g")["x"].apply(lambda v: len(v) * (v.mean() - grand) ** 2).sum()
-    sst = ((df["x"] - grand) ** 2).sum()
-    return float(ssb / sst) if sst > 0 else np.nan
-
-def _cluster_trainpd(Z_repr: np.ndarray, ids_idx: np.ndarray, yvals: np.ndarray, K: int, seed: int):
-    """
-    Fits GMM/KMeans on TRAIN-PD only for a specific representation.
-    Returns: labels (ordered by UPDRS median), plus metrics.
-    """
-    Z = Z_repr[ids_idx]
-    y = yvals[ids_idx]
-
-    m = np.isfinite(y) & np.isfinite(Z).all(1)
-    ids_idx = ids_idx[m]
-    Z = Z[m].astype(np.float64, copy=False)
-    y = y[m]
-
-    if len(ids_idx) < max(60, 8*K):
-        return pd.Series(dtype="Int64"), dict(n=int(len(ids_idx)))
-
-    Zs = StandardScaler(with_mean=True, with_std=True).fit_transform(Z)
-
-    model, method = _safe_gmm_fit(Zs, K, seed, reg0=1e-3)
-    labs = model.predict(Zs)
-
-    # Order labels by UPDRS median (defines cluster identity, reduces label-switch ambiguity)
-    meds = {k: float(np.median(y[labs == k])) if np.any(labs == k) else np.inf for k in np.unique(labs)}
-    # tie-break deterministically by cluster id
-    order = [k for k, _ in sorted(meds.items(), key=lambda kv: (kv[1], kv[0]))]
-    remap = {old: new for new, old in enumerate(order)}
-    labs_ord = np.array([remap.get(k, k) for k in labs], dtype=int)
-
-    # Metrics
-    counts = pd.Series(labs_ord).value_counts().sort_index().to_dict()
-    eta_updrs = _eta2_np(labs_ord, y)
-
-    try:
-        sil = float(silhouette_score(Zs, labs_ord)) if len(np.unique(labs_ord)) > 1 else np.nan
-    except Exception:
-        sil = np.nan
-
-    # Kruskal p (UPDRS)
-    try:
-        groups_up = [y[labs_ord == k] for k in range(K) if np.sum(labs_ord == k) > 0]
-        kw_up_p = float(kruskal(*groups_up).pvalue) if len(groups_up) >= 2 else np.nan
-    except Exception:
-        kw_up_p = np.nan
-
-    return (
-        pd.Series(labs_ord, index=clin.index[ids_idx].astype(str), name="cluster"),
-        dict(n=int(len(ids_idx)), counts=json.dumps(counts), silhouette=sil,
-             eta2_updrs=float(eta_updrs) if np.isfinite(eta_updrs) else np.nan,
-             kw_updrs_p=kw_up_p, method=method)
-    )
-
-def _hungarian_align(ref: pd.Series, cur: pd.Series, K: int):
-    """
-    Align cur labels to ref labels (label switching quantification).
-    Returns: aligned_cur (Series), mapping dict, mismatch_rate.
-    """
-    common = ref.index.intersection(cur.index)
-    if len(common) == 0:
-        return cur.copy(), {}, np.nan
-
-    r = ref.loc[common].astype(int).values
-    c = cur.loc[common].astype(int).values
-
-    # confusion matrix
-    M = np.zeros((K, K), dtype=int)
-    for rr, cc in zip(r, c):
-        if 0 <= rr < K and 0 <= cc < K:
-            M[rr, cc] += 1
-
-    # maximize overlap => minimize negative counts
-    row_ind, col_ind = linear_sum_assignment(-M)
-    mapping = {int(col): int(row) for row, col in zip(row_ind, col_ind)}
-
-    cur_al = cur.map(lambda x: mapping.get(int(x), int(x))).astype(int)
-    mismatch = float((cur_al.loc[common].values != ref.loc[common].values).mean())
-    return cur_al, mapping, mismatch
-
-def _raw_repr_for_modality(modality: str):
-    # Uses your anchored z-matrices (Xr/Xp) as "raw-omics space" for the reviewer comparison.
-    if modality == "rna":
-        return Xr
-    if modality == "prot":
-        return Xp
-    # fused
-    return np.hstack([Xr, Xp]) if (Xr.shape[1] + Xp.shape[1]) > 0 else np.zeros((len(all_ids), 0), dtype=np.float32)
-
-def _latent_repr_for_modality(zr_all, zp_all, zf_all, modality: str):
-    if modality == "rna":  return zr_all
-    if modality == "prot": return zp_all
-    return zf_all
-
-def _ids_trainpd_for_modality(modality: str):
-    base = np.asarray(is_pd_train, dtype=bool).copy()
-    # Require labels and some omics presence
-    base &= np.isfinite(y_all)
-    if modality == "rna":
-        base &= (Mr.sum(1) > 0)
-    elif modality == "prot":
-        base &= (Mp.sum(1) > 0)
-    else:
-        base &= ((Mr.sum(1) > 0) | (Mp.sum(1) > 0))
-    return np.where(base)[0]
-
-def _kw_upsit(labels: pd.Series):
-    # UPSIT comparison on TRAIN-PD only (same index as labels)
-    u = pd.to_numeric(clin["upsit_total"], errors="coerce").reindex(labels.index)
-    try:
-        groups_u = [u[labels.values == k].dropna().values for k in range(K) if (labels.values == k).sum() > 0]
-        groups_u = [g for g in groups_u if len(g) > 0]
-        return float(kruskal(*groups_u).pvalue) if len(groups_u) >= 2 else np.nan
-    except Exception:
-        return np.nan
-
-if RUN_CLUSTER_STABILITY:
-    print(f"[Stability] Running cluster stability over seeds={STABILITY_SEEDS} and modalities={STABILITY_MODALITIES}")
-
-    # Train representations per seed and cluster per modality
-    records = []
-    assign_long = []
-
-    tr_ids_full = train_idx[np.isfinite(y_tr) & has_any_omics[train_idx]]
-    te_empty = np.array([], dtype=int)
-
-    for s in STABILITY_SEEDS:
-        # Re-fit encoders (seed-specific) on TRAIN only
-        _, vae_r_s, vae_p_s, _ = fit_full_and_predict(tr_ids_full, te_empty, seed=int(s))
-        zr_s, zp_s, zf_s = get_mu_latents(vae_r_s, vae_p_s)
-
-        for mod in STABILITY_MODALITIES:
-            ids_idx = _ids_trainpd_for_modality(mod)
-            Z_lat = _latent_repr_for_modality(zr_s, zp_s, zf_s, mod)
-
-            labs_ser, met = _cluster_trainpd(Z_lat, ids_idx, y_all, K, seed=int(s))
-            if labs_ser.empty:
-                records.append({"seed": s, "modality": mod, **met, "kw_upsit_p": np.nan,
-                                "raw_ami": np.nan, "raw_ari": np.nan})
-                continue
-
-            # UPSIT downstream
-            kwu = _kw_upsit(labs_ser)
-
-            # VAE vs RAW-omics agreement (reviewer AMI request)
-            Z_raw = _raw_repr_for_modality(mod)
-            raw_labs, _ = _cluster_trainpd(Z_raw, ids_idx, y_all, K, seed=int(s))
-            if not raw_labs.empty:
-                common = labs_ser.index.intersection(raw_labs.index)
-                raw_ami = float(adjusted_mutual_info_score(labs_ser.loc[common], raw_labs.loc[common])) if len(common) > 10 else np.nan
-                raw_ari = float(adjusted_rand_score(labs_ser.loc[common], raw_labs.loc[common])) if len(common) > 10 else np.nan
-            else:
-                raw_ami, raw_ari = np.nan, np.nan
-
-            records.append({"seed": s, "modality": mod, **met, "kw_upsit_p": kwu,
-                            "raw_ami": raw_ami, "raw_ari": raw_ari})
-
-            tmp = labs_ser.reset_index()
-            tmp.columns = ["participant_id", "label"]
-            tmp["seed"] = int(s)
-            tmp["modality"] = mod
-            assign_long.append(tmp)
-
-    stab_df = pd.DataFrame(records)
-    stab_df.to_csv(TAB / "cluster_stability_seed_summary.csv", index=False)
-
-    assign_long_df = pd.concat(assign_long, axis=0, ignore_index=True) if assign_long else pd.DataFrame()
-    assign_long_df.to_csv(DEEP / "cluster_stability_assignments_long.csv", index=False)
-
-    # Pairwise seed stability + label switching quantification (per modality)
-    switch_rows = []
-    pair_rows = []
-
-    for mod in STABILITY_MODALITIES:
-        sub = assign_long_df[assign_long_df["modality"] == mod].copy()
-        if sub.empty:
-            continue
-
-        # pivot seed x participant
-        piv = sub.pivot_table(index="participant_id", columns="seed", values="label", aggfunc="first")
-        # restrict to participants present in all seeds (clean, fair comparison)
-        piv = piv.dropna(axis=0, how="any")
-        if piv.empty:
-            continue
-
-        seeds_sorted = list(piv.columns)
-        ref_seed = seeds_sorted[0]
-        ref = piv[ref_seed].astype(int)
-
-        # label switching (aligned mismatch) vs reference seed
-        for s in seeds_sorted[1:]:
-            cur = piv[s].astype(int)
-            cur_al, mapping, mismatch = _hungarian_align(ref, cur, K)
-            switch_rows.append({
-                "modality": mod,
-                "ref_seed": int(ref_seed),
-                "seed": int(s),
-                "aligned_mismatch_rate": mismatch,
-                "mapping_cur_to_ref": json.dumps(mapping)
-            })
-
-        # pairwise AMI/ARI across seeds (permutation-invariant; no alignment required)
-        for a, b in combinations(seeds_sorted, 2):
-            la = piv[a].astype(int).values
-            lb = piv[b].astype(int).values
-            pair_rows.append({
-                "modality": mod,
-                "seed_a": int(a), "seed_b": int(b),
-                "AMI": float(adjusted_mutual_info_score(la, lb)),
-                "ARI": float(adjusted_rand_score(la, lb)),
-                "n_common": int(len(la))
-            })
-
-        # participant-level stability: fraction matching consensus label
-        # Use reference-aligned labels for this calculation
-        aligned = pd.DataFrame(index=piv.index)
-        aligned[ref_seed] = ref
-        for s in seeds_sorted[1:]:
-            cur = piv[s].astype(int)
-            cur_al, _, _ = _hungarian_align(ref, cur, K)
-            aligned[s] = cur_al
-
-        consensus = aligned.mode(axis=1)[0].astype(int)
-        stability = (aligned.eq(consensus, axis=0).sum(axis=1) / aligned.shape[1]).astype(float)
-
-        out_part = pd.DataFrame({
-            "participant_id": aligned.index,
-            "modality": mod,
-            "consensus_label": consensus.values,
-            "assignment_stability": stability.values
-        })
-        out_part.to_csv(TAB / f"cluster_stability_participant_{mod}.csv", index=False)
-
-    switch_df = pd.DataFrame(switch_rows)
-    switch_df.to_csv(TAB / "cluster_stability_label_switching.csv", index=False)
-
-    pair_df = pd.DataFrame(pair_rows)
-    pair_df.to_csv(TAB / "cluster_stability_pairwise_AMI_ARI.csv", index=False)
-
-    # Modality agreement within seed (fused vs prot vs rna) on intersection of participants
-    mod_agree_rows = []
-    if not assign_long_df.empty:
-        for s in sorted(assign_long_df["seed"].unique()):
-            df_s = assign_long_df[assign_long_df["seed"] == s].pivot_table(
-                index="participant_id", columns="modality", values="label", aggfunc="first"
-            ).dropna(axis=0, how="any")
-            if df_s.empty:
-                continue
-            for a, b in combinations(STABILITY_MODALITIES, 2):
-                if (a in df_s.columns) and (b in df_s.columns):
-                    mod_agree_rows.append({
-                        "seed": int(s), "modality_a": a, "modality_b": b,
-                        "AMI": float(adjusted_mutual_info_score(df_s[a].astype(int), df_s[b].astype(int))),
-                        "ARI": float(adjusted_rand_score(df_s[a].astype(int), df_s[b].astype(int))),
-                        "n_common": int(len(df_s))
-                    })
-    pd.DataFrame(mod_agree_rows).to_csv(TAB / "cluster_stability_modality_agreement.csv", index=False)
-
-    print("[Stability] Wrote:",
-          TAB/"cluster_stability_seed_summary.csv",
-          TAB/"cluster_stability_label_switching.csv",
-          TAB/"cluster_stability_pairwise_AMI_ARI.csv",
-          TAB/"cluster_stability_modality_agreement.csv",
-          "and per-modality participant stability CSVs.")
-
 
 # Fit on TRAIN-PD and order labels by UPDRS
 pd_idx_train = np.where(is_pd_train)[0]
@@ -1791,11 +1282,7 @@ def integrated_gradients_smoothed(vae, head, X, which="rna", batch=128, steps=32
     """
     if vae is None or head is None or X is None or X.shape[1] == 0:
         return np.array([], dtype=np.float32)
-
     vae.eval(); head.eval()
-    for p in vae.parameters():  p.requires_grad_(False)
-    for p in head.parameters(): p.requires_grad_(False)
-
 
     # determine the "other" latent dim given 'which'
     other_dim = HP["d_prot_lat"] if which == "rna" else HP["d_rna_lat"]
@@ -1816,7 +1303,8 @@ def integrated_gradients_smoothed(vae, head, X, which="rna", batch=128, steps=32
             for alpha in np.linspace(0.0, 1.0, steps, endpoint=True):
                 xin = baseline + alpha * (x_noisy - baseline)
                 xin.requires_grad_(True)
-        
+
+                # deterministic mean latents (no sampling)
                 mu, lv = vae.encode(xin)
                 z_this = mu
                 z_other = torch.zeros((xin.shape[0], other_dim), device=device)
@@ -1830,8 +1318,8 @@ def integrated_gradients_smoothed(vae, head, X, which="rna", batch=128, steps=32
                 else:
                     yhat, _ = head(z_other, z_this, fr, fp)
 
-                g = torch.autograd.grad(yhat.sum(), xin, retain_graph=False, create_graph=False)[0]
-                grads += g.detach().cpu().numpy()
+                (yhat.sum()).backward()
+                grads += xin.grad.detach().cpu().numpy()
 
             ig = (x_noisy.detach().cpu().numpy() - baseline.detach().cpu().numpy()) * (grads / steps)
             grads_sum += ig
@@ -1962,142 +1450,6 @@ pred.to_csv(DEEP/"predictions.csv")
 print(f"[Predictions] Added visit_code; value counts (top 10):\n{pred['visit_code'].value_counts(dropna=False).head(10)}")
 
 
-# -----------------------------
-# Longitudinal trajectory analysis (within-subtype heterogeneity + baseline-only prognostic value)
-# -----------------------------
-def _ensure_months_for_traj(df: pd.DataFrame) -> pd.Series:
-    if "months" in df.columns:
-        months_raw = pd.to_numeric(df["months"], errors="coerce")
-    else:
-        months_raw = pd.Series(index=df.index, dtype=float)
-    if months_raw.notna().sum() >= 2:
-        return months_raw
-    vc = infer_visit_code(df)
-    months_from_vc = vc.str.extract(r"M(\d{1,3})", expand=False).astype(float)
-    return months_from_vc
-
-months_traj = _ensure_months_for_traj(clin)
-subtype_all = assign_all if "assign_all" in globals() else pd.Series(index=clin.index, dtype=float)
-traj = pd.DataFrame({
-    "participant_id": clin.index.astype(str),
-    "updrs_total": pd.to_numeric(clin.get("updrs_total"), errors="coerce"),
-    "months": months_traj,
-    "subtype": subtype_all,
-})
-traj = traj.loc[is_pd_flag.values]
-traj = traj[np.isfinite(traj["updrs_total"]) & np.isfinite(traj["months"])]
-traj["years"] = traj["months"] / 12.0
-
-rows = []
-for pid, df_pid in traj.groupby("participant_id"):
-    df_pid = df_pid.sort_values("years")
-    if df_pid["years"].nunique() < 2:
-        continue
-    x = df_pid["years"].to_numpy()
-    y = df_pid["updrs_total"].to_numpy()
-    slope, intercept = np.polyfit(x, y, 1)
-    yhat = slope * x + intercept
-    resid_sd = float(np.std(y - yhat, ddof=1)) if len(y) > 2 else float(np.std(y - yhat))
-    base_idx = df_pid["years"].idxmin()
-    baseline_updrs = float(df_pid.loc[base_idx, "updrs_total"])
-    rows.append({
-        "participant_id": pid,
-        "subtype": int(df_pid["subtype"].iloc[0]) if pd.notna(df_pid["subtype"].iloc[0]) else np.nan,
-        "n_visits": int(len(df_pid)),
-        "baseline_updrs": baseline_updrs,
-        "slope_per_year": float(slope),
-        "resid_sd": resid_sd,
-    })
-
-traj_participants = pd.DataFrame(rows, columns=[
-    "participant_id",
-    "subtype",
-    "n_visits",
-    "baseline_updrs",
-    "slope_per_year",
-    "resid_sd",
-])
-traj_participants.to_csv(TAB / "longitudinal_participant_slopes.csv", index=False)
-
-def _iqr(series: pd.Series) -> float:
-    s = series.dropna()
-    if s.empty:
-        return np.nan
-    return float(np.percentile(s, 75) - np.percentile(s, 25))
-
-subtype_summary = (traj_participants
-    .groupby("subtype")
-    .agg(
-        n=("participant_id", "count"),
-        slope_mean=("slope_per_year", "mean"),
-        slope_median=("slope_per_year", "median"),
-        slope_std=("slope_per_year", "std"),
-        slope_iqr=("slope_per_year", _iqr),
-        resid_sd_median=("resid_sd", "median"),
-    )
-    .reset_index()
-    .sort_values("subtype"))
-subtype_summary.to_csv(TAB / "longitudinal_trajectory_subtype_summary.csv", index=False)
-
-overall_resid_median = float(traj_participants["resid_sd"].median()) if not traj_participants.empty else np.nan
-slope_diff_02 = np.nan
-if {0, 2}.issubset(set(subtype_summary["subtype"].dropna().astype(int))):
-    s0 = subtype_summary.loc[subtype_summary["subtype"] == 0, "slope_mean"].iloc[0]
-    s2 = subtype_summary.loc[subtype_summary["subtype"] == 2, "slope_mean"].iloc[0]
-    slope_diff_02 = float(s2 - s0)
-ratio_vs_resid = abs(slope_diff_02) / overall_resid_median if np.isfinite(slope_diff_02) and np.isfinite(overall_resid_median) and overall_resid_median > 0 else np.nan
-
-def _ols_metrics(y: np.ndarray, X: np.ndarray) -> dict:
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    yhat = X @ beta
-    resid = y - yhat
-    sse = float(np.sum(resid ** 2))
-    sst = float(np.sum((y - y.mean()) ** 2))
-    r2 = 1.0 - sse / sst if sst > 0 else np.nan
-    n, k = len(y), X.shape[1]
-    aic = n * np.log(sse / n) + 2 * k if sse > 0 else np.nan
-    return {"r2": r2, "aic": aic, "sse": sse, "n": n, "k": k}
-
-prog_df = traj_participants.copy()
-prog_df["baseline_updrs"] = pd.to_numeric(prog_df["baseline_updrs"], errors="coerce")
-prog_df["slope_per_year"] = pd.to_numeric(prog_df["slope_per_year"], errors="coerce")
-prog_df = prog_df.dropna(subset=["baseline_updrs", "slope_per_year"])
-prog_df = prog_df[
-    np.isfinite(prog_df["baseline_updrs"].to_numpy())
-    & np.isfinite(prog_df["slope_per_year"].to_numpy())
-]
-prognostic_rows = []
-if not prog_df.empty:
-    y = prog_df["slope_per_year"].to_numpy()
-    X1 = np.column_stack([np.ones(len(prog_df)), prog_df["baseline_updrs"].to_numpy()])
-    m1 = _ols_metrics(y, X1)
-    prognostic_rows.append({"model": "baseline_only", **m1})
-
-    dummies = pd.get_dummies(prog_df["subtype"].astype("Int64"), prefix="subtype", drop_first=True)
-    X2 = np.column_stack([np.ones(len(prog_df)), prog_df["baseline_updrs"].to_numpy(), dummies.to_numpy()])
-    m2 = _ols_metrics(y, X2)
-    prognostic_rows.append({"model": "baseline_plus_subtype", **m2})
-
-    prognostic_rows.append({
-        "model": "delta",
-        "r2": m2["r2"] - m1["r2"] if np.isfinite(m1["r2"]) and np.isfinite(m2["r2"]) else np.nan,
-        "aic": m2["aic"] - m1["aic"] if np.isfinite(m1["aic"]) and np.isfinite(m2["aic"]) else np.nan,
-        "sse": m2["sse"] - m1["sse"] if np.isfinite(m1["sse"]) and np.isfinite(m2["sse"]) else np.nan,
-        "n": m1["n"],
-        "k": m2["k"] - m1["k"],
-    })
-
-pd.DataFrame(prognostic_rows).to_csv(TAB / "longitudinal_prognostic_value.csv", index=False)
-
-print(f"[Longitudinal] Participant slopes computed: {len(traj_participants)}")
-if not subtype_summary.empty:
-    print(f"[Longitudinal] Per-subtype slope summary saved to {TAB/'longitudinal_trajectory_subtype_summary.csv'}")
-    if np.isfinite(slope_diff_02):
-        print(f"[Longitudinal] Slope diff (subtype 2 - subtype 0): {slope_diff_02:.3f} points/year; "
-              f"ratio vs median residual SD: {ratio_vs_resid:.3f}")
-print(f"[Longitudinal] Prognostic value table saved to {TAB/'longitudinal_prognostic_value.csv'}")
-
-
 # Add pin fingerprints to summary
 man = _load_manifest(); meta = _load_meta()
 summary_update({
@@ -2118,9 +1470,6 @@ summary_update({
     "calibration": calibration_results if getattr(FLAGS,"calibrate",False) else None,
     "z_rna_sha12": meta.get("z_rna.csv",{}).get("sha12"), "z_proteins_sha12": meta.get("z_proteins.csv",{}).get("sha12"),
     "hc_mode": meta.get("z_rna.csv",{}).get("hc_mode") or HC_MODE,
-    "longitudinal_n_participants": int(len(traj_participants)),
-    "longitudinal_slope_diff_02": float(slope_diff_02) if np.isfinite(slope_diff_02) else None,
-    "longitudinal_slope_diff_vs_resid_sd": float(ratio_vs_resid) if np.isfinite(ratio_vs_resid) else None,
 })
 
 # -----------------------------
