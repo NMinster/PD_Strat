@@ -1,0 +1,110 @@
+# =========================
+# CONFIG
+# =========================
+
+hc_mode: "global"   # or "site" if you have a 'site' column with enough HCs per site
+case_control_path: "S:/AMP-PD/releases_2023_v4release_1027_amp_pd_case_control.csv"
+train_cohort_prefix: "PP-"
+test_cohort_prefix: "PD-"
+
+
+# --- Hotfix knobs (new) ---
+force_global_hc: true              # force global HC normalization (not per-site)
+rna_target_feature_count: 17488    # freeze RNA feature-space size
+prot_target_feature_count: 1168    # freeze PROT feature-space size
+prot_min_unique_analytes: 50       # skip protein files with too few analytes
+prot_value_col: NPX                # value column for Olink-style data
+prot_feature_cols_priority:        # preferred feature ID columns, in order
+  - OlinkID
+  - Assay
+  - Target
+  - Analyte
+  - Protein
+  - UniProt
+
+hc_mode: global
+hc_min_global: 30  
+rna_target_feature_count: 17488
+prot_target_feature_count: 1168
+prot_min_unique_analytes: 50
+prot_value_col: NPX
+prot_feature_cols_priority: [OlinkID, Assay, Target, Analyte, Protein, UniProt]
+
+
+# 1) FILE PATHS
+# --------------
+case_control_path: "S:/AMP-PD/releases_2023_v4release_1027_amp_pd_case_control.csv"
+demographics_path:  "S:/AMP-PD/Demographics.csv"
+upsit_path:         "S:/AMP-PD/releases_2023_v4release_1027_clinical_UPSIT.csv"
+
+clinical_path: "C:/Users/NM/Documents/Python Scripts/results/tables/clinical_unified.csv"
+
+rna_path: "S:/AMP-PD/releases_2023_v4release_1027_rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv"
+
+prot_paths:
+  - "S:/AMP-PD/releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_oncology.csv"
+  - "S:/AMP-PD/releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_neurology.csv"
+  - "S:/AMP-PD/releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_inflammation.csv"
+  - "S:/AMP-PD/releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_cardiometabolic.csv"
+
+updrs_paths:
+  part_i:   "S:/AMP-PD/releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_I.csv"
+  part_ii:  "S:/AMP-PD/releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_II.csv"
+  part_iii: "S:/AMP-PD/releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_III.csv"
+  part_iv:  "S:/AMP-PD/releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_IV.csv"
+
+# Optional (used for program gene-symbol annotation; leave blank to skip)
+gene_map_path: ""
+gene_symbol_col: "symbol"
+
+# 2) ID HANDLING & COHORTS
+# ------------------------
+id_prefixes: ["PP", "PD"]   # for reference/printing
+train_cohort_prefix: "PP-"
+test_cohort_prefix:  "PD-"
+
+data_patterns:
+  # Only 'split:' is honored by this code path (regex here would be ignored).
+  # Example: "PP-12345-XYZ" -> split '-' and take parts 0..2 => "PP-12345"
+  participant_pattern: "split:-:0:2"
+
+# 3) FEATURE FILTERING (applied on TRAIN only, then used for all)
+# ---------------------------------------------------------------
+
+rebuild_z: false        # leave RNA alone
+rebuild_z_prot: true    # force only the proteomics rebuild for this run
+
+filter_rna:
+  max_missing: 0.20     # drop features with >20% NaN in TRAIN
+  var_q: 0.70           # keep top 30% most variable (on TRAIN)
+  max_features: 50000    # cap for speed; adjust up/down as needed
+
+filter_prot:
+  max_missing: 0.20
+  var_q: 0.20           # proteins are fewer; keep wider slice
+  max_features: 2000
+
+# 4) LATENT FACTORS & PROGRAMS
+# ----------------------------
+axes:
+  n_factors_rna: 6      # PCA factors (TRAIN fit) for RNA
+  n_factors_prot: 6     # PCA factors (TRAIN fit) for Proteins
+  nmf_topics_rna: 6     # NMF program count (RNA)
+  nmf_topics_prot: 6    # NMF program count (Proteins)
+
+# Stronger anti-underprediction bias
+asym_under_w: 3.5     # was 2.0
+tail_gamma: 2.0       # was 1.0
+
+# Make MC-dropout estimates stabler & allow a bigger upward adjustment
+mc_T_override: 50    # was 50
+unc_uplift_k: 0.60    # was 0.35
+
+# Optional: slightly “less Huber, more MSE” in the upper ranges
+huber_beta: 12.0      # was 10.0
+
+run_cluster_stability: true
+cluster_stability_seeds: [42, 777, 2027, 17, 123, 999, 31415, 27182, 8888, 54321]
+
+y_clamp_lo: 0.0
+y_clamp_hi: 220.0  
