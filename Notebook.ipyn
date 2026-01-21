@@ -1139,12 +1139,106 @@ if getattr(FLAGS, "train_pd_grid", False):
 HP["gmm_k"] = read_k_choice(TAB/"subtype_K_choice.txt", default_k=HP.get("gmm_k",3))
 K = HP["gmm_k"]
 
+# -----------------------------
+# Subtyping: Fit on TRAIN-PD (BASELINE ONLY - M0)
+# -----------------------------
+
 # Fit on TRAIN-PD and order labels by UPDRS
-pd_idx_train = np.where(is_pd_train)[0]
-Z_trpd = zf_all[pd_idx_train]; y_trpd_all = y_all[pd_idx_train]
-mZ = np.isfinite(Z_trpd).all(1) & np.isfinite(y_trpd_all)
-Z_trpd = Z_trpd[mZ].astype(np.float64, copy=False); y_pd_clean = y_trpd_all[mZ]
-pd_ids_clean = clin.index[pd_idx_train][mZ]
+# IMPORTANT: Use BASELINE (M0) visits only for clustering to ensure one row per participant
+
+# First, infer visit codes if not already done
+def _infer_visit_code_series(df: pd.DataFrame) -> pd.Series:
+    """Infer visit code 'M<num>' per row from visit_name / sample_id / months."""
+    idx = df.index
+    vc = pd.Series(pd.NA, index=idx, dtype="object")
+
+    # 1) From visit_name (e.g., 'M0', 'M6', 'Month 12', etc.)
+    if "visit_name" in df.columns:
+        v = df["visit_name"].astype(str).str.upper()
+        tok = v.str.extract(r"\b(M\d{1,3})\b", expand=False)
+        fallback = v.str.extract(r"\bMONTH\s*(\d{1,3})\b", expand=False)
+        vc = tok.fillna(fallback.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
+        # Also check for "BL" or "BASELINE" -> M0
+        is_baseline = v.str.contains(r"\b(BL|BASELINE)\b", na=False)
+        vc = vc.where(~is_baseline, "M0")
+
+    # 2) From sample_id (e.g., '...-BLM0T1-...' or '...-M6-...')
+    if "sample_id" in df.columns:
+        s = df["sample_id"].astype(str)
+        m_blm = s.str.extract(r"\bBLM(\d{1,3})", flags=re.IGNORECASE, expand=False)
+        m_plain = s.str.extract(r"(?<![A-Z0-9])M(\d{1,3})(?![A-Z0-9])", flags=re.IGNORECASE, expand=False)
+        vc = vc.fillna(m_blm.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
+        vc = vc.fillna(m_plain.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
+
+    # 3) From months numeric (round to nearest integer)
+    if "months" in df.columns:
+        mn = pd.to_numeric(df["months"], errors="coerce")
+        vc = vc.fillna(mn.round().astype("Int64").map(lambda z: f"M{int(z)}" if pd.notna(z) else pd.NA))
+
+    return vc.astype("string")
+
+# Infer visit codes for clinical data
+visit_codes = _infer_visit_code_series(clin)
+is_baseline = visit_codes.isin(["M0", "M00"])  # M0 or M00 are baseline
+
+# Also try to identify baseline from visit_name directly if visit_code inference failed
+if is_baseline.sum() == 0 and "visit_name" in clin.columns:
+    vn = clin["visit_name"].astype(str).str.upper()
+    is_baseline = vn.str.contains(r"\b(BL|BASELINE|M0|MONTH\s*0)\b", na=False)
+
+print(f"[Subtype] Identified {is_baseline.sum()} baseline (M0) visits out of {len(clin)} total rows")
+
+# Get TRAIN-PD baseline indices
+is_pd_train_baseline = is_pd_train & is_baseline.values
+pd_idx_train_bl = np.where(is_pd_train_baseline)[0]
+
+if len(pd_idx_train_bl) < 20:
+    print(f"[Subtype] WARNING: Only {len(pd_idx_train_bl)} TRAIN-PD baseline samples found!")
+    print("[Subtype] Falling back to first visit per participant...")
+
+    # Fallback: use first visit per participant
+    pd_idx_train_all = np.where(is_pd_train)[0]
+    pid_train = clin.index[pd_idx_train_all]
+
+    # Get first occurrence of each participant
+    seen = set()
+    first_visit_idx = []
+    for i, pid in zip(pd_idx_train_all, pid_train):
+        if pid not in seen:
+            seen.add(pid)
+            first_visit_idx.append(i)
+    pd_idx_train_bl = np.array(first_visit_idx)
+    print(f"[Subtype] Using first visit for {len(pd_idx_train_bl)} unique TRAIN-PD participants")
+
+Z_trpd = zf_all[pd_idx_train_bl]
+y_pd_clean = y_all[pd_idx_train_bl]
+pd_ids_clean = clin.index[pd_idx_train_bl].values  # numpy array of participant IDs
+
+# Filter for valid (finite) data
+mZ = np.isfinite(Z_trpd).all(1) & np.isfinite(y_pd_clean)
+Z_trpd = Z_trpd[mZ].astype(np.float64, copy=False)
+y_pd_clean = y_pd_clean[mZ]
+pd_ids_clean = pd_ids_clean[mZ]
+
+# Verify uniqueness
+if len(pd_ids_clean) != len(set(pd_ids_clean)):
+    print("[Subtype] WARNING: Still have duplicate participant IDs after baseline filter!")
+    # Deduplicate by keeping first occurrence
+    seen = {}
+    unique_mask = []
+    for i, pid in enumerate(pd_ids_clean):
+        if pid not in seen:
+            seen[pid] = i
+            unique_mask.append(True)
+        else:
+            unique_mask.append(False)
+    unique_mask = np.array(unique_mask)
+    Z_trpd = Z_trpd[unique_mask]
+    y_pd_clean = y_pd_clean[unique_mask]
+    pd_ids_clean = pd_ids_clean[unique_mask]
+
+print(f"[Subtype] Using {len(pd_ids_clean)} unique TRAIN-PD participants (baseline) for clustering")
+
 Zs_trpd = StandardScaler(with_mean=True, with_std=True).fit_transform(Z_trpd)
 def _gmm_for_K(Zs, K, seed=SEED): gmm, _ = _safe_gmm_fit(Zs, K, seed, reg0=1e-3); return gmm
 model_k = _gmm_for_K(Zs_trpd, K, seed=SEED)
@@ -1154,22 +1248,60 @@ order = [k for k,_ in sorted(meds.items(), key=lambda kv: kv[1])]
 remap = {old:new for new,old in enumerate(order)}
 labs_trpd = np.array([remap[k] for k in labs_raw], dtype=int)
 
-# Persist TRAIN-PD assignments
+# Persist TRAIN-PD assignments (participant-level, no duplicates)
 assign_col = f"subtype_K{K}_byUPDRS_TRAINPD"
-sub_ser = pd.Series(labs_trpd, index=pd_ids_clean, name=assign_col)
-assign_df = pd.DataFrame(index=clin.index); assign_df[sub_ser.name] = sub_ser
+sub_ser = pd.Series(labs_trpd, index=pd.Index(pd_ids_clean), name=assign_col)
+assign_df = pd.DataFrame({assign_col: sub_ser})
+assign_df.index.name = "participant_id"
 assign_df.to_csv(TAB/f"subtypes_TRAINPD_K{K}_assignments.csv")
 
 # Also assign ALL PD (TRAIN+TEST) using same scaler/model and remap
-pd_idx_all = np.where(is_pd_flag.values)[0]
-Z_pd_all = zf_all[pd_idx_all]
+# Use baseline only for ALL PD as well
+is_pd_all_baseline = is_pd_flag.values & is_baseline.values
+pd_idx_all_bl = np.where(is_pd_all_baseline)[0]
+
+if len(pd_idx_all_bl) < len(np.where(is_pd_flag.values)[0]) * 0.3:
+    # Fallback to first visit per participant
+    pd_idx_all_raw = np.where(is_pd_flag.values)[0]
+    pid_all = clin.index[pd_idx_all_raw]
+    seen = set()
+    first_visit_idx = []
+    for i, pid in zip(pd_idx_all_raw, pid_all):
+        if pid not in seen:
+            seen.add(pid)
+            first_visit_idx.append(i)
+    pd_idx_all_bl = np.array(first_visit_idx)
+
+Z_pd_all = zf_all[pd_idx_all_bl]
+pd_ids_all = clin.index[pd_idx_all_bl].values
+
+# Deduplicate if needed
+if len(pd_ids_all) != len(set(pd_ids_all)):
+    seen = {}
+    unique_mask = []
+    for i, pid in enumerate(pd_ids_all):
+        if pid not in seen:
+            seen[pid] = i
+            unique_mask.append(True)
+        else:
+            unique_mask.append(False)
+    unique_mask = np.array(unique_mask)
+    Z_pd_all = Z_pd_all[unique_mask]
+    pd_ids_all = pd_ids_all[unique_mask]
+
 m_all = np.isfinite(Z_pd_all).all(1)
-Z_pd_all_s = (Z_pd_all[m_all] - Z_trpd.mean(0)) / (Z_trpd.std(0) + 1e-8)
+# Use the same scaler parameters from TRAIN-PD
+Z_trpd_mean = Z_trpd.mean(0)
+Z_trpd_std = Z_trpd.std(0) + 1e-8
+Z_pd_all_s = (Z_pd_all[m_all] - Z_trpd_mean) / Z_trpd_std
 labs_all = model_k.predict(Z_pd_all_s)
 labs_all = np.array([remap.get(k, k) for k in labs_all], dtype=int)
-assign_all = pd.Series(np.nan, index=clin.index, name=f"subtype_K{K}_byUPDRS_ALLPD")
-assign_all.iloc[pd_idx_all[m_all]] = labs_all
-assign_all.to_csv(TAB/f"subtypes_ALLPD_K{K}_assignments.csv")
+
+# Create ALL-PD assignment series (participant-level)
+assign_all = pd.Series(np.nan, index=pd.Index(pd_ids_all), name=f"subtype_K{K}_byUPDRS_ALLPD")
+assign_all.iloc[np.where(m_all)[0]] = labs_all
+assign_all.index.name = "participant_id"
+assign_all.to_frame().to_csv(TAB/f"subtypes_ALLPD_K{K}_assignments.csv")
 
 
 ##################################################################################################################################################################################################################################################
@@ -1180,15 +1312,13 @@ K = int(HP["gmm_k"])
 allpd_path = TAB / f"subtypes_ALLPD_K{K}_assignments.csv"
 if allpd_path.exists():
     sub_all = pd.read_csv(allpd_path, index_col=0)
-    # Find the column that holds the ALL-PD labels
-    col = next(c for c in sub_all.columns if c.lower().startswith("subtype_k") and "allpd" in c.lower())
-    vae_clusters = (sub_all[[col]]
-        .rename(columns={col: "vae_cluster"})
-        .reset_index()
-        .rename(columns={"index": "participant_id"}))
-    vae_clusters["participant_id"] = vae_clusters["participant_id"].astype(str)
-    vae_clusters.to_csv(DEEP / "vae_clusters.csv", index=False)
-    print(f"[Subtypes] Wrote clean VAE cluster map: {DEEP/'vae_clusters.csv'}")
+    col = next((c for c in sub_all.columns if c.lower().startswith("subtype_k") and "allpd" in c.lower()), None)
+    if col:
+        vae_clusters = sub_all[[col]].rename(columns={col: "vae_cluster"}).reset_index()
+        vae_clusters.columns = ["participant_id", "vae_cluster"]
+        vae_clusters["participant_id"] = vae_clusters["participant_id"].astype(str)
+        vae_clusters.to_csv(DEEP / "vae_clusters.csv", index=False)
+        print(f"[Subtypes] Wrote clean VAE cluster map: {DEEP/'vae_clusters.csv'}")
 
 
 ##################################################################################################################################################################################################################################################
@@ -1196,14 +1326,18 @@ if allpd_path.exists():
 # Per-cluster summary (TRAIN-PD)
 rows = []
 for k in range(K):
-    mk = (labs_trpd==k); up = y_pd_clean[mk]
-    rows.append({"cluster": k, "n": int(mk.sum()),
-                 "UPDRS_mean": float(np.mean(up)) if up.size else np.nan,
-                 "UPDRS_median": float(np.median(up)) if up.size else np.nan,
-                 "UPDRS_IQR": float(np.percentile(up,75)-np.percentile(up,25)) if up.size else np.nan})
+    mk = (labs_trpd == k)
+    up = y_pd_clean[mk]
+    rows.append({
+        "cluster": k,
+        "n": int(mk.sum()),
+        "UPDRS_mean": float(np.mean(up)) if up.size else np.nan,
+        "UPDRS_median": float(np.median(up)) if up.size else np.nan,
+        "UPDRS_IQR": float(np.percentile(up, 75) - np.percentile(up, 25)) if up.size else np.nan
+    })
 summ = pd.DataFrame(rows).sort_values("cluster")
-summ.to_csv(TAB/f"subtypes_TRAINPD_K{K}_summary.csv", index=False)
-print("\n[Subtypes TRAIN-PD K=%d] per-cluster UPDRS summary:\n%s" % (K, summ))
+summ.to_csv(TAB / f"subtypes_TRAINPD_K{K}_summary.csv", index=False)
+print(f"\n[Subtypes TRAIN-PD K={K}] per-cluster UPDRS summary:\n{summ}")
 
 # Confounders on TRAIN-PD only
 from scipy.stats import chi2_contingency
@@ -1213,47 +1347,45 @@ def cramers_v(table):
     n = table.values.sum()
     r, k = table.shape
     return float(np.sqrt((chi2 / max(n, 1e-12)) / max(1, min(k-1, r-1))))
-    
-# Ensure pd_ids_clean and labs_trpd align
-pd_ids_clean = pd.Index(pd_ids_clean.astype(str))
-labs_series = pd.Series(labs_trpd, index=pd_ids_clean, name="cluster")
+
+# Convert pd_ids_clean to Index for consistency
+pd_ids_clean_idx = pd.Index(pd_ids_clean.astype(str))
+labs_series = pd.Series(labs_trpd, index=pd_ids_clean_idx, name="cluster")
 
 def _safe_reindex_series(df: pd.DataFrame, col: str, idx: pd.Index) -> pd.Series:
-    """Return df[col] reindexed to idx, even if df's index isn't participant_id yet or col is missing."""
+    """Return df[col] reindexed to idx, handling index mismatches."""
     if col not in df.columns:
         return pd.Series(index=idx, dtype=object)
-    s = df[col]
-    # If df's current index doesn't contain participant IDs, try to set it
-    if not df.index.isin(idx).any():
-        id_cands = ["participant_id","patno","patient_id","subject_id","subject","id","record_id","ppid","pdid","pid","participant"]
-        id_col = next((c for c in id_cands if c in df.columns), None)
-        if id_col is not None:
-            df_idxed = df.set_index(df[id_col].astype(str), drop=False)
-            s = df_idxed[col]
-    return s.reindex(idx)
+
+    # If df index matches our participant IDs, use directly
+    df_idx_str = df.index.astype(str)
+    if df_idx_str.isin(idx).any():
+        return df[col].reindex(idx)
+
+    # Otherwise, df index is something else (e.g., row numbers)
+    # We need to match via the index values in df which should be participant IDs
+    # Since clin.index IS participant_id after earlier processing, just reindex
+    lookup = pd.Series(df[col].values, index=df_idx_str)
+    return lookup.reindex(idx)
 
 conf_rows = []
 
 # site
-site_ser = _safe_reindex_series(clin, "site", pd_ids_clean).astype(str)
+site_ser = _safe_reindex_series(clin, "site", pd_ids_clean_idx).astype(str)
 if site_ser.notna().sum() > 0 and site_ser.nunique(dropna=True) > 1:
     tbl = pd.crosstab(labs_series, site_ser)
     if tbl.shape[1] > 1 and tbl.values.sum() > 0:
         conf_rows.append({"metric": "cluster x site CramérV", "value": cramers_v(tbl)})
-    else:
-        conf_rows.append({"metric": "cluster x site CramérV", "value": 0.0})
 
 # sex
-sex_ser = _safe_reindex_series(clin, "sex", pd_ids_clean).astype(str)
+sex_ser = _safe_reindex_series(clin, "sex", pd_ids_clean_idx).astype(str)
 if sex_ser.notna().sum() > 0 and sex_ser.nunique(dropna=True) > 1:
     tbl = pd.crosstab(labs_series, sex_ser)
     if tbl.shape[1] > 1 and tbl.values.sum() > 0:
         conf_rows.append({"metric": "cluster x sex CramérV", "value": cramers_v(tbl)})
-    else:
-        conf_rows.append({"metric": "cluster x sex CramérV", "value": 0.0})
 
 # age (η²)
-def _eta2(groups, values):
+def _eta2_local(groups, values):
     df_local = pd.DataFrame({"g": groups, "x": values})
     df_local = df_local[np.isfinite(df_local["x"])]
     if df_local["g"].nunique() < 2:
@@ -1263,9 +1395,9 @@ def _eta2(groups, values):
     sst = ((df_local["x"] - grand) ** 2).sum()
     return float(ssb / sst) if sst > 0 else np.nan
 
-age_ser = pd.to_numeric(_safe_reindex_series(clin, "age", pd_ids_clean), errors="coerce")
+age_ser = pd.to_numeric(_safe_reindex_series(clin, "age", pd_ids_clean_idx), errors="coerce")
 if age_ser.notna().sum() > 0:
-    eta_age = _eta2(labs_trpd, age_ser.values)
+    eta_age = _eta2_local(labs_trpd, age_ser.values)
     conf_rows.append({"metric": "age η² across clusters", "value": float(eta_age) if np.isfinite(eta_age) else 0.0})
 
 pd.DataFrame(conf_rows).to_csv(TAB / f"subtypes_TRAINPD_K{K}_confounders.csv", index=False)
@@ -1585,22 +1717,32 @@ mte = chosen_ser.notna() & upsit_te.notna() & pd.Series(has_any_omics[is_test.va
 rho_test_upsit = spearman_np(chosen_ser[mte].values.astype(float), upsit_te[mte].values.astype(float)) if mte.any() else np.nan
 if np.isfinite(rho_test_upsit): print(f"[UPSIT] TEST chosen severity ~ UPSIT Spearman ρ: {rho_test_upsit:.3f}")
 
-# Per-cluster UPSIT summary on TRAIN-PD
-upsit_pd_train = upsit_ser.reindex(pd_ids_clean)
+# Per-cluster UPSIT summary on TRAIN-PD (baseline)
+# Need to get UPSIT values at baseline for these participants
+upsit_pd_train = pd.Series(index=pd.Index(pd_ids_clean), dtype=float)
+
+# Get UPSIT from the baseline rows we used
+upsit_baseline_vals = upsit_all[pd_idx_train_bl[mZ]]  # mZ was the valid data mask
+upsit_pd_train = pd.Series(upsit_baseline_vals, index=pd.Index(pd_ids_clean))
+
 rows_u = []
 for k_ in range(K):
-    mk = (labs_trpd==k_)
+    mk = (labs_trpd == k_)
     uu = pd.to_numeric(upsit_pd_train[mk], errors="coerce")
-    rows_u.append({"cluster":k_, "UPSIT_n": int(uu.notna().sum()),
-                   "UPSIT_mean": float(np.nanmean(uu)) if uu.notna().sum()>0 else np.nan,
-                   "UPSIT_median": float(np.nanmedian(uu)) if uu.notna().sum()>0 else np.nan})
-upsit_summary = pd.DataFrame(rows_u); upsit_summary.to_csv(TAB/f"subtypes_TRAINPD_K{K}_UPSIT_summary.csv", index=False)
+    rows_u.append({
+        "cluster": k_,
+        "UPSIT_n": int(uu.notna().sum()),
+        "UPSIT_mean": float(np.nanmean(uu)) if uu.notna().sum() > 0 else np.nan,
+        "UPSIT_median": float(np.nanmedian(uu)) if uu.notna().sum() > 0 else np.nan
+    })
+upsit_summary = pd.DataFrame(rows_u)
+upsit_summary.to_csv(TAB / f"subtypes_TRAINPD_K{K}_UPSIT_summary.csv", index=False)
 
-# Kruskal-Wallis for UPSIT across clusters (TRAIN-PD)
+# Kruskal-Wallis for UPSIT across clusters (TRAIN-PD baseline)
 try:
-    groups = [pd.to_numeric(upsit_pd_train[labs_trpd==k_], errors="coerce").dropna().values for k_ in range(K)]
-    groups = [g for g in groups if g.size>0]
-    if len(groups)>=2:
+    groups = [pd.to_numeric(upsit_pd_train[labs_trpd == k_], errors="coerce").dropna().values for k_ in range(K)]
+    groups = [g for g in groups if g.size > 0]
+    if len(groups) >= 2:
         kw_stat, kw_p = kruskal(*groups)
         print(f"[UPSIT] Kruskal-Wallis across clusters: H={kw_stat:.3f}, p={kw_p:.3e}")
 except Exception as e:
