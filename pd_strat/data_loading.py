@@ -1,541 +1,416 @@
 """
-§1-2c — Load clinical data, proteomics (Olink NPX), and RNA expression.
+Data loading, merging, QC diagnostics, and train/test/val splitting.
 
-Responsible for:
-  - Reading clinical_unified.csv and inferring ID/visit/cohort columns.
-  - Loading and HC-anchored z-scoring of proteomics panels.
-  - Loading and z-scoring RNA gene-expression data.
-  - Completeness filter audit.
+Functions
+---------
+load_proteomics(panels_dict)
+    Load and pivot Olink proteomics panels to wide format.
+load_rnaseq(path)
+    Load RNA-seq data and identify feature columns.
+load_deg(path, adj_p_thresh, logfc_thresh)
+    Load and filter DEG file.
+merge_datasets(rnaseq_data, df_proteomics_wide)
+    Inner-join RNA-seq and proteomics on PATNO.
+run_qc_diagnostics(df_proteomics_wide, rnaseq_data, prot_feat_cols, rna_feature_cols, output_dir)
+    Run missingness and distribution diagnostics (no transforms applied).
+run_batch_assessment(df_proteomics_wide, rnaseq_data, df_proteomics_long, ...)
+    PCA-based batch / site effect assessment.
+build_datasets(merged_data, deg_gene_ids, df_proteomics_wide)
+    Build Combined, Proteomics-only, and RNA-seq-only dataset dicts.
+create_splits(datasets, random_state)
+    Create PDBP train/test + PPMI validation splits.
+build_visit_level_proteomics(df_proteomics_long)
+    Build visit-level proteomics wide table for time-stratified analysis.
 """
-
-from __future__ import annotations
-
-import os
-import re
-import json
-from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from scipy.stats import kruskal, f_oneway
 
-from .config import (
-    CFG, TAB, TRAIN_PREFIX, TEST_PREFIX,
-    PROTEOMICS_PANELS, PROT_QC_FILTER, PROT_COMPLETENESS_THRESHOLD,
-    HC_MODE, N_SVD, CFG_PROT_TARGET_N, SEED,
-    META_PATH, MANIFEST_PATH,
-    RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
-    RNA_EXCLUDE_BATCHES,
-)
-from .utils import (
-    _to_str_index, choose_id, map_participant_id, infer_visit_code,
-    resolve_column, short_sha, load_json, save_manifest,
-    apply_manifest, stable_top_features, flow_record, summary_update,
-)
+from .config import RANDOM_STATE, OUTPUT_DIR
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  §1  LOAD CLINICAL DATA & TARGETS                                       ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+def get_cohort(patno):
+    """Derive cohort from PATNO prefix (AMP-PD convention)."""
+    s = str(patno)
+    if s.startswith("PP-"):
+        return "PPMI"
+    elif s.startswith("PD-"):
+        return "PDBP"
+    return "Other"
 
-def _ensure_updrs_total(df: pd.DataFrame):
-    """Create or validate the updrs_total column."""
-    if ("updrs_total" in df.columns
-            and pd.to_numeric(df["updrs_total"], errors="coerce").notna().sum() > 20):
-        df["updrs_total"] = pd.to_numeric(df["updrs_total"], errors="coerce")
-        return
-    lc = {x.lower(): x for x in df.columns}
-    for k in ("updrs_total", "mds_updrs_total", "mds_updrs_total_score",
-              "mds_updrs_total__sum", "total_updrs"):
-        if k in lc:
-            df["updrs_total"] = pd.to_numeric(df[lc[k]], errors="coerce")
-            return
-    parts = []
-    for aliases in (
-        ("mds_updrs_part_i_total",   "updrs_part_i_total"),
-        ("mds_updrs_part_ii_total",  "updrs_part_ii_total"),
-        ("mds_updrs_part_iii_total", "updrs_part_iii_total"),
-        ("mds_updrs_part_iv_total",  "updrs_part_iv_total"),
-    ):
-        for a in aliases:
-            if a.lower() in lc:
-                parts.append(lc[a.lower()])
-                break
-    if parts:
-        df["updrs_total"] = pd.to_numeric(
-            df[parts].sum(axis=1, min_count=1), errors="coerce")
+
+def load_proteomics(panels_dict):
+    """Load and pivot Olink proteomics panels to wide format.
+
+    Returns (df_proteomics_long, df_proteomics_wide).
+    """
+    panel_dfs = []
+    for panel_name, path in panels_dict.items():
+        df = pd.read_csv(path)
+        df["panel"] = panel_name
+        panel_dfs.append(df)
+        print(f"  {panel_name}: {df.shape[0]:,} rows, {df['UniProt'].nunique()} proteins")
+
+    df_proteomics = pd.concat(panel_dfs, ignore_index=True)
+    print(f"\nTotal proteomics: {df_proteomics.shape[0]:,} rows, "
+          f"{df_proteomics['UniProt'].nunique()} unique proteins, "
+          f"{df_proteomics['participant_id'].nunique()} subjects")
+
+    df_proteomics_wide = (
+        df_proteomics
+        .pivot_table(index="participant_id", columns="UniProt", values="NPX", aggfunc="mean")
+        .reset_index()
+        .rename(columns={"participant_id": "PATNO"})
+    )
+    print(f"Proteomics wide: {df_proteomics_wide.shape}")
+    return df_proteomics, df_proteomics_wide
+
+
+def load_rnaseq(path):
+    """Load RNA-seq data and identify feature columns.
+
+    Returns (rnaseq_data, rna_feature_cols).
+    """
+    rnaseq_data = pd.read_csv(path)
+    if "participant_id" in rnaseq_data.columns:
+        rnaseq_data.rename(columns={"participant_id": "PATNO"}, inplace=True)
+    print(f"RNA-seq: {rnaseq_data.shape}")
+
+    rna_feature_cols = [c for c in rnaseq_data.columns if c not in ["PATNO", "pd"]]
+    print(f"RNA feature columns (first 5): {rna_feature_cols[:5]}")
+    print(f"Total RNA features: {len(rna_feature_cols)}")
+    return rnaseq_data, rna_feature_cols
+
+
+def load_deg(path, adj_p_thresh=0.05, logfc_thresh=0.1):
+    """Load and filter DEG file.
+
+    Returns (df_deg, deg_gene_ids).
+    """
+    df_deg = pd.read_csv(path)
+    filtered_deg = df_deg[(df_deg["adj.P.Val"] < adj_p_thresh) &
+                          (df_deg["logFC"] > logfc_thresh)]
+    deg_gene_ids = filtered_deg["gene_id"].tolist()
+    print(f"DEGs passing filter (adj.P<{adj_p_thresh}, logFC>{logfc_thresh}): "
+          f"{len(deg_gene_ids)}")
+    return df_deg, deg_gene_ids
+
+
+def merge_datasets(rnaseq_data, df_proteomics_wide):
+    """Inner-join RNA-seq and proteomics on PATNO."""
+    merged_data = pd.merge(rnaseq_data, df_proteomics_wide, on="PATNO", how="inner")
+    print(f"Merged: {merged_data.shape} ({merged_data['PATNO'].nunique()} subjects)")
+    return merged_data
+
+
+def run_qc_diagnostics(df_proteomics_wide, rnaseq_data,
+                       prot_feat_cols, rna_feature_cols, output_dir=OUTPUT_DIR):
+    """Run missingness & distribution diagnostics (no transforms applied).
+
+    Returns (RNA_NEEDS_LOG, rna_expressed).
+    """
+    print("=" * 60)
+    print("QUALITY CONTROL — DIAGNOSTIC ONLY")
+    print("=" * 60)
+
+    # ── Missingness ──
+    print("\n--- 1. Missingness Assessment ---")
+    prot_missing = df_proteomics_wide[prot_feat_cols].isnull().mean()
+    print(f"\nProteomics ({len(prot_feat_cols)} features):")
+    print(f"  Mean missingness per feature: {prot_missing.mean()*100:.2f}%")
+    print(f"  Max missingness:              {prot_missing.max()*100:.2f}%")
+    print(f"  Features >10% missing:        {(prot_missing > 0.10).sum()}")
+    print(f"  Features >20% missing:        {(prot_missing > 0.20).sum()}")
+
+    rna_missing = rnaseq_data[rna_feature_cols].isnull().mean()
+    print(f"\nRNA-seq ({len(rna_feature_cols)} features):")
+    print(f"  Mean missingness per feature: {rna_missing.mean()*100:.2f}%")
+    print(f"  Max missingness:              {rna_missing.max()*100:.2f}%")
+    print(f"  Features >10% missing:        {(rna_missing > 0.10).sum()}")
+
+    prot_sample_missing = df_proteomics_wide[prot_feat_cols].isnull().mean(axis=1)
+    rna_sample_missing = rnaseq_data[rna_feature_cols].isnull().mean(axis=1)
+    print(f"\nPer-sample missingness:")
+    print(f"  Proteomics: median={prot_sample_missing.median()*100:.2f}%, "
+          f"max={prot_sample_missing.max()*100:.2f}%")
+    print(f"  RNA-seq:    median={rna_sample_missing.median()*100:.2f}%, "
+          f"max={rna_sample_missing.max()*100:.2f}%")
+
+    # ── Distribution diagnostics ──
+    print("\n--- 2. Distribution Diagnostics ---")
+    prot_sample_vals = df_proteomics_wide[prot_feat_cols].values.flatten()
+    prot_sample_vals = prot_sample_vals[~np.isnan(prot_sample_vals)]
+    print(f"\nProteomics (Olink NPX):")
+    print(f"  Range: [{np.min(prot_sample_vals):.2f}, {np.max(prot_sample_vals):.2f}]")
+    print(f"  Median: {np.median(prot_sample_vals):.2f}")
+    is_npx_log_scale = np.max(prot_sample_vals) < 50
+    if is_npx_log_scale:
+        print("  Olink NPX is pre-normalized (log2) — no additional log needed")
     else:
-        df["updrs_total"] = np.nan
+        print("  Values look large for NPX — verify data provenance")
+
+    rna_sample_vals = rnaseq_data[rna_feature_cols[:500]].values.flatten()
+    rna_sample_vals = rna_sample_vals[~np.isnan(rna_sample_vals)]
+    rna_max = np.max(rna_sample_vals)
+    rna_median = np.median(rna_sample_vals)
+    rna_pct_zero = (rna_sample_vals == 0).mean() * 100
+
+    print(f"\nRNA-seq:")
+    print(f"  Range: [{np.min(rna_sample_vals):.2f}, {rna_max:.2f}]")
+    print(f"  Median: {rna_median:.2f}")
+    print(f"  % zeros: {rna_pct_zero:.1f}%")
+
+    rna_already_log = rna_max < 30 and rna_median < 15
+    RNA_NEEDS_LOG = not rna_already_log
+
+    if rna_already_log:
+        print("  RNA-seq appears already log-transformed — log2 will NOT be applied")
+    else:
+        print("  RNA-seq appears to be raw counts/TPM — log2(x+1) WILL be applied")
+
+    # Low-variance features
+    prot_var = df_proteomics_wide[prot_feat_cols].var()
+    rna_var = rnaseq_data[rna_feature_cols].var()
+    rna_expressed = [c for c in rna_feature_cols if rna_var.get(c, 0) >= 1e-6]
+
+    print(f"\n  Low-variance features:")
+    print(f"    Proteomics near-zero: {(prot_var < 1e-6).sum()}/{len(prot_feat_cols)}")
+    print(f"    RNA near-zero:        {len(rna_feature_cols) - len(rna_expressed)}/{len(rna_feature_cols)}")
+
+    # ── Diagnostic plots ──
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    axes[0].hist(prot_sample_vals, bins=80, color="steelblue", edgecolor="none", alpha=0.8)
+    axes[0].set_title("Proteomics (NPX) — Raw")
+    axes[0].set_xlabel("NPX value")
+    axes[0].set_ylabel("Count")
+
+    axes[1].hist(rna_sample_vals[rna_sample_vals > 0], bins=80, color="#E57373",
+                 edgecolor="none", alpha=0.8)
+    axes[1].set_title("RNA-seq — Raw (non-zero)")
+    axes[1].set_xlabel("Expression value")
+
+    axes[2].bar(["Proteomics", "RNA-seq"],
+                [prot_missing.mean() * 100, rna_missing.mean() * 100],
+                color=["steelblue", "#E57373"], edgecolor="black")
+    axes[2].set_ylabel("Mean % missing per feature")
+    axes[2].set_title("Feature Missingness")
+
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/qc_distributions_raw.png", dpi=200)
+    plt.show()
+
+    print(f"\n  NO TRANSFORMS APPLIED in this step.")
+    print(f"  Flags set: RNA_NEEDS_LOG={RNA_NEEDS_LOG}")
+    return RNA_NEEDS_LOG, rna_expressed
 
 
-def _ensure_upsit(df: pd.DataFrame):
-    for k in ("upsit_total", "UPSIT_total", "UPSITTOTAL",
-              "upsit_score", "upsit"):
-        if k in df.columns:
-            s = pd.to_numeric(df[k], errors="coerce")
-            if np.isfinite(s).sum() > 0:
-                df["upsit_total"] = s
-                return
-    df["upsit_total"] = np.nan
+def needs_correction(pcs, labels, threshold=0.01):
+    """Test whether PCs differ significantly by cohort (Kruskal-Wallis)."""
+    unique = [c for c in pd.unique(labels) if c != "Other"]
+    if len(unique) < 2:
+        return False, 1.0
+    for pc_idx in range(min(2, pcs.shape[1])):
+        groups = [pcs[labels == c, pc_idx] for c in unique]
+        groups = [g for g in groups if len(g) >= 5]
+        if len(groups) >= 2:
+            _, pval = kruskal(*groups)
+            if pval < threshold:
+                return True, pval
+    return False, 1.0
 
 
-_SEX_CANDIDATES  = ["sex", "Sex", "SEX", "gender", "Gender"]
-_AGE_CANDIDATES  = ["age_at_baseline", "age", "Age", "AGE",
-                     "age_at_enrollment", "enroll_age"]
-_SITE_CANDIDATES = ["site", "Site", "SITE", "center", "Centre",
-                     "enrolling_site", "study_site"]
+def run_batch_assessment(df_proteomics_wide, rnaseq_data, df_proteomics_long,
+                         prot_feat_cols, rna_feature_cols, rna_expressed,
+                         output_dir=OUTPUT_DIR):
+    """PCA-based batch / site effect assessment.
 
-
-def load_clinical() -> Tuple[pd.DataFrame, str, str, str, str]:
-    """Load and prepare clinical data.
-
-    Returns
-    -------
-    clin : pd.DataFrame   — indexed by participant ID
-    id_key, SEX_COL, AGE_COL, SITE_COL : str or None
+    Returns NEEDS_BATCH_CORRECTION flag.
     """
-    clin_path = TAB / "clinical_unified.csv"
-    if not clin_path.exists():
-        raise FileNotFoundError(
-            "Missing results/tables/clinical_unified.csv -- run assembly first.")
-    clin = pd.read_csv(clin_path)
+    print("=" * 60)
+    print("BATCH EFFECT ASSESSMENT")
+    print("=" * 60)
 
-    # ── ID inference ────────────────────────────────────────────────────
-    id_key = choose_id(clin)
-    clin[id_key] = _to_str_index(clin[id_key])
-    print(f"[Infer] id_key='{id_key}'  "
-          f"(unique={clin[id_key].nunique()}, rows={len(clin)})")
-    clin = clin.set_index(id_key, drop=True)
-    clin.index = _to_str_index(clin.index)
+    # Proteomics PCA
+    prot_for_pca = df_proteomics_wide[prot_feat_cols].dropna()
+    prot_patno = df_proteomics_wide.loc[prot_for_pca.index, "PATNO"]
+    prot_cohort = prot_patno.apply(get_cohort)
 
-    # ── UPDRS total ─────────────────────────────────────────────────────
-    _ensure_updrs_total(clin)
+    prot_scaled = StandardScaler().fit_transform(prot_for_pca)
+    prot_pca = PCA(n_components=5, random_state=RANDOM_STATE)
+    prot_pcs = prot_pca.fit_transform(prot_scaled)
+    prot_var_explained = prot_pca.explained_variance_ratio_
 
-    # ── Visit code ──────────────────────────────────────────────────────
-    clin["visit_code"] = infer_visit_code(clin)
+    print(f"\n  Proteomics: {len(prot_for_pca)} samples")
+    print(f"  Variance explained: PC1={prot_var_explained[0]:.3f}, PC2={prot_var_explained[1]:.3f}")
 
-    # ── Cohort flags ────────────────────────────────────────────────────
-    clin["cohort"] = (clin.get("cohort",
-                               pd.Series(index=clin.index, dtype=object))
-                      .astype(str).str.upper())
+    # RNA PCA
+    rna_for_pca_cols = rna_expressed[:5000] if len(rna_expressed) > 5000 else rna_expressed
+    rna_for_pca = rnaseq_data[rna_for_pca_cols].dropna()
+    rna_patno = rnaseq_data.loc[rna_for_pca.index, "PATNO"]
+    rna_cohort = rna_patno.apply(get_cohort)
 
-    # ── Case / control ──────────────────────────────────────────────────
-    if "case_control" not in clin.columns:
-        is_test = clin["cohort"].eq("TEST")
-        clin["case_control"] = np.where(is_test, "CASE", "UNKNOWN")
+    rna_scaled = StandardScaler().fit_transform(rna_for_pca)
+    rna_pca = PCA(n_components=5, random_state=RANDOM_STATE)
+    rna_pcs = rna_pca.fit_transform(rna_scaled)
+    rna_var_explained = rna_pca.explained_variance_ratio_
 
-    # ── UPSIT ───────────────────────────────────────────────────────────
-    _ensure_upsit(clin)
+    # Site info
+    prot_has_site = "site" in df_proteomics_long.columns
 
-    # ── Demographics ────────────────────────────────────────────────────
-    SEX_COL  = resolve_column(clin, _SEX_CANDIDATES)
-    AGE_COL  = resolve_column(clin, _AGE_CANDIDATES)
-    SITE_COL = resolve_column(clin, _SITE_CANDIDATES)
-    print(f"[Demographics] sex='{SEX_COL}', age='{AGE_COL}', site='{SITE_COL}'")
+    # Visualization
+    n_panels = 3 if prot_has_site else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
 
-    clin["_sex"]  = clin[SEX_COL].astype(str) if SEX_COL else np.nan
-    clin["_age"]  = pd.to_numeric(clin[AGE_COL], errors="coerce") if AGE_COL else np.nan
-    clin["_site"] = clin[SITE_COL].astype(str) if SITE_COL else np.nan
+    for cohort, color in [("PPMI", "#2196F3"), ("PDBP", "#FF9800"), ("Other", "gray")]:
+        mask = prot_cohort.values == cohort
+        if mask.any():
+            axes[0].scatter(prot_pcs[mask, 0], prot_pcs[mask, 1],
+                            alpha=0.4, s=15, c=color, label=cohort)
+    axes[0].set_xlabel(f"PC1 ({prot_var_explained[0]:.1%})")
+    axes[0].set_ylabel(f"PC2 ({prot_var_explained[1]:.1%})")
+    axes[0].set_title("Proteomics PCA — by Cohort")
+    axes[0].legend()
 
-    return clin, id_key, SEX_COL, AGE_COL, SITE_COL
+    for cohort, color in [("PPMI", "#2196F3"), ("PDBP", "#FF9800"), ("Other", "gray")]:
+        mask = rna_cohort.values == cohort
+        if mask.any():
+            axes[1].scatter(rna_pcs[mask, 0], rna_pcs[mask, 1],
+                            alpha=0.4, s=15, c=color, label=cohort)
+    axes[1].set_xlabel(f"PC1 ({rna_var_explained[0]:.1%})")
+    axes[1].set_ylabel(f"PC2 ({rna_var_explained[1]:.1%})")
+    axes[1].set_title("RNA-seq PCA — by Cohort")
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/qc_pca_batch_assessment.png", dpi=200)
+    plt.savefig(f"{output_dir}/qc_pca_batch_assessment.eps", format="eps", dpi=300)
+    plt.show()
+
+    # Statistical tests
+    prot_needs_combat, prot_batch_p = needs_correction(prot_pcs, prot_cohort.values)
+    rna_needs_combat, rna_batch_p = needs_correction(rna_pcs, rna_cohort.values)
+    NEEDS_BATCH_CORRECTION = prot_needs_combat or rna_needs_combat
+
+    print(f"\n  Proteomics PC1/2 ~ cohort: "
+          f"{'SIGNIFICANT' if prot_needs_combat else 'n.s.'} (best p={prot_batch_p:.2e})")
+    print(f"  RNA-seq PC1/2 ~ cohort:    "
+          f"{'SIGNIFICANT' if rna_needs_combat else 'n.s.'} (best p={rna_batch_p:.2e})")
+
+    if NEEDS_BATCH_CORRECTION:
+        print(f"\n  Batch effects detected. Correction will be applied FOLD-AWARE.")
+    else:
+        print(f"\n  No significant batch effects. StandardScaler suffices.")
+
+    return NEEDS_BATCH_CORRECTION
 
 
-def build_cohort_masks(clin: pd.DataFrame):
-    """Derive train/test/PD/HC boolean masks from clinical data.
+def make_analysis_copies(rnaseq_data, merged_data, rna_feature_cols, RNA_NEEDS_LOG):
+    """Create globally log-transformed copies for descriptive analyses only.
 
-    Returns dict with keys: is_train, is_test, is_control, is_pd_flag,
-    is_pd_train, is_pd_test.
+    Returns (rnaseq_analysis, merged_analysis).
     """
-    is_train = clin["cohort"].eq("TRAIN")
-    is_test  = clin["cohort"].eq("TEST")
+    rnaseq_analysis = rnaseq_data.copy()
+    merged_analysis = merged_data.copy()
 
-    cc = clin["case_control"].astype(str).str.upper()
-    is_control = cc.isin(["CONTROL", "CNTL", "HC", "HEALTHY"])
-    is_test_prefix = np.fromiter(
-        (str(x).upper().startswith(TEST_PREFIX) for x in clin.index),
-        dtype=bool, count=len(clin))
-    is_pd_flag = (cc.isin(["CASE", "PD", "PARKINSONS", "PATIENT", "DISEASE"])
-                  | is_test_prefix) & ~is_control
-    is_pd_train = is_pd_flag & is_train
-    is_pd_test  = is_pd_flag & is_test
+    if RNA_NEEDS_LOG:
+        print("  Applying log2(x+1) to RNA analysis copies...")
+        rnaseq_analysis[rna_feature_cols] = np.log2(
+            rnaseq_analysis[rna_feature_cols].clip(lower=0) + 1)
+        for col in rna_feature_cols:
+            if col in merged_analysis.columns:
+                merged_analysis[col] = np.log2(merged_analysis[col].clip(lower=0) + 1)
+    else:
+        print("  RNA-seq already log-scale — no transform needed")
 
-    flow_record("01_raw_clinical", int(is_train.sum()), int(is_test.sum()))
+    return rnaseq_analysis, merged_analysis
 
-    return {
-        "is_train": is_train, "is_test": is_test,
-        "is_control": is_control, "is_pd_flag": is_pd_flag,
-        "is_pd_train": is_pd_train, "is_pd_test": is_pd_test,
+
+def build_datasets(merged_data, deg_gene_ids, df_proteomics_wide, rna_feature_cols):
+    """Build Combined, Proteomics-only, and RNA-seq-only dataset dicts.
+
+    Returns (datasets, columns_rna, proteomics_cols, proteomics_cols_only).
+    """
+    columns_rna = [c for c in merged_data.columns if c in deg_gene_ids]
+    proteomics_cols = [
+        c for c in merged_data.columns
+        if c not in ["PATNO", "pd"] and c not in deg_gene_ids
+    ]
+    proteomics_cols_only = [
+        c for c in merged_data.columns
+        if c in df_proteomics_wide.columns and c not in ["PATNO", "pd"]
+    ]
+
+    datasets = {
+        "Combined":        merged_data[["PATNO", "pd"] + columns_rna + proteomics_cols].dropna(),
+        "Proteomics only": merged_data[["PATNO", "pd"] + proteomics_cols_only].dropna(),
+        "RNA-seq only":    merged_data[["PATNO", "pd"] + columns_rna].dropna(),
     }
 
+    for name, df in datasets.items():
+        n_pos = df["pd"].sum()
+        n_neg = len(df) - n_pos
+        print(f"{name:20s}: {df.shape[1]-2:5d} features, "
+              f"{len(df):4d} samples (PD={n_pos}, HC={n_neg})")
 
-def demographics_for(clin: pd.DataFrame, positions: np.ndarray) -> pd.DataFrame:
-    sub = clin.iloc[positions]
-    return pd.DataFrame({
-        "participant_id": sub.index.values,
-        "sex":    sub["_sex"].values,
-        "age":    sub["_age"].values,
-        "site":   sub["_site"].values,
-        "cohort": sub["cohort"].values,
-    })
+    return datasets, columns_rna, proteomics_cols, proteomics_cols_only
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  §2  LOAD PROTEOMICS                                                    ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+def create_splits(datasets, random_state=RANDOM_STATE):
+    """Create PDBP train/test + PPMI validation splits.
 
-def _normlower(s):
-    return pd.Series(s, dtype="object").astype(str).str.strip().str.lower()
-
-
-def _is_hc_rows(df_case: pd.DataFrame):
-    diag_bl = _normlower(df_case.get("diagnosis_at_baseline"))
-    c_bl    = _normlower(df_case.get("case_control_other_at_baseline"))
-    c_lt    = _normlower(df_case.get("case_control_other_latest"))
-    return ((diag_bl.str.contains("no pd nor other", na=False)
-             | c_bl.eq("control") | c_lt.eq("control"))
-            .fillna(False))
-
-
-def _load_case_control_table() -> Optional[pd.DataFrame]:
-    cc_path = CFG.get("case_control_path", "")
-    if not cc_path or not os.path.exists(cc_path):
-        return None
-    df = pd.read_csv(cc_path, sep=None, engine="python", encoding="utf-8-sig")
-    if "participant_id" not in df.columns:
-        cand = next((c for c in df.columns
-                     if c.strip().lower() in {"participant_id", "participant",
-                                              "patno"}), None)
-        if cand is None:
-            raise ValueError("case_control file needs participant_id column")
-        df = df.rename(columns={cand: "participant_id"})
-    df["participant_id_mapped"] = (df["participant_id"].astype(str)
-                                   .map(map_participant_id))
-    return df.set_index("participant_id_mapped")
-
-
-CASE_DF = _load_case_control_table()
-
-
-def _select_train_hc_ids(raw_index: pd.Index, is_train: pd.Series,
-                          min_n: int = 30) -> pd.Index:
-    if CASE_DF is None:
-        return pd.Index([])
-    hc_ids_all = CASE_DF.index[_is_hc_rows(CASE_DF)]
-    clin_index = is_train.index
-    hc_ids = (pd.Index(hc_ids_all)
-              .intersection(clin_index[is_train])
-              .intersection(raw_index))
-    return hc_ids if len(hc_ids) >= min_n else pd.Index([])
-
-
-def _load_proteomics_panels(panels_dict: Dict[str, str],
-                            qc_filter: str = "PASS"
-                            ) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
-    """Load panels, return (wide_df, panel_protein_map)."""
-    panel_dfs = []
-    panel_map: Dict[str, List[str]] = {}
-
-    for name, path in panels_dict.items():
-        if not os.path.exists(path):
-            print(f"  [WARN] Panel '{name}' not found: {path}")
-            continue
-        df = pd.read_csv(path, low_memory=False)
-        df["panel"] = name
-        if "Cumulative_QC" in df.columns and qc_filter:
-            n0 = len(df)
-            df = df[df["Cumulative_QC"].astype(str).str.upper()
-                    == qc_filter.upper()]
-            print(f"  {name}: {n0:,}->{len(df):,} rows (QC), "
-                  f"{df['UniProt'].nunique()} proteins")
-        else:
-            print(f"  {name}: {df.shape[0]:,} rows, "
-                  f"{df['UniProt'].nunique()} proteins")
-        panel_map[name] = sorted(df["UniProt"].dropna().unique().tolist())
-        panel_dfs.append(df)
-
-    if not panel_dfs:
-        return pd.DataFrame(), {}
-
-    df_all = pd.concat(panel_dfs, ignore_index=True)
-    print(f"\n  Total: {df_all.shape[0]:,} rows, "
-          f"{df_all['UniProt'].nunique()} proteins, "
-          f"{df_all['participant_id'].nunique()} subjects")
-    wide = (df_all.pivot_table(index="participant_id", columns="UniProt",
-                               values="NPX", aggfunc="mean"))
-    wide.index = [map_participant_id(str(i)) for i in wide.index]
-    if wide.index.has_duplicates:
-        wide = wide.groupby(wide.index).mean()
-    print(f"  Wide: {wide.shape}")
-
-    for pname in list(panel_map.keys()):
-        panel_map[pname] = [c for c in panel_map[pname] if c in wide.columns]
-        print(f"  Panel '{pname}': {len(panel_map[pname])} proteins in wide")
-
-    return wide.astype(np.float32), panel_map
-
-
-def load_proteomics(clin: pd.DataFrame,
-                    is_train: pd.Series,
-                    name_csv: str = "z_prot.csv",
-                    ) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
-    """Load (or build) z-scored proteomics.
-
-    Returns (z_prot DataFrame aligned to clin.index, panel_protein_map).
+    Returns dict of {dataset_name: split_dict}.
     """
-    csv_path = TAB / name_csv
-    meta = load_json(META_PATH).get(name_csv, {})
-    panel_map_path = TAB / "panel_protein_map.json"
-    panel_protein_map: Dict[str, List[str]] = {}
+    splits = {}
+    for name, df in datasets.items():
+        train_test = df[df["PATNO"].str.startswith("PD-")].copy()
+        val = df[df["PATNO"].str.startswith("PP-")].copy()
 
-    # Try cached
-    if csv_path.exists() and meta.get("hc_mode") == HC_MODE:
-        df = pd.read_csv(csv_path, index_col=0)
-        def _pid_like(x):
-            return str(x).upper().startswith(("PP-", "PD-"))
-        if (sum(_pid_like(c) for c in df.columns) >
-                0.6 * len(df.columns)):
-            df = df.T
-        df.index = [map_participant_id(i) for i in df.index.astype(str)]
-        if df.index.has_duplicates:
-            df = df[~df.index.duplicated(keep="first")]
-        df = df.reindex(clin.index)
-        df = apply_manifest(df, "prot")
-        if panel_map_path.exists():
-            pmap = json.load(open(panel_map_path))
-            for pname in list(pmap.keys()):
-                pmap[pname] = [c for c in pmap[pname]
-                               if c in set(df.columns.astype(str))]
-            panel_protein_map = pmap
-        else:
-            z_cols_set = set(df.columns.astype(str))
-            for pname, ppath in PROTEOMICS_PANELS.items():
-                if os.path.exists(ppath):
-                    try:
-                        raw_p = pd.read_csv(ppath, low_memory=False,
-                                            usecols=["UniProt"], nrows=500000)
-                        prots = sorted(raw_p["UniProt"].dropna().unique().tolist())
-                        prots = [c for c in prots if c in z_cols_set]
-                        if prots:
-                            panel_protein_map[pname] = prots
-                            print(f"    [Reconstruct] panel '{pname}': "
-                                  f"{len(prots)} proteins")
-                    except Exception as e:
-                        print(f"    [WARN] Could not read panel '{pname}': {e}")
-            if panel_protein_map:
-                json.dump(panel_protein_map, open(panel_map_path, "w"), indent=2)
-        print(f"  [Pin] {name_csv} shape={df.shape}, "
-              f"sha={short_sha(df.columns)}, "
-              f"panels={list(panel_protein_map.keys())}")
-        return df, panel_protein_map
+        X_tt = train_test.drop(columns=["PATNO", "pd"])
+        y_tt = train_test["pd"]
+        groups_tt = train_test["PATNO"]
 
-    # Build from panels
-    raw, panel_map = _load_proteomics_panels(PROTEOMICS_PANELS, PROT_QC_FILTER)
-    if raw.empty:
-        print("  [WARN] No proteomics data -- returning empty DataFrame")
-        return pd.DataFrame(index=clin.index), {}
+        X_val = val.drop(columns=["PATNO", "pd"])
+        y_val = val["pd"]
 
-    raw = raw.reindex(clin.index)
-    print(f"  [PROT/raw] samples={raw.notna().any(axis=1).sum()}, "
-          f"feats={raw.shape[1]}")
+        X_train, X_test, y_train, y_test, grp_train, grp_test = train_test_split(
+            X_tt, y_tt, groups_tt,
+            test_size=0.2, random_state=random_state, stratify=y_tt,
+        )
 
-    # HC-anchored z-scoring
-    hc_ids = _select_train_hc_ids(raw.dropna(how="all").index, is_train,
-                                   min_n=30)
-    if len(hc_ids) >= 30:
-        mu = raw.loc[hc_ids].mean(axis=0)
-        sd = raw.loc[hc_ids].std(axis=0).replace(0, np.nan).fillna(1.0)
-        Z = (raw - mu) / sd
-        print(f"  [HC] Global TRAIN anchoring (n_hc={len(hc_ids)})")
-    else:
-        tr_ids = clin.index[is_train]
-        tr_raw = raw.loc[raw.index.intersection(tr_ids)]
-        mu = tr_raw.median(axis=0)
-        mad = (tr_raw - mu).abs().median(axis=0)
-        sd = (mad * 1.4826).replace(0, np.nan).fillna(1.0)
-        Z = (raw - mu) / sd
-        print(f"  [HC] Endpoint-blind fallback: robust median/MAD on "
-              f"TRAIN (n={len(tr_raw)})")
+        splits[name] = {
+            "X_train": X_train, "y_train": y_train, "groups_train": grp_train,
+            "X_test": X_test, "y_test": y_test,
+            "X_val": X_val, "y_val": y_val,
+            "X_tt": X_tt, "y_tt": y_tt, "groups_tt": groups_tt,
+        }
+        print(f"{name}: train={len(X_train)}, test={len(X_test)}, "
+              f"val={len(X_val)}, features={X_train.shape[1]}")
 
-    Z = Z.clip(-10, 10).reindex(clin.index).astype(np.float32)
-    Z = stable_top_features(Z, CFG_PROT_TARGET_N, "PROT",
-                            train_mask=is_train.values)
-    man = load_json(MANIFEST_PATH)
-    if "prot_cols" in man:
-        Z = apply_manifest(Z, "prot")
-    else:
-        save_manifest(list(Z.columns))
-
-    z_cols_set = set(Z.columns.astype(str))
-    for pname in list(panel_map.keys()):
-        panel_map[pname] = [c for c in panel_map[pname] if c in z_cols_set]
-    panel_protein_map = panel_map
-
-    Z.to_csv(csv_path)
-    json.dump(panel_map, open(panel_map_path, "w"), indent=2)
-    sha = short_sha(Z.columns)
-    meta_all = load_json(META_PATH)
-    meta_all[name_csv] = dict(hc_mode=HC_MODE, shape=list(Z.shape), sha12=sha)
-    json.dump(meta_all, open(META_PATH, "w"), indent=2)
-    print(f"  [Pin] wrote {name_csv}: shape={Z.shape}, sha={sha}")
-    return Z, panel_protein_map
+    return splits
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  §2b  COMPLETENESS FILTER AUDIT                                         ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+def build_visit_level_proteomics(df_proteomics_long):
+    """Build visit-level proteomics wide table.
 
-def completeness_audit(z_prot: pd.DataFrame,
-                       is_train: pd.Series, is_test: pd.Series,
-                       panel_protein_map: Dict[str, List[str]]):
-    """Print and save per-sample / per-panel completeness diagnostics."""
-    print(f"\n{'=' * 60}")
-    print("COMPLETENESS FILTER AUDIT")
-    print(f"{'=' * 60}")
-
-    raw_miss = z_prot.isna().mean(axis=1)
-    raw_obs  = 1.0 - raw_miss
-    panel_presence: Dict[str, pd.Series] = {}
-    for pname, pcols in panel_protein_map.items():
-        if pcols:
-            panel_presence[pname] = z_prot[pcols].notna().mean(axis=1)
-
-    print(f"  Total samples: {len(z_prot)}")
-    print(f"  Total proteins: {z_prot.shape[1]}")
-    print(f"  Overall missingness: {raw_miss.mean()*100:.1f}%")
-    print(f"\n  Per-sample completeness distribution:")
-    for q in [0, 10, 25, 50, 75, 90, 100]:
-        val = np.nanpercentile(raw_obs.values, q)
-        print(f"    P{q:3d}: {val*100:.1f}%")
-
-    print(f"\n  Samples passing completeness thresholds:")
-    for thresh in [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
-        n_pass_train = int((raw_obs[is_train] >= thresh).sum())
-        n_pass_test  = int((raw_obs[is_test] >= thresh).sum())
-        marker = " <<<" if thresh == PROT_COMPLETENESS_THRESHOLD else ""
-        print(f"    >={thresh*100:.0f}%: TRAIN={n_pass_train}, "
-              f"TEST={n_pass_test}{marker}")
-
-    if panel_presence:
-        print(f"\n  Per-panel presence:")
-        for pname, pseries in panel_presence.items():
-            has_panel = (pseries > 0).sum()
-            full_panel = (pseries >= 0.9).sum()
-            print(f"    {pname}: {has_panel} any data, {full_panel} >=90%")
-
-    audit_df = pd.DataFrame({
-        "participant_id": z_prot.index,
-        "cohort": is_train.map({True: "TRAIN", False: ""}).values,
-        "overall_completeness": raw_obs.values,
-    })
-    for pname, pseries in panel_presence.items():
-        audit_df[f"panel_{pname}_completeness"] = pseries.values
-    audit_df.to_csv(TAB / "completeness_audit.csv", index=False)
-
-    n_with = z_prot.notna().any(axis=1).sum()
-    n_tr   = (is_train & z_prot.notna().any(axis=1)).sum()
-    n_te   = (is_test  & z_prot.notna().any(axis=1)).sum()
-    miss   = z_prot.isna().mean().mean()
-    print(f"\n  Samples with any data: {n_with} (TRAIN={n_tr}, TEST={n_te})")
-    print(f"  Proteins: {z_prot.shape[1]}")
-    print(f"  Overall missingness: {miss*100:.1f}%")
-    flow_record("03_after_qc", int(n_tr), int(n_te))
-
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  §2c  RNA LOADING                                                        ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-def load_rna(clin: pd.DataFrame,
-             is_train: pd.Series) -> Tuple[pd.DataFrame, bool]:
-    """Load optional RNA modality. Returns (z_rna, HAS_RNA)."""
-    print(f"\n{'=' * 60}")
-    print("RNA LOADING (optional modality)")
-    print(f"{'=' * 60}")
-
-    rna_path = TAB / "z_rna.csv"
-    rna_raw_path = Path(CFG.get("rna_path",
-        r"S:/AMP-PD/releases_2023_v4release_1027_rnaseq_gene_expression.csv"))
-
-    z_rna = pd.DataFrame(index=clin.index)
-
-    # Try cached
-    if rna_path.exists():
-        df = pd.read_csv(rna_path, index_col=0)
-        def _pid(x):
-            return str(x).upper().startswith(("PP-", "PD-"))
-        if sum(_pid(c) for c in df.columns) > 0.6 * len(df.columns):
-            df = df.T
-        df.index = [map_participant_id(i) for i in df.index.astype(str)]
-        if df.index.has_duplicates:
-            df = df[~df.index.duplicated(keep="first")]
-        df = df.reindex(clin.index)
-        print(f"  [Pin] z_rna.csv: shape={df.shape}, "
-              f"non-null={df.notna().any(axis=1).sum()}")
-        z_rna = df
-    elif rna_raw_path.exists():
-        print(f"  Loading raw RNA from: {rna_raw_path}")
-        try:
-            raw = pd.read_csv(rna_raw_path, low_memory=False)
-            if "participant_id" in raw.columns:
-                id_col = "participant_id"
-            elif "PATNO" in raw.columns:
-                id_col = "PATNO"
-            else:
-                id_col = raw.columns[0]
-            raw.index = [map_participant_id(str(x)) for x in raw[id_col].values]
-            raw = raw.drop(columns=[id_col], errors="ignore")
-            raw = raw.select_dtypes(include=[np.number])
-            if raw.index.has_duplicates:
-                raw = raw[~raw.index.duplicated(keep="first")]
-            raw = raw.reindex(clin.index)
-            print(f"  [RNA/raw] samples={raw.notna().any(axis=1).sum()}, "
-                  f"genes={raw.shape[1]}")
-
-            hc_ids = _select_train_hc_ids(raw.dropna(how="all").index,
-                                           is_train, min_n=30)
-            if len(hc_ids) >= 30:
-                mu = raw.loc[hc_ids].mean(axis=0)
-                sd = raw.loc[hc_ids].std(axis=0).replace(0, np.nan).fillna(1.0)
-                Z = (raw - mu) / sd
-                print(f"  [RNA/HC] Global TRAIN anchoring (n_hc={len(hc_ids)})")
-            else:
-                tr_ids = clin.index[is_train]
-                tr_raw = raw.loc[raw.index.intersection(tr_ids)]
-                mu = tr_raw.median(axis=0)
-                mad = (tr_raw - mu).abs().median(axis=0)
-                sd = (mad * 1.4826).replace(0, np.nan).fillna(1.0)
-                Z = (raw - mu) / sd
-                print(f"  [RNA/HC] Endpoint-blind median/MAD (n={len(tr_raw)})")
-
-            Z = Z.clip(-10, 10).reindex(clin.index).astype(np.float32)
-            Z = stable_top_features(Z, RNA_TARGET_N_GENES, "RNA",
-                                    train_mask=is_train.values)
-            Z.to_csv(rna_path)
-            print(f"  [Pin] wrote z_rna.csv: shape={Z.shape}")
-            z_rna = Z
-        except Exception as e:
-            print(f"  [WARN] RNA loading failed: {e}")
-    else:
-        print(f"  [SKIP] No RNA data found at {rna_raw_path}")
-
-    # Batch QC for RNA
-    if not z_rna.empty and RNA_EXCLUDE_BATCHES:
-        def _rna_batch_prefix(pid: str) -> str:
-            pid = str(pid).upper().strip()
-            if pid.startswith("PP-"):
-                digits = ''.join(c for c in pid[3:][:2] if c.isdigit())
-                if digits:
-                    return f"PP-{digits}"
-            return "OTHER"
-        bp = pd.Series([_rna_batch_prefix(p) for p in z_rna.index],
-                       index=z_rna.index)
-        excl = bp.isin(RNA_EXCLUDE_BATCHES)
-        if excl.sum() > 0:
-            z_rna.loc[excl, :] = np.nan
-            print(f"  RNA batch QC: excluded {excl.sum()} samples "
-                  f"from batches {RNA_EXCLUDE_BATCHES}")
-
-    HAS_RNA = not z_rna.empty and z_rna.notna().any(axis=1).sum() >= 30
-    print(f"  RNA available: {HAS_RNA} "
-          f"({z_rna.notna().any(axis=1).sum()} samples with data)")
-    return z_rna, HAS_RNA
+    Returns df_prot_visit.
+    """
+    print("Building visit-level proteomics wide table...")
+    df_prot_visit = (
+        df_proteomics_long
+        .dropna(subset=["visit_month", "NPX"])
+        .pivot_table(
+            index=["participant_id", "visit_month"],
+            columns="UniProt", values="NPX", aggfunc="mean",
+        )
+        .reset_index()
+        .rename(columns={"participant_id": "PATNO"})
+    )
+    print(f"  Visit-level proteomics: {df_prot_visit.shape}")
+    print(f"  Subjects: {df_prot_visit['PATNO'].nunique()}")
+    return df_prot_visit

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Output
+revision_outputs/
+*.eps
+*.png
+
+# Data files (too large for git)
+*.csv
+!requirements.txt
+
+# OS
+.DS_Store
+Thumbs.db

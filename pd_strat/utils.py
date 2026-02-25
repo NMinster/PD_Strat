@@ -1,323 +1,141 @@
 """
-Shared utility functions: metrics, ID helpers, manifest I/O, summary tracking.
-
-Every module imports from here rather than reimplementing these primitives.
+Shared utility functions: hyperparameter generation, bootstrap CI, DeLong test.
 """
 
-from __future__ import annotations
-
-import json
-import hashlib
-import re
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
-
 import numpy as np
-import pandas as pd
-from scipy.stats import spearmanr, pearsonr
+from scipy.stats import qmc, norm
+from sklearn.metrics import roc_auc_score
 
 from .config import (
-    CFG, TAB, MANIFEST_PATH, META_PATH, SEED, Y_LO, Y_HI,
-    PROT_COMPLETENESS_THRESHOLD,
+    RANDOM_STATE, N_BOOTSTRAPS, ALPHA, LHS_N_ITER,
+    MAX_ESTIMATORS_DEFAULT, MAX_ESTIMATORS_COMBINED,
 )
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Run-summary helper                                                      ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
-from .config import LOCKED
-
-summary: Dict[str, Any] = {
-    "locked_plan": {k: v for k, v in LOCKED.items()
-                    if not isinstance(v, range)},
-    "version": "2.1",
-}
-
-
-def summary_update(extra: dict):
-    summary.update(extra)
-    with open(TAB / "summary.json", "w") as fh:
-        json.dump(summary, fh, indent=2, default=str)
-
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Sample-flow accountant                                                  ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-_FLOW: Dict[str, Dict[str, int]] = {"TRAIN": {}, "TEST": {}}
-
-
-def flow_record(step: str, n_train: int, n_test: int):
-    _FLOW["TRAIN"][step] = n_train
-    _FLOW["TEST"][step]  = n_test
+def generate_lhs_params(n_iter=LHS_N_ITER, d=6, seed=RANDOM_STATE,
+                        max_estimators=MAX_ESTIMATORS_DEFAULT):
+    """Generate Latin Hypercube Sampled hyperparameters for RF pipeline."""
+    sampler = qmc.LatinHypercube(d=d, seed=seed)
+    samples = sampler.random(n_iter)
+    params = []
+    for row in samples:
+        n_estimators = int(row[0] * (max_estimators - 500)) + 500
+        max_depth = None if row[1] < 1 / 11 else int((row[1] - 1 / 11) / (1 - 1 / 11) * (10 - 1)) + 1
+        min_samples_split = int(row[2] * (10 - 2)) + 2
+        min_samples_leaf = int(row[3] * (4 - 1)) + 1
+        class_weight = "balanced" if row[4] < 0.5 else "balanced_subsample"
+        feature_k = int(row[5] * (51 - 30)) + 30
+        params.append({
+            "model__n_estimators": n_estimators,
+            "model__max_depth": max_depth,
+            "model__min_samples_split": min_samples_split,
+            "model__min_samples_leaf": min_samples_leaf,
+            "model__class_weight": class_weight,
+            "model__random_state": RANDOM_STATE,
+            "feature_selection__k": feature_k,
+        })
+    return [{k: [v] for k, v in c.items()} for c in params]
 
 
-def save_flow_table() -> pd.DataFrame:
-    rows = [{"step": s,
-             "TRAIN_n": _FLOW["TRAIN"].get(s, ""),
-             "TEST_n":  _FLOW["TEST"].get(s, "")}
-            for s in _FLOW["TRAIN"]]
-    df = pd.DataFrame(rows)
-    df.to_csv(TAB / "sample_flow_table.csv", index=False)
-    print("\n" + "=" * 60)
-    print("SAMPLE FLOW TABLE")
-    print("=" * 60)
-    print(df.to_string(index=False))
-    return df
+def bootstrap_ci(y_true, y_score, metric_fn, n_bootstraps=N_BOOTSTRAPS,
+                 alpha=ALPHA, seed=RANDOM_STATE):
+    """Bootstrap resampling confidence interval for any metric function.
 
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  ID / index helpers                                                      ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-def _to_str_index(idx) -> pd.Index:
-    if isinstance(idx, pd.MultiIndex):
-        idx = idx.to_flat_index()
-    return pd.Index([
-        "" if (isinstance(x, float) and np.isnan(x)) or x is None
-        else str(x) for x in idx
-    ])
-
-
-_ID_CANDIDATES = [
-    "participant_id", "patno", "patient_id", "subject_id", "subject",
-    "id", "record_id", "ppid", "pdid", "pid", "participant",
-]
-
-
-def choose_id(df: pd.DataFrame) -> str:
-    """Pick the best participant-ID column from a clinical DataFrame."""
-    present = [c for c in _ID_CANDIDATES if c in df.columns]
-    for c in present:
-        s = df[c]
-        nunique = s.dropna().astype(str).nunique()
-        n = len(s.dropna())
-        if n >= 2 and nunique <= max(0.9 * n, n - 1):
-            return c
-    if present:
-        return present[0]
-    if "sample_id" in df.columns:
-        return "sample_id"
-    df["_tmp_id"] = np.arange(len(df))
-    return "_tmp_id"
-
-
-def map_participant_id(s: str) -> str:
-    """Map a raw index value to a canonical participant-level ID."""
-    pat = ((CFG.get("data_patterns") or {}).get("participant_pattern")
-           or "split:-:0:2")
-    s = str(s)
-    if pat.startswith("split:"):
-        try:
-            _, sep, lo, hi = pat.split(":")
-            lo, hi = int(lo), int(hi)
-            bits = s.split(sep)
-            lo = max(0, min(lo, len(bits)))
-            hi = max(lo + 1, min(hi, len(bits)))
-            return sep.join(bits[lo:hi])
-        except Exception:
-            return s
-    return s
-
-
-def extract_patno(idx_values) -> np.ndarray:
-    """Extract participant-level ID from row index (strips visit suffixes)."""
-    return np.array([map_participant_id(str(x)) for x in idx_values])
-
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Manifest / metadata I/O                                                 ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-def short_sha(cols) -> str:
-    if cols is None or len(cols) == 0:
-        return "NA"
-    return hashlib.sha1("\n".join(map(str, cols)).encode()).hexdigest()[:12]
-
-
-def load_json(p: Path) -> dict:
-    if p.exists():
-        try:
-            return json.load(open(p))
-        except Exception:
-            return {}
-    return {}
-
-
-def save_manifest(prot_cols: List[str]):
-    m = load_json(MANIFEST_PATH)
-    m["prot_cols"]  = list(map(str, prot_cols))
-    m["prot_sha12"] = short_sha(m["prot_cols"])
-    json.dump(m, open(MANIFEST_PATH, "w"), indent=2)
-
-
-def apply_manifest(Z: pd.DataFrame, key: str) -> pd.DataFrame:
-    man = load_json(MANIFEST_PATH)
-    want = man.get(f"{key}_cols")
-    if not want:
-        return Z
-    inter = [c for c in want if c in set(Z.columns.astype(str))]
-    return Z.loc[:, inter]
-
-
-def stable_top_features(Z: pd.DataFrame, target_n: int, name: str,
-                        train_mask: Optional[np.ndarray] = None
-                        ) -> pd.DataFrame:
-    """Deterministic top-N feature selection by missingness then variance."""
-    if Z.empty or target_n <= 0 or Z.shape[1] <= target_n:
-        return Z
-    X = Z.values if train_mask is None else Z.values[train_mask]
-    mrate = 1.0 - np.mean(pd.isna(X), axis=0)
-    Xn = np.nan_to_num(X, nan=0.0)
-    var = np.var(Xn, axis=0)
-    keep = var > 0
-    if keep.sum() == 0:
-        return Z
-    cols_k = np.array(Z.columns)[keep]
-    m_k, v_k = mrate[keep], var[keep]
-    order = np.lexsort((cols_k.astype(str), -v_k, -m_k))
-    chosen = cols_k[order][:target_n].tolist()
-    Z2 = Z.loc[:, chosen]
-    print(f"  [Freeze/{name}] {Z.shape[1]} -> {Z2.shape[1]} features")
-    return Z2
-
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Metric functions                                                        ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-def spearman_np(a, b):
-    m = np.isfinite(a) & np.isfinite(b)
-    if m.sum() < 3:
-        return np.nan
-    return float(spearmanr(a[m], b[m]).statistic)
-
-
-def pearson_np(a, b):
-    m = np.isfinite(a) & np.isfinite(b)
-    if m.sum() < 3:
-        return np.nan
-    return float(pearsonr(a[m], b[m]).statistic)
-
-
-def full_metrics(pred, true, label=""):
-    """Compute full metric set: Spearman, Pearson, MAE, RMSE, R2."""
-    m = np.isfinite(pred) & np.isfinite(true)
-    n = int(m.sum())
-    if n < 3:
-        return {"n": n, "spearman": np.nan, "pearson": np.nan,
-                "mae": np.nan, "rmse": np.nan, "r2": np.nan}
-    p, t = pred[m], true[m]
-    mae  = float(np.mean(np.abs(p - t)))
-    rmse = float(np.sqrt(np.mean((p - t)**2)))
-    ss_res = np.sum((t - p)**2)
-    ss_tot = np.sum((t - t.mean())**2)
-    r2 = float(1 - ss_res / max(ss_tot, 1e-12))
-    return {
-        "n": n,
-        "spearman": spearman_np(pred, true),
-        "pearson":  pearson_np(pred, true),
-        "mae": mae, "rmse": rmse, "r2": r2,
-    }
-
-
-def bootstrap_ci(positions: np.ndarray, predictions: np.ndarray,
-                  y_vals: np.ndarray, clin_index: pd.Index,
-                  n_boot: int = 2000,
-                  ci: float = 0.95, seed: int = SEED
-                  ) -> Dict[str, Dict[str, float]]:
-    """Participant-level bootstrap 95% CIs for all metrics."""
-    pids = np.array([map_participant_id(str(x))
-                     for x in clin_index[positions]])
-    unique_pids = np.unique(pids)
-    rng = np.random.default_rng(seed)
-    alpha = (1 - ci) / 2
-
-    boot_metrics: Dict[str, List[float]] = {
-        "spearman": [], "pearson": [], "mae": [], "rmse": [], "r2": []}
-
-    for _ in range(n_boot):
-        bs_pids = rng.choice(unique_pids, size=len(unique_pids), replace=True)
-        bs_idx = []
-        for pid in bs_pids:
-            bs_idx.extend(np.where(pids == pid)[0])
-        bs_idx = np.array(bs_idx)
-        if len(bs_idx) < 5:
+    Returns (mean, lo, hi).
+    """
+    rng = np.random.RandomState(seed)
+    scores = []
+    y_true_arr = np.asarray(y_true)
+    y_score_arr = np.asarray(y_score)
+    for _ in range(n_bootstraps):
+        idx = rng.randint(0, len(y_true_arr), len(y_true_arr))
+        if len(np.unique(y_true_arr[idx])) < 2:
             continue
+        scores.append(metric_fn(y_true_arr[idx], y_score_arr[idx]))
+    scores = np.array(scores)
+    lo = np.percentile(scores, 100 * alpha / 2)
+    hi = np.percentile(scores, 100 * (1 - alpha / 2))
+    return np.mean(scores), lo, hi
 
-        p_bs = predictions[bs_idx]
-        t_bs = y_vals[bs_idx]
-        m_bs = np.isfinite(p_bs) & np.isfinite(t_bs)
-        if m_bs.sum() < 5:
+
+def bootstrap_paired_aucs(y_true_a, proba_a, y_true_b=None, proba_b=None,
+                          n_bootstraps=N_BOOTSTRAPS, seed=RANDOM_STATE):
+    """Bootstrap AUC difference between two models."""
+    rng = np.random.RandomState(seed)
+    diffs = []
+    ya = np.asarray(y_true_a)
+    pa = np.asarray(proba_a)
+    if y_true_b is None:
+        yb, pb = ya, np.asarray(proba_b)
+    else:
+        yb = np.asarray(y_true_b)
+        pb = np.asarray(proba_b)
+    for _ in range(n_bootstraps):
+        idx_a = rng.randint(0, len(ya), len(ya))
+        idx_b = rng.randint(0, len(yb), len(yb))
+        if len(np.unique(ya[idx_a])) < 2 or len(np.unique(yb[idx_b])) < 2:
             continue
-
-        p_, t_ = p_bs[m_bs], t_bs[m_bs]
-        boot_metrics["spearman"].append(float(spearmanr(p_, t_).statistic))
-        boot_metrics["pearson"].append(float(pearsonr(p_, t_).statistic))
-        boot_metrics["mae"].append(float(np.mean(np.abs(p_ - t_))))
-        boot_metrics["rmse"].append(float(np.sqrt(np.mean((p_ - t_)**2))))
-        ss_res = np.sum((t_ - p_)**2)
-        ss_tot = np.sum((t_ - t_.mean())**2)
-        boot_metrics["r2"].append(float(1 - ss_res / max(ss_tot, 1e-12)))
-
-    result: Dict[str, Dict[str, float]] = {}
-    point = full_metrics(predictions, y_vals)
-    for metric in boot_metrics:
-        vals = np.array(boot_metrics[metric])
-        if len(vals) < 100:
-            result[metric] = {"point": point.get(metric, np.nan),
-                              "lo": np.nan, "hi": np.nan}
-        else:
-            result[metric] = {
-                "point": point.get(metric, np.nan),
-                "lo": float(np.percentile(vals, 100 * alpha)),
-                "hi": float(np.percentile(vals, 100 * (1 - alpha))),
-            }
-    return result
+        auc_a = roc_auc_score(ya[idx_a], pa[idx_a])
+        auc_b = roc_auc_score(yb[idx_b], pb[idx_b])
+        diffs.append(auc_a - auc_b)
+    return np.array(diffs)
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Visit-code / demographic helpers                                        ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+# ── DeLong Test for ROC Comparison ──
 
-def infer_visit_code(df: pd.DataFrame) -> pd.Series:
-    vc = pd.Series(pd.NA, index=df.index, dtype="object")
-    if "visit_name" in df.columns:
-        v = df["visit_name"].astype(str).str.upper()
-        tok = v.str.extract(r"\b(M\d{1,3})\b", expand=False)
-        fb  = v.str.extract(r"\bMONTH\s*(\d{1,3})\b", expand=False)
-        vc  = tok.fillna(fb.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
-    if "sample_id" in df.columns:
-        s = df["sample_id"].astype(str)
-        m_blm   = s.str.extract(r"\bBLM(\d{1,3})", flags=re.I, expand=False)
-        m_plain = s.str.extract(
-            r"(?<![A-Z0-9])M(\d{1,3})(?![A-Z0-9])", flags=re.I, expand=False)
-        vc = vc.fillna(m_blm.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
-        vc = vc.fillna(m_plain.map(lambda x: f"M{x}" if pd.notna(x) else pd.NA))
-    if "months" in df.columns:
-        mn = pd.to_numeric(df["months"], errors="coerce")
-        vc = vc.fillna(mn.round().astype("Int64").map(
-            lambda z: f"M{int(z)}" if pd.notna(z) else pd.NA))
-    return vc.astype("string")
+def compute_midrank(x):
+    """Compute midrank values for the DeLong test."""
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        for k in range(i, j):
+            T[k] = 0.5 * (i + j - 1)
+        i = j
+    T2 = np.empty(N)
+    T2[J] = T + 1
+    return T2
 
 
-def resolve_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+def delong_roc_variance(ground_truth, predictions):
+    """Compute AUC and its variance using the DeLong method."""
+    order = (-ground_truth).argsort()
+    label_ordered = ground_truth[order]
+    predictions_sorted = predictions[order]
+    m = np.sum(label_ordered == 1)
+    n = np.sum(label_ordered == 0)
+    positive_examples = predictions_sorted[label_ordered == 1]
+    negative_examples = predictions_sorted[label_ordered == 0]
+    midrank = compute_midrank(predictions_sorted)
+    tx_pos = midrank[label_ordered == 1]
+    aucs = (np.sum(tx_pos) - m * (m + 1) / 2.0) / (m * n)
+    v01 = np.zeros(m)
+    v10 = np.zeros(n)
+    for i in range(m):
+        v01[i] = ((1.0 / n) * np.sum(positive_examples[i] > negative_examples) +
+                  (1.0 / (2 * n)) * np.sum(positive_examples[i] == negative_examples))
+    for i in range(n):
+        v10[i] = ((1.0 / m) * np.sum(negative_examples[i] < positive_examples) +
+                  (1.0 / (2 * m)) * np.sum(negative_examples[i] == positive_examples))
+    sx = np.var(v01, ddof=1)
+    sy = np.var(v10, ddof=1)
+    var_auc = sx / m + sy / n
+    return aucs, var_auc
 
 
-def eta2(labels, values):
-    """Effect-size: fraction of variance explained by cluster labels."""
-    m = np.isfinite(values)
-    if m.sum() < 10:
-        return np.nan
-    l, v = labels[m], values[m]
-    grand = v.mean()
-    ss_t = np.sum((v - grand)**2)
-    if ss_t < 1e-12:
-        return 0.0
-    ss_b = sum(np.sum(l == k) * (v[l == k].mean() - grand)**2
-               for k in np.unique(l))
-    return float(ss_b / ss_t)
+def delong_test(y_true, pred_a, pred_b):
+    """DeLong test for comparing two ROC curves on the same test set.
+
+    Returns (auc_a, auc_b, z_statistic, p_value).
+    """
+    y = np.asarray(y_true)
+    auc_a, var_a = delong_roc_variance(y, np.asarray(pred_a))
+    auc_b, var_b = delong_roc_variance(y, np.asarray(pred_b))
+    z = (auc_a - auc_b) / np.sqrt(var_a + var_b + 1e-10)
+    p = 2 * norm.sf(abs(z))
+    return auc_a, auc_b, z, p
