@@ -135,9 +135,10 @@ def fig_discovery(made):
                                            for _, r in bd.iterrows()], fontsize=7)
     ax.invert_yaxis(); ax.set_xlabel("Spearman ρ (continuous targets) or AUROC (fast progressor)")
     ax.axvline(0, color=AXIS, lw=0.8)
-    ax.legend(loc="lower right", ncol=2)
-    ax.set_title("Does the proteome add to baseline clinical scoring? (hollow = clinical, filled = proteomic)")
-    fig.tight_layout()
+    ax.set_xlim(left=min(-0.05, ax.get_xlim()[0]), right=ax.get_xlim()[1] + 0.35)
+    fig.legend(loc="lower center", ncol=2, bbox_to_anchor=(0.5, -0.02))
+    ax.set_title("Does the proteome add to baseline clinical scoring?  (hollow = clinical, filled = best proteomic)")
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     _save(fig, "fig_discovery_incremental.png", made)
 
 
@@ -170,11 +171,14 @@ def fig_trajectories(made):
             ax.plot(x, agg["mean"], color=col, lw=2, zorder=3,
                     label=f"T{t} ({'lowest' if t == 1 else 'highest' if t == 3 else 'middle'} predicted severity, n={sub['pid'].nunique()})")
             ax.scatter(x, agg["mean"], s=18, color=col, edgecolor=SURF, lw=1, zorder=4)
-        ax.set_title(f"{split}: UPDRS trajectories by baseline proteomic-severity tertile")
+        ax.set_title(split)
         ax.set_xlabel("Months from baseline proteomic sample")
         if ax is axes[0][0]:
             ax.set_ylabel("MDS-UPDRS total")
         ax.legend(loc="upper left")
+    fig.suptitle("UPDRS trajectories by baseline proteomic-severity tertile "
+                 "(thin lines = individual participants; bold = tertile mean ± SE)",
+                 fontsize=9, color=INK2, y=1.02)
     fig.tight_layout()
     _save(fig, "fig_trajectories_by_tertile.png", made)
 
@@ -305,11 +309,14 @@ def fig_replication(made):
                     fmt="none", ecolor=col, elinewidth=0.6, alpha=0.5, capsize=0)
         ax.scatter(s["train_beta"], s["test_beta"], s=34, color=col, marker=mk, edgecolor=SURF, lw=1,
                    zorder=3, label=lab)
-    lab_df = c.reindex(c["test_beta"].abs().sort_values(ascending=False).index).head(8)
-    for _, r in lab_df.iterrows():
+    lab_df = c.reindex(c["test_beta"].abs().sort_values(ascending=False).index).head(6)
+    for k, (_, r) in enumerate(lab_df.iterrows()):
         nm = r["gene"] if isinstance(r.get("gene"), str) and r["gene"] not in ("", "nan") else r["protein"]
-        ax.annotate(nm, (r["train_beta"], r["test_beta"]), xytext=(4, 4), textcoords="offset points",
-                    fontsize=6.5, color=INK2)
+        # alternate offsets so neighbouring labels do not collide
+        dx, dy = ((6, 6), (6, -9), (-6, 6), (-6, -9))[k % 4]
+        ax.annotate(nm, (r["train_beta"], r["test_beta"]), xytext=(dx, dy), textcoords="offset points",
+                    fontsize=6.5, color=INK2, ha="left" if dx > 0 else "right",
+                    arrowprops=dict(arrowstyle="-", color=AXIS, lw=0.5))
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
     ax.set_xlabel("TRAIN β (UPDRS points per SD protein, 95% CI)")
     ax.set_ylabel("TEST β (95% CI)")
@@ -397,7 +404,7 @@ def fig_within_pd(made):
             ax.axvline(0, color=AXIS, lw=0.8)
             ax.set_yticks(range(len(comps))); ax.set_yticklabels(comps, fontsize=7); ax.invert_yaxis()
             ax.set_xlabel(f"Δρ vs primary ({m['primary'].iloc[0]}), participant-level paired bootstrap 95% CI")
-            ax.set_title("Alternative models never beat the primary on TEST when CIs are shown")
+            ax.set_title("Candidate models vs the primary (Δρ < 0 = worse than primary)")
             ax.legend(loc="lower right")
             fig.tight_layout()
             _save(fig, "fig_model_comparison_forest.png", made)

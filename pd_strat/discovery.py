@@ -436,7 +436,9 @@ def run_discovery(clin, z_prot, M_prot, y_all, cohort, tv) -> Dict[str, Any]:
 
     # enrichment for trial design (fast progressor / slope) ------------------
     enr_rows = []
-    src = best_preds_test.get("fast_progressor") or best_preds_test.get("slope_per_year")
+    src = best_preds_test.get("fast_progressor")
+    if src is None:
+        src = best_preds_test.get("slope_per_year")
     if src is not None and te is not None:
         sl = te["tg"].set_index("pid")["slope_per_year"]
         d = src.set_index("pid").join(sl, how="inner").dropna(subset=["pred_best", "slope_per_year"])
