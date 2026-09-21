@@ -289,10 +289,18 @@ def _load_med_history(path: str) -> Optional[pd.DataFrame]:
     yr_dx = _find_col(df, [r"diagnos.*year", r"year.*diagnos", r"^pd_dx_year$",
                            r"diagnosis_date", r"date.*diagnos"],
                       "diagnosis year/date", required=False)
+    levo = _find_col(df, [r"^on_levodopa$", r"levodopa", r"l_?dopa"],
+                     "levodopa use", required=False)
+    ledd = _find_col(df, [r"^ledd$", r"levodopa.*equivalent", r"\bledd\b"],
+                     "LEDD", required=False)
+    dopa_any = _find_col(df, [r"on_dopamine_agonist", r"dopamine.*agonist",
+                              r"on_other_pd_medications", r"pd_medication"],
+                         "other dopaminergic medication", required=False)
     print(f"    [MedHx] id='{pid}', age_at_diagnosis='{age_dx}', "
-          f"diagnosis_year='{yr_dx}'")
-    if age_dx is None and yr_dx is None:
-        print("    [MedHx] no diagnosis age/date column -> skipped")
+          f"diagnosis_year='{yr_dx}', levodopa='{levo}', LEDD='{ledd}', "
+          f"other_dopaminergic='{dopa_any}'")
+    if age_dx is None and yr_dx is None and levo is None and ledd is None:
+        print("    [MedHx] no diagnosis-age / medication column -> skipped")
         return None
     out = pd.DataFrame({"participant_id": _norm_pid(df[pid])})
     out["age_at_diagnosis"] = (pd.to_numeric(df[age_dx], errors="coerce")
@@ -301,11 +309,37 @@ def _load_med_history(path: str) -> Optional[pd.DataFrame]:
         yr = pd.to_numeric(df[yr_dx].astype(str).str.extract(r"(\d{4})", expand=False),
                            errors="coerce")
         out["diagnosis_year"] = yr
-    out = (out.sort_values("participant_id")
-              .groupby("participant_id", as_index=False)
-              .agg(lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan))
-    print(f"    [MedHx] {int(out['age_at_diagnosis'].notna().sum())} participants "
-          f"with age at diagnosis")
+
+    def _yes(col):
+        s = df[col].astype(str).str.strip().str.lower()
+        num = pd.to_numeric(df[col], errors="coerce")
+        return np.where(num.notna(), (num > 0).astype(float),
+                        s.isin(["yes", "y", "true", "1", "on"]).astype(float))
+
+    # participant-level medication exposure (any visit) — a reviewer-facing
+    # confounder: plasma DDC rises with levodopa/DDC-inhibitor treatment
+    if levo:
+        out["on_levodopa"] = _yes(levo)
+    if dopa_any:
+        out["on_other_dopaminergic"] = _yes(dopa_any)
+    if ledd:
+        out["ledd"] = pd.to_numeric(df[ledd], errors="coerce")
+    g = out.groupby("participant_id", as_index=False)
+    aggs = {}
+    for c in out.columns:
+        if c == "participant_id":
+            continue
+        aggs[c] = "max" if c in ("on_levodopa", "on_other_dopaminergic") else "first"
+    out = (out.sort_values("participant_id").groupby("participant_id", as_index=False)
+              .agg(aggs))
+    if "ledd" in out.columns:
+        out["ledd"] = out["ledd"].fillna(np.nan)
+    msg = f"    [MedHx] {int(out['age_at_diagnosis'].notna().sum())} with age at diagnosis"
+    if "on_levodopa" in out.columns:
+        msg += f"; {int((out['on_levodopa'] > 0).sum())} ever on levodopa"
+    if "ledd" in out.columns:
+        msg += f"; {int(out['ledd'].notna().sum())} with LEDD"
+    print(msg)
     return out
 
 
@@ -533,7 +567,8 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
     cols = ["participant_id", "visit_name", "visit_month", "cohort",
             "case_control", "diagnosis", "updrs_total", p1, p2, p3, p4,
             "hoehn_yahr", "updrs3_state", "upsit_total", "sex", "age_at_baseline",
-            "age", "age_at_diagnosis", "disease_duration_years", "site",
+            "age", "age_at_diagnosis", "disease_duration_years",
+            "on_levodopa", "on_other_dopaminergic", "ledd", "site",
             "race", "ethnicity"]
     cols = [c for c in cols if c in base.columns]
     cols += [c for c in base.columns if c.startswith("datscan_")]

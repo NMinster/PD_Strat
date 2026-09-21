@@ -137,6 +137,12 @@ Missing: Abstract, Keywords, "Unsupervised subtyping" (heading only), "Model sel
 
 ---
 
+## 6b. Literature-driven additions (see `docs/literature_review.md`)
+
+- Cite and differentiate **Minster & Jafri, npj Parkinson's Disease 2026** (same data, PDBP→PPMI, PSI); justify the reversed cohort roles and report the reverse direction as a supplement.
+- **Medication confound on DDC (P20711)**: plasma DDC rises with levodopa/DDC-inhibitor treatment (2024). Re-run with `prot_exclude: ["P20711"]`, report levodopa-stratified ρ (§3i) and the DDC coefficient by stratum.
+- Update the SAA sentence (quantitative SAA now exists), the NSD-ISS framing (5-year staging results), add NfL as the incumbent comparator, and note Olink-platform dependence as a limitation.
+
 ## 7. Checklist after running on the real data
 
 1. `python run.py` (full; ~1–2 h with `n_permutations: 100`, `stability_B: 200`).

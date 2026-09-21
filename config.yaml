@@ -57,6 +57,10 @@ prot_min_obs_frac: 0.30
 prot_min_mad: 0.01
 prot_corr_thresh: 0.95
 prot_feature_cap: 1168
+# Medication-sensitivity re-run: drop proteins whose plasma level is altered by
+# PD treatment (P20711 = DDC rises with levodopa/DDC-inhibitor).  Run once with
+# the list empty (primary) and once with it set, using a different out_dir.
+prot_exclude: []            # e.g. ["P20711"]
 
 # Inference knobs (lower for a quick run; manuscript defaults shown)
 n_permutations: 100        # label-permutation null for OOF rho (empirical p)

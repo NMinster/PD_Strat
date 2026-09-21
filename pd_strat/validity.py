@@ -189,8 +189,10 @@ def _population_refit(clin, X, M, y_all, bff, groups_all,
 # ║  (c) extended covariates                                                 ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
-_NUMERIC_COVS = [("age", "_age"), ("disease_duration", "disease_duration_years")]
-_CATEG_COVS = [("sex", "_sex"), ("site", "_site"), ("med_state", "updrs3_state")]
+_NUMERIC_COVS = [("age", "_age"), ("disease_duration", "disease_duration_years"),
+                 ("ledd", "ledd")]
+_CATEG_COVS = [("sex", "_sex"), ("site", "_site"), ("med_state", "updrs3_state"),
+               ("levodopa", "on_levodopa")]
 
 
 def _design(clin, positions, ref_cols=None, fill=None):
@@ -297,6 +299,13 @@ def _extended_covariates(clin, X, M, y_all, bff, train_idx_y, groups_train, gkf,
                 mm = (st == s) & np.isfinite(pred) & np.isfinite(y)
                 if mm.sum() >= 20:
                     strata[f"{tag}_medstate_{s}"] = {
+                        "n": int(mm.sum()), "rho": spearman_np(pred[mm], y[mm])}
+        if "on_levodopa" in clin.columns:
+            lv = pd.to_numeric(clin["on_levodopa"].iloc[pos], errors="coerce").values
+            for lab, val in (("levodopa_yes", 1.0), ("levodopa_no", 0.0)):
+                mm = (lv == val) & np.isfinite(pred) & np.isfinite(y)
+                if mm.sum() >= 20:
+                    strata[f"{tag}_{lab}"] = {
                         "n": int(mm.sum()), "rho": spearman_np(pred[mm], y[mm])}
         if "disease_duration_years" in clin.columns:
             dd = pd.to_numeric(clin["disease_duration_years"].iloc[pos],

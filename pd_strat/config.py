@@ -153,6 +153,10 @@ PROT_MIN_OBS_FRAC  = float(_cfg("prot_min_obs_frac", 0.30))
 PROT_MIN_MAD       = float(_cfg("prot_min_mad", 0.01))
 PROT_CORR_THRESH   = float(_cfg("prot_corr_thresh", 0.95))
 PROT_FEATURE_CAP   = int(_cfg("prot_feature_cap", 1168))
+# Proteins to drop before modelling (UniProt accessions) — e.g. P20711 (DDC),
+# whose plasma level rises with levodopa/DDC-inhibitor treatment.  Use for a
+# medication-sensitivity re-run; empty by default.
+PROT_EXCLUDE: List[str] = [str(x).strip().upper() for x in (_cfg("prot_exclude", []) or [])]
 
 # ── Population for the severity model ──────────────────────────────────────
 # "all"     : every TRAIN/TEST row with UPDRS (PD cases + healthy controls)

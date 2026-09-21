@@ -26,7 +26,7 @@ from .config import (
     META_PATH, MANIFEST_PATH, CASE_CONTROL_PATH,
     RNA_PATH, RNA_LOG1P,
     FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
-    PROT_FEATURE_CAP,
+    PROT_FEATURE_CAP, PROT_EXCLUDE,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
     RNA_EXCLUDE_BATCHES,
 )
@@ -307,6 +307,10 @@ def load_proteomics(clin: pd.DataFrame,
             df = df[~df.index.duplicated(keep="first")]
         df = df.reindex(clin.index)
         df = apply_manifest(df, "prot")
+        if PROT_EXCLUDE:
+            drop = [c for c in df.columns if str(c).upper() in set(PROT_EXCLUDE)]
+            df = df.drop(columns=drop)
+            print(f"  [Exclude] dropped {len(drop)} protein(s) per prot_exclude: {drop}")
         if panel_map_path.exists():
             pmap = json.load(open(panel_map_path))
             for pname in list(pmap.keys()):
@@ -364,6 +368,10 @@ def load_proteomics(clin: pd.DataFrame,
               f"TRAIN (n={len(tr_raw)})")
 
     Z = Z.clip(-10, 10).reindex(clin.index).astype(np.float32)
+    if PROT_EXCLUDE:
+        drop = [c for c in Z.columns if str(c).upper() in set(PROT_EXCLUDE)]
+        Z = Z.drop(columns=drop)
+        print(f"  [Exclude] dropped {len(drop)} protein(s) per prot_exclude: {drop}")
     if FEATURE_SELECTION == "mad_corr_cap":
         from .feature_selection import select_protein_features
         Z, _ = select_protein_features(
