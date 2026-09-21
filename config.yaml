@@ -96,6 +96,10 @@ discovery_min_span_months: 12   # minimum follow-up to define a slope target
 discovery_models: []            # [] = all; e.g. [RidgeSVD, RandomForest, HistGBT]
 
 # Proteomics: Olink Explore panels.  PLA = plasma, CSF = cerebrospinal fluid.
+# PLA (plasma) | CSF | "PLA+CSF" (both compartments as one feature set; proteins
+# prefixed PLA:/CSF:).  Or on the command line: python run.py --tissue CSF
+# (writes to results_CSF/).  Compare runs on the same participants with:
+#   python -m pd_strat.compare_runs results results_CSF results_PLA_CSF
 proteomics_tissue: "PLA"
 proteomics_panel_names: [oncology, neurology, inflammation, cardiometabolic]
 prot_qc_filter: "PASS"               # Cumulative_QC value to keep

@@ -54,6 +54,10 @@ _ap.add_argument("--report_only", action="store_true", default=False,
                  help="Only (re)generate SUMMARY_REPORT.md from a previous run")
 _ap.add_argument("--skip_discovery", action="store_true", default=False,
                  help="Skip the discovery benchmark (§14)")
+_ap.add_argument("--tissue", default=None,
+                 help="Proteomics compartment: PLA, CSF, or PLA+CSF (combined, tissue-prefixed "
+                      "proteins). Overrides proteomics_tissue; default out_dir becomes "
+                      "results_<tissue> when --out_dir is not given")
 _ap.add_argument("--exclude_proteins", default=None,
                  help="Comma-separated UniProt accessions to drop before modelling "
                       "(e.g. P20711 = DDC); overrides prot_exclude in config.yaml")
@@ -91,9 +95,13 @@ def _cfg(key: str, default=None):
 
 # ── Directory layout ───────────────────────────────────────────────────────
 DATA_DIR = Path(FLAGS.data_dir or _cfg("data_dir", "S:/AMP-PD"))
-_default_out = PROJECT_ROOT / ("results_reverse" if FLAGS.reverse_cohorts else "results")
-OUT = Path(FLAGS.out_dir or (_default_out if FLAGS.reverse_cohorts
-                             else _cfg("out_dir", _default_out)))
+_suffix = ""
+if FLAGS.tissue:
+    _suffix += "_" + FLAGS.tissue.upper().replace("+", "_")
+if FLAGS.reverse_cohorts:
+    _suffix += "_reverse"
+_default_out = PROJECT_ROOT / f"results{_suffix}"
+OUT = Path(FLAGS.out_dir or (_default_out if _suffix else _cfg("out_dir", _default_out)))
 _train_pfx, _test_pfx = str(_cfg("train_prefix", "PP-")), str(_cfg("test_prefix", "PD-"))
 if FLAGS.reverse_cohorts:
     _train_pfx, _test_pfx = _test_pfx, _train_pfx
@@ -252,20 +260,30 @@ ASSEMBLY: Dict[str, Any] = {
 }
 
 # ── Proteomics panel paths ─────────────────────────────────────────────────
-PROTEOMICS_TISSUE = str(_cfg("proteomics_tissue", "PLA")).upper()   # PLA | CSF
+PROTEOMICS_TISSUE = str(FLAGS.tissue or _cfg("proteomics_tissue", "PLA")).upper()  # PLA | CSF | PLA+CSF
+PROTEOMICS_TISSUES: List[str] = [t.strip() for t in PROTEOMICS_TISSUE.split("+") if t.strip()]
+MULTI_TISSUE = len(PROTEOMICS_TISSUES) > 1        # proteins get a "TISSUE:" prefix
 _PANEL_NAMES = list(_cfg("proteomics_panel_names",
                          ["oncology", "neurology", "inflammation",
                           "cardiometabolic"]))
-_DEFAULT_PANELS = {
-    name: (f"{RELEASE_PREFIX}_proteomics-{PROTEOMICS_TISSUE}-PPEA-D03_"
-           f"olink-explore_protein-expression_{PROTEOMICS_TISSUE}-PPEA-D03_"
-           f"{name}.csv")
-    for name in _PANEL_NAMES
-}
-PROTEOMICS_PANELS: Dict[str, str] = {
-    k: _data_path(v) for k, v in
-    (_cfg("proteomics_panels", None) or _DEFAULT_PANELS).items()
-}
+
+
+def _panel_file(tissue: str, name: str) -> str:
+    return (f"{RELEASE_PREFIX}_proteomics-{tissue}-PPEA-D03_"
+            f"olink-explore_protein-expression_{tissue}-PPEA-D03_{name}.csv")
+
+
+if _cfg("proteomics_panels", None) and not FLAGS.tissue:
+    _DEFAULT_PANELS = dict(_cfg("proteomics_panels"))
+elif MULTI_TISSUE:
+    _DEFAULT_PANELS = {f"{t}_{name}": _panel_file(t, name)
+                       for t in PROTEOMICS_TISSUES for name in _PANEL_NAMES}
+else:
+    _DEFAULT_PANELS = {name: _panel_file(PROTEOMICS_TISSUES[0], name) for name in _PANEL_NAMES}
+PROTEOMICS_PANELS: Dict[str, str] = {k: _data_path(v) for k, v in _DEFAULT_PANELS.items()}
+# panel name -> tissue tag used to prefix protein IDs in multi-tissue mode
+PANEL_TISSUE: Dict[str, str] = {k: (k.split("_", 1)[0] if MULTI_TISSUE else PROTEOMICS_TISSUES[0])
+                                for k in PROTEOMICS_PANELS}
 
 # ── RNA config (optional modality; off unless rna_path is given) ───────────
 RNA_PATH: Optional[str] = None

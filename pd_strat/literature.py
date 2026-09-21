@@ -48,7 +48,10 @@ def run_literature_overlap(prot_cols: List[str]) -> Dict[str, Any]:
         print("  [SKIP] no curated list found")
         return {}
     annot = load_protein_annotation()
-    panel = {str(c).upper() for c in prot_cols}
+    # multi-tissue runs prefix proteins with "PLA:" / "CSF:" — match on the accession
+    _acc = lambda c: str(c).upper().split(":")[-1]
+    panel = {_acc(c) for c in prot_cols}
+    _strip = lambda s: {_acc(x) for x in s}
 
     stab = pd.read_csv(ROB / "stability_selection.csv") if (ROB / "stability_selection.csv").exists() else None
     locked = (set(pd.read_csv(ROB / "confirmatory_protein_list.csv")["protein"].astype(str))
@@ -59,8 +62,13 @@ def run_literature_overlap(prot_cols: List[str]) -> Dict[str, Any]:
             if (ROB / "confirmatory_severity.csv").exists() else None)
     stable = set()
     if stab is not None:
-        stab = stab.set_index("protein")
+        stab = stab.copy(); stab["protein"] = stab["protein"].astype(str).map(_acc)
+        stab = stab[~stab["protein"].duplicated()].set_index("protein")
         stable = set(stab.index[stab["incl_freq_k50"] >= 0.8].astype(str))
+    locked, kstar = _strip(locked), _strip(kstar)
+    if conf is not None:
+        conf = conf.copy(); conf.index = conf.index.astype(str).map(_acc)
+        conf = conf[~conf.index.duplicated()]
 
     rows = []
     for c in cur:

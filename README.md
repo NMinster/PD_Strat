@@ -157,6 +157,21 @@ bootstrap Δ against the clinical model and a permutation p. The number of
 configurations tested is printed beside every result. **Only a TEST Δ whose
 CI excludes zero supports an "adds to clinical scoring" claim.**
 
+### Plasma vs CSF vs combined
+
+```bat
+python run.py                      :: plasma      -> results/
+python run.py --tissue CSF         :: CSF         -> results_CSF/
+python run.py --tissue PLA+CSF     :: both compartments as one feature set (PLA:/CSF: prefixes) -> results_PLA_CSF/
+python -m pd_strat.compare_runs results results_CSF results_PLA_CSF --labels plasma csf both
+```
+
+`compare_runs` intersects the PD participants present in every run and reports
+within-PD ρ on that common set with paired bootstrap Δ (fewer participants
+have CSF, so the headline numbers of separate runs are not comparable), plus
+each run's discovery-benchmark deltas and the overlap of top proteins
+(`results_comparison/run_comparison.md`, `fig_run_comparison.png`).
+
 The whole zoo runs in minutes on CPU at AMP-PD sample sizes (≈100–200 PD
 participants per cohort); a GPU is not needed and deep networks would only
 overfit. If you scale to the newer PPMI Olink Explore 3072 release (thousands

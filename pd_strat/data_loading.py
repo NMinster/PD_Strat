@@ -27,6 +27,7 @@ from .config import (
     RNA_PATH, RNA_LOG1P,
     FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
     PROT_FEATURE_CAP, PROT_EXCLUDE, PROTEOMICS_VISIT_MATCHING,
+    MULTI_TISSUE, PANEL_TISSUE,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
     RNA_EXCLUDE_BATCHES, RNA_PREFILTER_GENES,
 )
@@ -250,11 +251,15 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
             continue
         df = pd.read_csv(path, low_memory=False)
         df["panel"] = name
+        if MULTI_TISSUE:
+            # keep plasma and CSF measurements of the same protein distinct
+            df["UniProt"] = PANEL_TISSUE[name] + ":" + df["UniProt"].astype(str)
         # UniProt -> gene symbol (Olink 'Assay' column) for readable tables
         if "Assay" in df.columns:
             for u, g in (df[["UniProt", "Assay"]].dropna()
                          .drop_duplicates("UniProt").itertuples(index=False)):
-                annot.append({"uniprot": str(u), "gene": str(g), "panel": name})
+                gene = f"{PANEL_TISSUE[name]}:{g}" if MULTI_TISSUE else str(g)
+                annot.append({"uniprot": str(u), "gene": gene, "panel": name})
         if "Cumulative_QC" in df.columns and qc_filter:
             n0 = len(df)
             df = df[df["Cumulative_QC"].astype(str).str.upper()
@@ -394,7 +399,7 @@ def load_proteomics(clin: pd.DataFrame,
             df = df.reindex(clin.index)
         df = apply_manifest(df, "prot")
         if PROT_EXCLUDE:
-            drop = [c for c in df.columns if str(c).upper() in set(PROT_EXCLUDE)]
+            drop = [c for c in df.columns if str(c).upper().split(":")[-1] in set(PROT_EXCLUDE)]
             df = df.drop(columns=drop)
             print(f"  [Exclude] dropped {len(drop)} protein(s) per prot_exclude: {drop}")
         if panel_map_path.exists():
@@ -463,7 +468,7 @@ def load_proteomics(clin: pd.DataFrame,
     else:
         Z = Z.reindex(clin.index)
     if PROT_EXCLUDE:
-        drop = [c for c in Z.columns if str(c).upper() in set(PROT_EXCLUDE)]
+        drop = [c for c in Z.columns if str(c).upper().split(":")[-1] in set(PROT_EXCLUDE)]
         Z = Z.drop(columns=drop)
         print(f"  [Exclude] dropped {len(drop)} protein(s) per prot_exclude: {drop}")
     if FEATURE_SELECTION == "mad_corr_cap":
