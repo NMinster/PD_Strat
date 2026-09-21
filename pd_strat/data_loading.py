@@ -25,6 +25,8 @@ from .config import (
     HC_MODE, N_SVD, CFG_PROT_TARGET_N, SEED,
     META_PATH, MANIFEST_PATH, CASE_CONTROL_PATH,
     RNA_PATH, RNA_LOG1P,
+    FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
+    PROT_FEATURE_CAP,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
     RNA_EXCLUDE_BATCHES,
 )
@@ -362,8 +364,14 @@ def load_proteomics(clin: pd.DataFrame,
               f"TRAIN (n={len(tr_raw)})")
 
     Z = Z.clip(-10, 10).reindex(clin.index).astype(np.float32)
-    Z = stable_top_features(Z, CFG_PROT_TARGET_N, "PROT",
-                            train_mask=is_train.values)
+    if FEATURE_SELECTION == "mad_corr_cap":
+        from .feature_selection import select_protein_features
+        Z, _ = select_protein_features(
+            Z, is_train.values, PROT_MIN_OBS_FRAC, PROT_MIN_MAD,
+            PROT_CORR_THRESH, PROT_FEATURE_CAP, "PROT")
+    else:
+        Z = stable_top_features(Z, CFG_PROT_TARGET_N, "PROT",
+                                train_mask=is_train.values)
     man = load_json(MANIFEST_PATH)
     if "prot_cols" in man:
         Z = apply_manifest(Z, "prot")

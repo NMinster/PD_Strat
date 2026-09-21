@@ -25,6 +25,10 @@ clinical_files:
   upsit:        "releases_2023_v4release_1027_clinical_UPSIT.csv"
   demographics: "Demographics.csv"
   case_control: "releases_2023_v4release_1027_amp_pd_case_control.csv"
+  # optional files (skipped when absent)
+  med_history:   "releases_2023_v4release_1027_clinical_PD_Medical_History.csv"   # age at diagnosis -> disease duration
+  datscan:       "releases_2023_v4release_1027_clinical_DaTSCAN_SBR.csv"          # cross-endpoint validation
+  time_to_event: "endpoints_time_to_event.csv"                                     # Cox models (see tte_endpoints)
 
 # Assembly options
 updrs3_prefer_off_state: true        # use OFF-medication Part III rows when a visit has both ON/OFF
@@ -32,9 +36,35 @@ updrs_part_iv_missing_as_zero: true  # Part IV absent at a visit -> 0 (I, II, II
 upsit_fill_from_baseline: true       # carry a participant's earliest UPSIT forward to later visits
 keep_other_cohorts: false            # keep participants whose ID prefix is neither TRAIN nor TEST
 
+# Time-to-event column pairs.  Auto-detected from column names when omitted;
+# set explicitly if the auto-detection message says it could not pair them.
+# tte_endpoints:
+#   - {name: "hy3", time_col: "time_to_hy3_months", event_col: "event_hy3"}
+
 # Cohort split (locked): PPMI (PP-) trains, PDBP (PD-) is the external test set
 train_prefix: "PP-"
 test_prefix:  "PD-"
+
+# Population used to fit/evaluate the severity model.
+#   all      = PD cases + healthy controls with UPDRS (validity package then reports PD-only refit)
+#   pd_only  = PD cases only  (validity package then reports the all-population refit)
+severity_population: "all"
+
+# Outcome-blind feature selection (3 stages, TRAIN only): MAD/observation filter,
+# |r|>0.95 redundancy pruning (higher-MAD member kept), cap by MAD rank.
+feature_selection: "mad_corr_cap"      # or "variance_topn" (legacy)
+prot_min_obs_frac: 0.30
+prot_min_mad: 0.01
+prot_corr_thresh: 0.95
+prot_feature_cap: 1168
+
+# Inference knobs (lower for a quick run; manuscript defaults shown)
+n_permutations: 100        # label-permutation null for OOF rho (empirical p)
+stability_B: 200           # bootstrap stability selection resamples
+paired_boot_B: 1000        # paired participant-level model comparison
+participant_boot_B: 2000   # participant-level bootstrap CIs
+progression_min_visits: 2
+progression_min_span_months: 3
 
 # Proteomics: Olink Explore panels.  PLA = plasma, CSF = cerebrospinal fluid.
 proteomics_tissue: "PLA"

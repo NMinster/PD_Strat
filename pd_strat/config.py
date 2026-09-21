@@ -147,6 +147,29 @@ N_SVD              = LOCKED["n_svd_components"]
 PANEL_SVD_NC       = LOCKED["panel_svd_components"]
 CFG_PROT_TARGET_N  = int(_cfg("prot_target_feature_count", 1463))
 
+# ── Feature selection (§2a) ────────────────────────────────────────────────
+FEATURE_SELECTION  = str(_cfg("feature_selection", "mad_corr_cap"))   # | variance_topn
+PROT_MIN_OBS_FRAC  = float(_cfg("prot_min_obs_frac", 0.30))
+PROT_MIN_MAD       = float(_cfg("prot_min_mad", 0.01))
+PROT_CORR_THRESH   = float(_cfg("prot_corr_thresh", 0.95))
+PROT_FEATURE_CAP   = int(_cfg("prot_feature_cap", 1168))
+
+# ── Population for the severity model ──────────────────────────────────────
+# "all"     : every TRAIN/TEST row with UPDRS (PD cases + healthy controls)
+# "pd_only" : PD cases only.  The validity package always reports the other.
+SEVERITY_POPULATION = str(_cfg("severity_population", "all")).lower()
+
+# ── Resampling / inference knobs ───────────────────────────────────────────
+N_PERMUTATIONS  = int(_cfg("n_permutations", 100))
+STABILITY_B     = int(_cfg("stability_B", 200))
+PAIRED_BOOT_B   = int(_cfg("paired_boot_B", 1000))
+PLR_BOOT_B      = int(_cfg("participant_boot_B", 2000))
+CUMULATIVE_K_GRID = list(_cfg("cumulative_k_grid",
+    [5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000]))
+PROGRESSION_MIN_VISITS       = int(_cfg("progression_min_visits", 2))
+PROGRESSION_MIN_SPAN_MONTHS  = float(_cfg("progression_min_span_months", 3))
+TTE_ENDPOINTS = _cfg("tte_endpoints", None)     # optional explicit column mapping
+
 # ── Raw AMP-PD release files ───────────────────────────────────────────────
 RELEASE_PREFIX = str(_cfg("release_prefix", "releases_2023_v4release_1027"))
 
@@ -165,6 +188,10 @@ _DEFAULT_CLINICAL_FILES = {
     "upsit":        f"{RELEASE_PREFIX}_clinical_UPSIT.csv",
     "demographics": "Demographics.csv",
     "case_control": f"{RELEASE_PREFIX}_amp_pd_case_control.csv",
+    # optional — silently skipped when absent
+    "med_history":  f"{RELEASE_PREFIX}_clinical_PD_Medical_History.csv",
+    "datscan":      f"{RELEASE_PREFIX}_clinical_DaTSCAN_SBR.csv",
+    "time_to_event": "endpoints_time_to_event.csv",
 }
 CLINICAL_FILES: Dict[str, str] = {
     k: _data_path(v) for k, v in
@@ -241,5 +268,10 @@ def print_banner():
     print(f"  K selection          : min BIC (sil>0, AMI>={LOCKED['ami_threshold']})")
     print(f"  Prediction clamp     : [{Y_LO}, {Y_HI}]")
     print(f"  Primary estimand     : {LOCKED['primary_estimand']}")
+    print(f"  Severity population  : {SEVERITY_POPULATION}")
+    print(f"  Feature selection    : {FEATURE_SELECTION} "
+          f"(obs>={PROT_MIN_OBS_FRAC:.0%}, MAD>={PROT_MIN_MAD}, |r|<={PROT_CORR_THRESH}, "
+          f"cap={PROT_FEATURE_CAP})")
+    print(f"  Permutations / stability B : {N_PERMUTATIONS} / {STABILITY_B}")
     print(f"  Robustness           : {'SKIPPED' if FLAGS.skip_robustness else 'enabled'}")
     print("=" * 70)

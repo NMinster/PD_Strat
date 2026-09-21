@@ -125,6 +125,24 @@ estimand, incremental gain over covariates, severity-band classification,
 MSI_U, subtype K-selection and cluster summary, confounding audit, robustness
 highlights, and the list of files written.
 
+### Validity, progression and panel-reduction packages
+
+| Report section | Question it answers | Main outputs |
+|---|---|---|
+| 3h Severity vs diagnosis | Is the score graded severity within PD, or PD-vs-HC discrimination? | `validity_severity_vs_diagnosis.csv`, `predictions_pd_only.csv`, `figures/pd_only_participant_scatter.png` |
+| 3i Extended covariates | Does age / sex / site / disease duration / Part-III medication state explain it? | `validity_extended_covariates.csv` |
+| 3j Cross-endpoint | UPDRS I–IV, UPSIT, Hoehn & Yahr, DaTSCAN SBR | `validity_cross_endpoint.csv`, `figures/cross_endpoint_forest.png` |
+| 3k Error structure | Bias by severity / visit bin, heteroscedasticity, range shift | `validity_error_stratification.csv` |
+| 3l Target recalibration | Cross-fitted (participant-grouped) recalibration inside TEST | `validity_target_recalibration.csv` |
+| 3m Model comparison | Paired participant-level bootstrap Δρ with CI | `validity_model_comparison.csv` |
+| 5b Progression | Baseline proteomic severity vs UPDRS slope, mixed models, Cox | `progression_*.csv`, `figures/progression_baseline_vs_slope.png` |
+| 7 Robustness | Permutation null with empirical p (n = `n_permutations`) | `robustness/permutation_null.csv`, `figures/permutation_null.png` |
+| 7b Panel reduction | Stability selection; nested cumulative curve with k* chosen on OOF | `robustness/stability_selection.csv`, `robustness/cumulative_importance.csv`, `robustness/reduced_panel_k_star.csv` |
+| 7c Confirmatory | Locked 40 proteins: TEST replication of severity and protein×time models | `robustness/confirmatory_severity.csv`, `robustness/confirmatory_progression.csv`, `figures/confirmatory_forest.png` |
+
+See `docs/manuscript_review.md` for how these map onto the manuscript and
+`docs/TRIPOD_AI_checklist.md` for the reporting checklist.
+
 ---
 
 ## 4. Command-line flags

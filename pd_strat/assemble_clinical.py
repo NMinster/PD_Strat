@@ -128,25 +128,45 @@ def _load_updrs_part(path: str, part: str) -> pd.DataFrame:
         "score": pd.to_numeric(df[score], errors="coerce"),
     })
 
-    # Part III is often recorded twice per visit (ON / OFF medication).
-    if part == "iii" and ASSEMBLY["updrs3_prefer_off_state"]:
+    extra_cols: List[str] = []
+    if part == "iii":
+        # Hoehn & Yahr stage lives in the Part III file
+        hy = _find_col(df, [r"hoehn", r"\bhy\b.*stage", r"^upd2hy"],
+                       "Hoehn & Yahr", required=False)
+        if hy is not None:
+            out["hoehn_yahr"] = pd.to_numeric(df[hy], errors="coerce")
+            extra_cols.append("hoehn_yahr")
+            print(f"    [{label}] Hoehn & Yahr col='{hy}' "
+                  f"({int(out['hoehn_yahr'].notna().sum())} values)")
+        # Medication state of the exam (ON / OFF / unknown)
         state = _find_col(
             df, [r"clinical_state", r"on_off", r"med.*state", r"^upd23b"],
             "Part III medication state", required=False)
         if state is not None:
             st = df[state].astype(str).str.upper()
-            out["is_off"] = st.str.contains("OFF", na=False).astype(int)
-            n_off = int(out["is_off"].sum())
-            print(f"    [{label}] medication-state col='{state}' "
-                  f"({n_off} OFF rows) -> preferring OFF per visit")
-            has_off = (out.groupby(["participant_id", "visit_key"])["is_off"]
-                       .transform("max"))
-            out = out[(out["is_off"] == 1) | (has_off == 0)]
-            out = out.drop(columns=["is_off"])
+            out["updrs3_state"] = np.where(st.str.contains("OFF", na=False), "OFF",
+                                  np.where(st.str.contains("ON", na=False), "ON", "UNK"))
+            extra_cols.append("updrs3_state")
+            # Part III is often recorded twice per visit (ON / OFF medication).
+            if ASSEMBLY["updrs3_prefer_off_state"]:
+                out["is_off"] = (out["updrs3_state"] == "OFF").astype(int)
+                n_off = int(out["is_off"].sum())
+                print(f"    [{label}] medication-state col='{state}' "
+                      f"({n_off} OFF rows) -> preferring OFF per visit")
+                has_off = (out.groupby(["participant_id", "visit_key"])["is_off"]
+                           .transform("max"))
+                out = out[(out["is_off"] == 1) | (has_off == 0)]
+                out = out.drop(columns=["is_off"])
+        else:
+            out["updrs3_state"] = "UNK"
+            extra_cols.append("updrs3_state")
 
     out = out.dropna(subset=["visit_key", "score"])
-    agg = (out.groupby(["participant_id", "visit_key"], as_index=False)["score"]
-              .mean()
+    aggs = {"score": "mean"}
+    for c in extra_cols:
+        aggs[c] = "mean" if c == "hoehn_yahr" else "first"
+    agg = (out.groupby(["participant_id", "visit_key"], as_index=False)
+              .agg(aggs)
               .rename(columns={"score": f"mds_updrs_part_{part}_total"}))
     print(f"    [{label}] {len(agg)} participant-visits, "
           f"{agg['participant_id'].nunique()} participants")
@@ -254,6 +274,125 @@ def _load_case_control(path: str) -> Optional[pd.DataFrame]:
     return out
 
 
+def _load_med_history(path: str) -> Optional[pd.DataFrame]:
+    """Participant-level age at PD diagnosis (for disease duration)."""
+    if not os.path.exists(path):
+        print(f"  PD medical history: not found ({Path(path).name}) -> "
+              f"disease duration unavailable")
+        return None
+    print(f"  PD medical history: {Path(path).name}")
+    df = _read(path)
+    pid = _find_col(df, _PID_PATTERNS, "participant_id")
+    age_dx = _find_col(df, [r"age.*diagnos", r"diagnos.*age", r"^age_at_dx$",
+                            r"age.*onset", r"onset.*age"],
+                       "age at diagnosis", required=False)
+    yr_dx = _find_col(df, [r"diagnos.*year", r"year.*diagnos", r"^pd_dx_year$",
+                           r"diagnosis_date", r"date.*diagnos"],
+                      "diagnosis year/date", required=False)
+    print(f"    [MedHx] id='{pid}', age_at_diagnosis='{age_dx}', "
+          f"diagnosis_year='{yr_dx}'")
+    if age_dx is None and yr_dx is None:
+        print("    [MedHx] no diagnosis age/date column -> skipped")
+        return None
+    out = pd.DataFrame({"participant_id": _norm_pid(df[pid])})
+    out["age_at_diagnosis"] = (pd.to_numeric(df[age_dx], errors="coerce")
+                               if age_dx else np.nan)
+    if yr_dx:
+        yr = pd.to_numeric(df[yr_dx].astype(str).str.extract(r"(\d{4})", expand=False),
+                           errors="coerce")
+        out["diagnosis_year"] = yr
+    out = (out.sort_values("participant_id")
+              .groupby("participant_id", as_index=False)
+              .agg(lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan))
+    print(f"    [MedHx] {int(out['age_at_diagnosis'].notna().sum())} participants "
+          f"with age at diagnosis")
+    return out
+
+
+def _load_datscan(path: str) -> Optional[pd.DataFrame]:
+    """Visit-level striatal binding ratios (mean L/R putamen, caudate)."""
+    if not os.path.exists(path):
+        print(f"  DaTSCAN: not found ({Path(path).name}) -> skipped")
+        return None
+    print(f"  DaTSCAN: {Path(path).name}")
+    df = _read(path)
+    pid = _find_col(df, _PID_PATTERNS, "participant_id")
+    put = [c for c in df.columns if re.search(r"putamen", c, re.I)]
+    cau = [c for c in df.columns if re.search(r"caudate", c, re.I)]
+    print(f"    [DaTSCAN] id='{pid}', putamen={put}, caudate={cau}")
+    if not put and not cau:
+        print("    [DaTSCAN] no putamen/caudate columns -> skipped")
+        return None
+    out = pd.DataFrame({"participant_id": _norm_pid(df[pid]),
+                        "visit_key": _visit_key(df, "DaTSCAN")})
+    if put:
+        out["datscan_putamen"] = df[put].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+    if cau:
+        out["datscan_caudate"] = df[cau].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+    if put and cau:
+        out["datscan_striatum"] = out[["datscan_putamen", "datscan_caudate"]].mean(axis=1)
+    out["visit_key"] = out["visit_key"].fillna("M0")
+    val_cols = [c for c in out.columns if c.startswith("datscan_")]
+    out = out.dropna(subset=val_cols, how="all")
+    agg = out.groupby(["participant_id", "visit_key"], as_index=False)[val_cols].mean()
+    print(f"    [DaTSCAN] {len(agg)} participant-visits, "
+          f"{agg['participant_id'].nunique()} participants")
+    return agg
+
+
+def _load_tte(path: str) -> Optional[pd.DataFrame]:
+    """Time-to-event endpoints -> long table (participant_id, endpoint, time, event).
+
+    Column pairs are taken from config ``tte_endpoints`` when given, otherwise
+    detected by name: a column containing 'time'/'tte'/'years'/'months' is
+    paired with a column sharing its stem that contains 'event'/'status'/
+    'censor'/'reached'.
+    """
+    from .config import TTE_ENDPOINTS
+    if not os.path.exists(path):
+        print(f"  Time-to-event: not found ({Path(path).name}) -> skipped")
+        return None
+    print(f"  Time-to-event: {Path(path).name}")
+    df = _read(path)
+    pid = _find_col(df, _PID_PATTERNS, "participant_id")
+    pairs = []
+    if TTE_ENDPOINTS:
+        for e in TTE_ENDPOINTS:
+            pairs.append((e["name"], e["time_col"], e["event_col"]))
+    else:
+        low = {c: c.lower() for c in df.columns}
+        time_cols = [c for c in df.columns
+                     if re.search(r"time|tte|years|months|days", low[c]) and c != pid]
+        for tc in time_cols:
+            stem = re.sub(r"(time_to_|_time|tte_|_tte|_years|_months|_days|years_to_|"
+                          r"months_to_|days_to_|time_)", "", low[tc])
+            cand = [c for c in df.columns if c not in (tc, pid)
+                    and re.search(r"event|status|censor|reached|occur", low[c])
+                    and (stem in low[c] or re.sub(r"(event_|_event|status_|_status|"
+                                                  r"_censor|censor_|_reached|reached_)",
+                                                  "", low[c]) == stem)]
+            if cand:
+                pairs.append((stem or tc, tc, cand[0]))
+    if not pairs:
+        print(f"    [TTE] could not pair time/event columns in {list(df.columns)} -> "
+              f"set 'tte_endpoints' in config.yaml")
+        return None
+    rows = []
+    for name, tc, ec in pairs:
+        t = pd.to_numeric(df[tc], errors="coerce")
+        ev = df[ec].astype(str).str.strip().str.lower()
+        e = pd.to_numeric(df[ec], errors="coerce")
+        if e.isna().all():
+            e = ev.isin(["1", "true", "yes", "event", "y", "reached"]).astype(float)
+        e = (e > 0).astype(float)
+        sub = pd.DataFrame({"participant_id": _norm_pid(df[pid]), "endpoint": name,
+                            "time": t, "event": e}).dropna(subset=["time"])
+        rows.append(sub)
+        print(f"    [TTE] endpoint '{name}': time='{tc}', event='{ec}', "
+              f"n={len(sub)}, events={int(sub['event'].sum())}")
+    return pd.concat(rows, ignore_index=True)
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  main assembly                                                           ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -356,11 +495,34 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
     else:
         base["upsit_total"] = np.nan
 
+    # ── Optional: disease duration, DaTSCAN, time-to-event ──────────────
+    medhx = _load_med_history(CLINICAL_FILES.get("med_history", ""))
+    if medhx is not None:
+        base = base.merge(medhx, on="participant_id", how="left")
+    dat = _load_datscan(CLINICAL_FILES.get("datscan", ""))
+    if dat is not None:
+        base = base.merge(dat, on=["participant_id", "visit_key"], how="left")
+        bl = (dat.assign(m=_month_from_key(dat["visit_key"]))
+                 .sort_values(["participant_id", "m"]).drop_duplicates("participant_id")
+                 .set_index("participant_id"))
+        for c in [c for c in dat.columns if c.startswith("datscan_")]:
+            base[f"{c}_baseline"] = base["participant_id"].map(bl[c])
+    tte = _load_tte(CLINICAL_FILES.get("time_to_event", ""))
+    if tte is not None:
+        tte.to_csv(TAB / "time_to_event.csv", index=False)
+
     # ── Final columns ───────────────────────────────────────────────────
     base = base.rename(columns={"visit_key": "visit_name"})
     base["visit_month"] = _month_from_key(base["visit_name"])
     base["age"] = base["age_at_baseline"] + base["visit_month"] / 12.0
     base["site"] = base["participant_id"].str.split("-").str[0]
+    if "age_at_diagnosis" in base.columns:
+        base["disease_duration_years"] = base["age"] - base["age_at_diagnosis"]
+        base.loc[base["disease_duration_years"] < -1, "disease_duration_years"] = np.nan
+        base.loc[base["case_control"].astype(str).str.upper() == "CONTROL",
+                 "disease_duration_years"] = np.nan
+        print(f"  Disease duration available on "
+              f"{int(base['disease_duration_years'].notna().sum())} rows")
 
     if not ASSEMBLY["keep_other_cohorts"]:
         n_other = int(base["cohort"].eq("OTHER").sum())
@@ -370,9 +532,11 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
 
     cols = ["participant_id", "visit_name", "visit_month", "cohort",
             "case_control", "diagnosis", "updrs_total", p1, p2, p3, p4,
-            "upsit_total", "sex", "age_at_baseline", "age", "site",
+            "hoehn_yahr", "updrs3_state", "upsit_total", "sex", "age_at_baseline",
+            "age", "age_at_diagnosis", "disease_duration_years", "site",
             "race", "ethnicity"]
     cols = [c for c in cols if c in base.columns]
+    cols += [c for c in base.columns if c.startswith("datscan_")]
     base = (base[cols]
             .sort_values(["participant_id", "visit_month"])
             .reset_index(drop=True))

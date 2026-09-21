@@ -28,7 +28,8 @@ import traceback
 
 import numpy as np
 
-from .config import print_banner, FLAGS, TAB
+from .config import (print_banner, FLAGS, TAB, SEVERITY_POPULATION,
+                     PROT_COMPLETENESS_THRESHOLD)
 from .utils import summary, summary_update, save_flow_table
 
 
@@ -71,7 +72,11 @@ def main():
     from .subtyping import run_msi_u_and_subtyping
     from .confounding import run_confounding_audit
     from .robustness import run_robustness
-    from .figures import run_figures
+    from .figures import run_figures, run_extended_figures
+    from .validity import run_validity
+    from .progression import run_progression
+    from .panel_reduction import run_panel_reduction
+    from .confirmatory import run_confirmatory
 
     t_start = time.time()
 
@@ -120,7 +125,21 @@ def main():
                     "panel_aware": bool(USE_PANEL_AWARE)})
 
     # ── §4  Targets, masks, CV ────────────────────────────────────────
-    tv = setup_targets_and_cv(clin, z_prot, M_prot, is_train, is_test)
+    if SEVERITY_POPULATION == "pd_only":
+        print(f"\n[Population] severity model restricted to PD cases "
+              f"(severity_population=pd_only)")
+        is_train_sev = is_train & cohort["is_pd_flag"]
+        is_test_sev = is_test & cohort["is_pd_flag"]
+    else:
+        is_train_sev, is_test_sev = is_train, is_test
+    tv = setup_targets_and_cv(clin, z_prot, M_prot, is_train_sev, is_test_sev)
+    if SEVERITY_POPULATION == "pd_only":
+        # index sets for the all-population sensitivity refit in the validity package
+        comp_all = z_prot.notna().mean(axis=1).values
+        ok_all = (comp_all >= PROT_COMPLETENESS_THRESHOLD) & (M_prot.sum(1) > 0) \
+                 & np.isfinite(tv["y_all"])
+        tv["train_idx_y_all"] = np.where(is_train.values & ok_all)[0]
+        tv["test_idx_omics_all"] = np.where(is_test.values & ok_all)[0]
     y_all, upsit_all = tv["y_all"], tv["upsit_all"]
     train_idx, test_idx = tv["train_idx"], tv["test_idx"]
     has_any_omics = tv["has_any_omics"]
@@ -178,6 +197,13 @@ def main():
            test_idx_omics, test_pred, prot_ok_test,
            y_te_full, has_test_y, optional=True)
 
+    # ── §6e Validity package ──────────────────────────────────────────
+    _stage("validity", run_validity,
+           clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
+           PANEL_COL_INDICES, USE_PANEL_AWARE, PRIMARY_LABEL,
+           oof_pred, test_pred, _oof_preds, _test_preds,
+           severity_population=SEVERITY_POPULATION, optional=True)
+
     # ── §6d RNA pipeline + late fusion ────────────────────────────────
     if HAS_RNA:
         _stage("rna_pipeline", run_rna_pipeline,
@@ -198,6 +224,12 @@ def main():
     # ── §9  Confounding audit ─────────────────────────────────────────
     _stage("confounding", run_confounding_audit, sub_results, optional=True)
 
+    # ── §6f Progression / prognostic value ────────────────────────────
+    _stage("progression", run_progression,
+           clin, y_all, train_idx_y, oof_pred, test_idx_omics,
+           test_pred[prot_ok_test] if len(test_idx_omics) else np.array([]),
+           cohort, sub_results, optional=True)
+
     # ── §10 Robustness ────────────────────────────────────────────────
     if FLAGS.skip_robustness:
         print("\n[Robustness SKIPPED per --skip_robustness]")
@@ -213,6 +245,17 @@ def main():
                rho_oof, rho_test, d_prot, prot_cols, prot_cols_set,
                sub_results, optional=True)
 
+        # ── §11 Panel reduction (stability selection, nested cumulative) ─
+        _stage("panel_reduction", run_panel_reduction,
+               clin, X_prot, y_all, train_idx_y, groups_train, gkf,
+               test_idx_omics, y_te_full, prot_cols, PANEL_COL_INDICES,
+               optional=True)
+
+        # ── §10n Confirmatory protein analysis with TEST replication ──
+        _stage("confirmatory", run_confirmatory,
+               clin, z_prot, y_all, train_idx_y, test_idx_omics, prot_cols,
+               cohort, optional=True)
+
     # ── §12 Figures ───────────────────────────────────────────────────
     _stage("figures", run_figures,
            oof_pred=oof_pred, y_tr=y_all[train_idx_y], train_idx_y=train_idx_y,
@@ -225,6 +268,7 @@ def main():
            z_rna=z_rna if HAS_RNA else None, z_prot=z_prot,
            d_rna=d_rna, d_prot=d_prot, has_any_omics=has_any_omics,
            optional=True)
+    _stage("extended_figures", run_extended_figures, optional=True)
 
     # ── §13 Flow table + summary report ───────────────────────────────
     save_flow_table()
@@ -239,6 +283,12 @@ def main():
               "oof_spearman", "test_spearman", "subtype_K",
               "eta2_updrs", "eta2_upsit"):
         print(f"  {k:<16}: {summary.get(k)}")
+    svd = summary.get("validity", {}).get("severity_vs_diagnosis", {})
+    for split in ("OOF", "TEST"):
+        if split in svd:
+            print(f"  {split:<4} within-PD rho (participant): "
+                  f"{svd[split].get('rho_within_pd_participant')}  "
+                  f"AUROC PD vs HC: {svd[split].get('auroc_pd_vs_hc_participant')}")
     print(f"\n  Outputs : {TAB.parent}")
     print(f"  Report  : {TAB.parent / 'SUMMARY_REPORT.md'}")
     return summary

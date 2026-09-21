@@ -228,6 +228,77 @@ def build_report(summary: Dict[str, Any]) -> str:
         L += ["### 3g. Severity-band classification / decision analysis", ""]
         L += _generic(sb, depth=1)
 
+    # ── 3h-3m. Validity package ─────────────────────────────────────────
+    val = summary.get("validity")
+    if val:
+        L += ["### 3h. Severity or diagnosis? (HC-vs-PD discrimination, within-PD ρ)", ""]
+        L += [f"Primary population: **{val.get('primary_population', 'all')}**. "
+              "`rho_within_pd` is the rank correlation restricted to PD rows; "
+              "`auroc_pd_vs_hc` is how well the *same* score separates PD from HC.", ""]
+        svd = val.get("severity_vs_diagnosis", {})
+        if svd:
+            L += _md_table([{"_name": k, **v} for k, v in svd.items()],
+                           ["n_pd_participants", "rho_all", "rho_within_pd",
+                            "rho_within_pd_participant", "rho_within_hc",
+                            "auroc_pd_vs_hc_participant", "mean_pred_hc", "mean_pred_pd",
+                            "n_pd_rows", "n_hc_rows"], "split")
+        for key, title in (("refit_pd_only", "Model refit on PD cases only"),
+                           ("refit_all", "Model refit on all rows (PD + HC)")):
+            rf = val.get(key)
+            if rf and "OOF_row" in rf:
+                L += [f"**{title}** (TRAIN {rf['n_train_participants']} participants / "
+                      f"{rf['n_train_rows']} rows; TEST {rf.get('n_test_rows', 0)} rows)", ""]
+                tbl = {}
+                for s in ("OOF", "TEST"):
+                    if f"{s}_row" in rf:
+                        tbl[f"{s} row-level"] = rf[f"{s}_row"]
+                    if f"{s}_participant" in rf:
+                        tbl[f"{s} participant-mean"] = rf[f"{s}_participant"]
+                L += _metrics_table(tbl, index_name="level")
+                ci = {s: rf[f"{s}_participant_ci"] for s in ("OOF", "TEST")
+                      if f"{s}_participant_ci" in rf}
+                if ci:
+                    L += _ci_table(ci)
+        ec = val.get("extended_covariates")
+        if ec:
+            L += ["### 3i. Extended covariate adjustment", ""]
+            L += [f"Covariates: {', '.join(ec.get('covariates', []))}", ""]
+            for s in ("OOF", "TEST"):
+                if s in ec:
+                    L += [f"**{s}** (partial ρ of proteomics given covariates = "
+                          f"{_f(ec[s].get('partial_rho_prot_given_cov'))})", ""]
+                    L += _metrics_table({k: v for k, v in ec[s].items() if isinstance(v, dict)})
+            if ec.get("strata"):
+                L += ["**Strata**", ""]
+                L += _md_table([{"_name": k, "n": v["n"], "rho": v["rho"]}
+                                for k, v in ec["strata"].items()], ["n", "rho"], "stratum")
+        if val.get("cross_endpoint"):
+            L += ["### 3j. Cross-endpoint validation (participant-level Spearman ρ, 95% CI)", ""]
+            ce = pd.DataFrame(val["cross_endpoint"])
+            ce = ce[ce["population"] == "PD"] if "population" in ce else ce
+            L += _md_table(ce.to_dict("records"),
+                           ["split", "endpoint", "n_participants", "rho_participant",
+                            "ci_lo_participant", "ci_hi_participant", "n_rows", "rho_rows"])
+        es = val.get("error_structure")
+        if es:
+            L += ["### 3k. Error structure and range shift", ""]
+            L += _metrics_table({k: v for k, v in es.items() if isinstance(v, dict)},
+                                index_name="split")
+            if es.get("table"):
+                L += _md_table(es["table"], ["split", "stratum", "bin", "n", "mae", "bias"])
+        tr = val.get("target_recalibration")
+        if tr:
+            L += ["### 3l. Recalibration in the target cohort (cross-fitted within TEST)", ""]
+            L += [tr.get("note", ""), ""]
+            L += _metrics_table({k: {kk: vv for kk, vv in v.items() if kk != "participant"}
+                                 for k, v in tr.items() if isinstance(v, dict)})
+        if val.get("model_comparison"):
+            L += ["### 3m. Paired participant-level model comparison (Δρ = comparator − primary)", ""]
+            L += _md_table(val["model_comparison"],
+                           ["split", "comparator", "n_participants", "rho_primary",
+                            "rho_comparator", "delta_rho", "delta_ci_lo", "delta_ci_hi",
+                            "p_two_sided"])
+
     # ── 4. RNA / fusion ─────────────────────────────────────────────────
     if summary.get("rna_oof") or summary.get("late_fusion"):
         L += ["## 4. RNA modality and late fusion", ""]
@@ -261,6 +332,40 @@ def build_report(summary: Dict[str, Any]) -> str:
         L += [f"**Cluster summary (K={K})**", ""]
         L += _csv_table(TAB / f"subtypes_TRAINPD_K{K}_summary.csv")
 
+    # ── 5b. Progression ─────────────────────────────────────────────────
+    pr = summary.get("progression")
+    if pr:
+        L += ["## 5b. Progression and prognostic value (PD participants)", ""]
+        for s in ("TRAIN", "TEST"):
+            if f"{s}_slope" in pr and pr[f"{s}_slope"].get("n_participants", 0) >= 20:
+                d = pr[f"{s}_slope"]
+                L += [f"**{s}** — n = {d['n_participants']} participants with slopes "
+                      f"(median span {_f(pr.get(f'{s}_slope_summary', {}).get('median_span_months'), 1)} months)", ""]
+                L += _md_table([
+                    {"_name": "ρ(baseline UPDRS, slope)", "value": d.get("rho_baselineUPDRS_slope")},
+                    {"_name": "ρ(baseline proteomic severity, slope)", "value": d.get("rho_pred0_slope"),
+                     "95% CI": f"[{_f(d.get('rho_pred0_slope_ci', [np.nan]*2)[0])}, {_f(d.get('rho_pred0_slope_ci', [np.nan]*2)[1])}]"},
+                    {"_name": "ρ(residual proteomic severity | baseline UPDRS, slope)",
+                     "value": d.get("rho_pred0_resid_slope"),
+                     "95% CI": f"[{_f(d.get('rho_pred0_resid_slope_ci', [np.nan]*2)[0])}, {_f(d.get('rho_pred0_resid_slope_ci', [np.nan]*2)[1])}]"},
+                ], ["value", "95% CI"], "association")
+                if "ols_slope_on_pred0_and_baseline" in d:
+                    L += ["Combined OLS (HC3 SE), slope ~ z(pred0) + z(baseline UPDRS):", ""]
+                    L += _md_table([d["ols_slope_on_pred0_and_baseline"]])
+            if f"{s}_mixed" in pr:
+                mm = {k: v for k, v in pr[f"{s}_mixed"].items() if isinstance(v, dict) and "beta_pred0_x_year" in v}
+                if mm:
+                    L += [f"**{s}** mixed model UPDRS ~ pred0_z × years (+ baseline UPDRS) + (1 | participant)", ""]
+                    L += _md_table([{"_name": k, **{kk: vv for kk, vv in v.items() if kk != 'formula'}}
+                                    for k, v in mm.items()], None, "model")
+        if pr.get("cox"):
+            L += ["**Time-to-event (Cox, HR per SD of baseline proteomic severity)**", ""]
+            L += _md_table(pr["cox"], ["split", "endpoint", "model", "n", "n_events",
+                                       "HR_per_SD_pred0", "HR_ci_lo", "HR_ci_hi", "p", "harrell_C"])
+        if pr.get("subtype_progression"):
+            L += ["**Progression by molecular subtype (TRAIN)**", ""]
+            L += _generic(pr["subtype_progression"], depth=2)
+
     # ── 6. Confounding ──────────────────────────────────────────────────
     conf = summary.get("msi_u_confounding")
     if conf:
@@ -271,9 +376,42 @@ def build_report(summary: Dict[str, Any]) -> str:
     rob = summary.get("robustness")
     L += ["## 7. Robustness package", ""]
     if rob:
-        L += _generic(rob, depth=1)
+        if "perm_empirical_p" in rob:
+            L += [f"Permutation null (n = {rob.get('perm_n')}): mean ρ = {_f(rob.get('perm_rho_mean'))}, "
+                  f"max = {_f(rob.get('perm_rho_max'))}; observed OOF ρ = "
+                  f"{_f(summary.get('oof_spearman'))} → empirical p = {_f(rob['perm_empirical_p'], 4)}.", ""]
+        L += _generic({k: v for k, v in rob.items() if k != "perm_rhos"}, depth=1)
     else:
         L += ["_Robustness package skipped (`--skip_robustness`) or failed._", ""]
+
+    # ── 7b. Panel reduction ─────────────────────────────────────────────
+    prd = summary.get("panel_reduction")
+    if prd:
+        L += ["## 7b. Reduced panel: stability selection and nested cumulative curve", ""]
+        L += [f"k* = **{prd.get('k_star')}** proteins ({prd.get('k_star_rule')}); "
+              f"OOF ρ at k* = {_f(prd.get('oof_rho_at_k_star'))} vs full {_f(prd.get('oof_rho_full'))}; "
+              f"TEST ρ at k* = {_f(prd.get('test_rho_at_k_star'))} vs full {_f(prd.get('test_rho_full'))}.", ""]
+        L += [f"Stable proteins (inclusion ≥ 80% at k = 50): {prd.get('n_stable_k50_freq80')}; "
+              f"sign consistency all / top-20 / top-40 = {_f(prd.get('mean_sign_consistency_all'))} / "
+              f"{_f(prd.get('mean_sign_consistency_top20'))} / {_f(prd.get('mean_sign_consistency_top40'))}.", ""]
+        if prd.get("stable_set_test"):
+            L += ["Stability-selected set on TEST:", ""] + _md_table([prd["stable_set_test"]])
+        L += _csv_table(ROB / "cumulative_importance.csv")
+        L += ["Top 20 by stability-weighted importance:", ""]
+        L += _csv_table(ROB / "stability_selection.csv", max_rows=20)
+
+    # ── 7c. Confirmatory ────────────────────────────────────────────────
+    cf = summary.get("confirmatory")
+    if cf:
+        L += ["## 7c. Confirmatory protein analysis (locked list, TEST replication)", ""]
+        L += ["TRAIN p-values are descriptive (proteins were selected on TRAIN); "
+              "the confirmatory evidence is TEST replication.", ""]
+        if cf.get("severity"):
+            L += ["**Cross-sectional severity**", ""] + _md_table([cf["severity"]])
+        if cf.get("progression"):
+            L += ["**Baseline protein × time (adjusted for baseline UPDRS)**", ""] + _md_table([cf["progression"]])
+        L += ["Top 15 proteins (sorted by TEST p):", ""]
+        L += _csv_table(ROB / "confirmatory_severity.csv", max_rows=15)
 
     # ── 8. Outputs ──────────────────────────────────────────────────────
     L += ["## 8. Output files", ""]
