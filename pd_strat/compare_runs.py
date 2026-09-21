@@ -180,11 +180,13 @@ def _figure(rows, labels, out: Path):
                 ax.plot([r0 + s.loc[l, "delta_ci_lo"], r0 + s.loc[l, "delta_ci_hi"]], [yv[i], yv[i]],
                         color=cols[split], lw=1.4, alpha=0.6)
     ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels); ax.invert_yaxis()
-    ax.set_xlabel("Within-PD Spearman ρ on the same participants (bar = 95% CI of Δ vs first run)")
+    ax.set_xlabel("Within-PD Spearman ρ, same participants\n(bar = 95% CI of Δ vs first run, drawn around the run's ρ)",
+                  fontsize=8)
     ax.grid(color="#e1e0d9", lw=0.6); ax.spines[["top", "right"]].set_visible(False)
-    ax.legend(frameon=False, fontsize=7)
+    ax.legend(frameon=False, fontsize=7, loc="best")
     ax.set_title("Compartment comparison on matched participants", fontsize=9)
-    fig.tight_layout(); fig.savefig(out / "fig_run_comparison.png", facecolor="#fcfcfb"); plt.close(fig)
+    fig.tight_layout(); fig.savefig(out / "fig_run_comparison.png", facecolor="#fcfcfb", bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
