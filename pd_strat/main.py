@@ -77,6 +77,7 @@ def main():
     from .progression import run_progression
     from .panel_reduction import run_panel_reduction
     from .confirmatory import run_confirmatory
+    from .literature import run_literature_overlap
 
     t_start = time.time()
 
@@ -255,6 +256,9 @@ def main():
         _stage("confirmatory", run_confirmatory,
                clin, z_prot, y_all, train_idx_y, test_idx_omics, prot_cols,
                cohort, optional=True)
+
+    # ── §11b Literature overlap (works with whatever tables exist) ────
+    _stage("literature_overlap", run_literature_overlap, prot_cols, optional=True)
 
     # ── §12 Figures ───────────────────────────────────────────────────
     _stage("figures", run_figures,

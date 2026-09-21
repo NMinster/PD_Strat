@@ -427,6 +427,40 @@ def _load_tte(path: str) -> Optional[pd.DataFrame]:
     return pd.concat(rows, ignore_index=True)
 
 
+def _load_extra_biomarkers() -> List[pd.DataFrame]:
+    """Optional external biomarkers (config `extra_biomarkers`), one frame each
+    with columns participant_id, visit_key, <name>."""
+    from .config import EXTRA_BIOMARKERS, DATA_DIR
+    out = []
+    for spec in EXTRA_BIOMARKERS:
+        name = str(spec.get("name", "")).strip()
+        path = spec.get("file", "")
+        path = str(path if Path(str(path)).is_absolute() else DATA_DIR / str(path))
+        if not name or not os.path.exists(path):
+            print(f"  Biomarker '{name}': not found ({path}) -> skipped")
+            continue
+        print(f"  Biomarker '{name}': {Path(path).name}")
+        df = _read(path)
+        pid = _find_col(df, _PID_PATTERNS, "participant_id")
+        vc = spec.get("value_col")
+        val = _find_col(df, [rf"^{re.escape(str(vc))}$"] if vc else [rf"^{re.escape(name)}$", name],
+                        f"{name} value", required=False)
+        if val is None:
+            print(f"    [{name}] value column not found in {list(df.columns)} -> skipped")
+            continue
+        bm = pd.DataFrame({"participant_id": _norm_pid(df[pid]),
+                           "visit_key": _visit_key(df, name),
+                           name: pd.to_numeric(df[val], errors="coerce")}).dropna(subset=[name])
+        bm["visit_key"] = bm["visit_key"].fillna("M0")
+        if spec.get("log_transform", False):
+            bm[name] = np.log1p(bm[name].clip(lower=0))
+        agg = bm.groupby(["participant_id", "visit_key"], as_index=False)[name].mean()
+        print(f"    [{name}] value col='{val}', {len(agg)} participant-visits, "
+              f"{agg['participant_id'].nunique()} participants")
+        out.append(agg)
+    return out
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  main assembly                                                           ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -544,6 +578,13 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
     tte = _load_tte(CLINICAL_FILES.get("time_to_event", ""))
     if tte is not None:
         tte.to_csv(TAB / "time_to_event.csv", index=False)
+    for bm in _load_extra_biomarkers():
+        name = [c for c in bm.columns if c not in ("participant_id", "visit_key")][0]
+        base = base.merge(bm, on=["participant_id", "visit_key"], how="left")
+        bl = (bm.assign(m=_month_from_key(bm["visit_key"]))
+                .sort_values(["participant_id", "m"]).drop_duplicates("participant_id")
+                .set_index("participant_id")[name])
+        base[f"{name}_baseline"] = base["participant_id"].map(bl)
 
     # ── Final columns ───────────────────────────────────────────────────
     base = base.rename(columns={"visit_key": "visit_name"})
@@ -572,6 +613,10 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
             "race", "ethnicity"]
     cols = [c for c in cols if c in base.columns]
     cols += [c for c in base.columns if c.startswith("datscan_")]
+    from .config import EXTRA_BIOMARKERS
+    for spec in EXTRA_BIOMARKERS:
+        n = str(spec.get("name", ""))
+        cols += [c for c in (n, f"{n}_baseline") if c in base.columns and c not in cols]
     base = (base[cols]
             .sort_values(["participant_id", "visit_month"])
             .reset_index(drop=True))

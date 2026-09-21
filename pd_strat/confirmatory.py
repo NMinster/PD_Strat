@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .config import TAB, ROB, LOCKED, PROGRESSION_MIN_VISITS, PROGRESSION_MIN_SPAN_MONTHS
-from .utils import map_participant_id, summary_update
+from .utils import map_participant_id, summary_update, load_protein_annotation
 from .progression import _months
 
 
@@ -81,12 +81,15 @@ def run_confirmatory(clin, z_prot, y_all, train_idx_y, test_idx_omics, prot_cols
     pid_all = np.array([map_participant_id(str(x)) for x in clin.index])
     is_pd = cohort["is_pd_flag"].values.astype(bool)
     n_bonf = len(prots)
+    annot = load_protein_annotation()
+    levo = (pd.to_numeric(clin["on_levodopa"], errors="coerce").values
+            if "on_levodopa" in clin.columns else None)
 
-    # ── severity ─────────────────────────────────────────────────────────
+    # ── severity (+ medication-association screen) ──────────────────────
     sev_rows = []
     for prot in prots:
         j = col_idx[prot]
-        row: Dict[str, Any] = {"protein": prot}
+        row: Dict[str, Any] = {"protein": prot, "gene": annot.get(prot, "")}
         for tag, pos in (("train", train_idx_y), ("test", test_idx_omics)):
             if len(pos) < 20:
                 continue
@@ -99,6 +102,18 @@ def run_confirmatory(clin, z_prot, y_all, train_idx_y, test_idx_omics, prot_cols
                 for k, v in fit.items():
                     row[f"{tag}_{k}"] = v
                 row[f"{tag}_n_participants"] = int(df["pid"].nunique())
+            # Does the protein track levodopa exposure independent of severity?
+            # (plasma DDC does — a treatment-responsive protein is not a
+            # severity marker even if it replicates across cohorts)
+            if levo is not None:
+                pdm = is_pd[pos]
+                dfl = pd.DataFrame({"z": z_prot.iloc[pos, j].values, "y": y_all[pos],
+                                    "levo": levo[pos], "pid": pid_all[pos]})[pdm].dropna()
+                if len(dfl) >= 40 and (dfl["levo"] == 1).sum() >= 20 and (dfl["levo"] == 0).sum() >= 20:
+                    fl = _fit_mixed("z ~ levo + y", dfl, dfl["pid"], "levo")
+                    if fl:
+                        row[f"{tag}_levodopa_beta"] = fl["beta"]
+                        row[f"{tag}_levodopa_p"] = fl["p"]
         if "train_beta" in row and "test_beta" in row:
             row["sign_replicated"] = bool(np.sign(row["train_beta"]) == np.sign(row["test_beta"]))
             row["ci_overlap"] = bool(max(row["train_ci_lo"], row["test_ci_lo"]) <=
@@ -123,6 +138,13 @@ def run_confirmatory(clin, z_prot, y_all, train_idx_y, test_idx_omics, prot_cols
             "ci_overlap": int(sev.get("ci_overlap", pd.Series(dtype=bool)).sum()),
             "bonferroni_alpha": 0.05 / n_bonf,
         }
+        for tag in ("train", "test"):
+            if f"{tag}_levodopa_p" in sev:
+                s[f"{tag}_levodopa_associated_p05"] = int((sev[f"{tag}_levodopa_p"] < 0.05).sum())
+                s[f"{tag}_levodopa_associated_bonf"] = int((sev[f"{tag}_levodopa_p"] < 0.05 / n_bonf).sum())
+                flagged = sev.loc[sev[f"{tag}_levodopa_p"] < 0.05 / n_bonf, "protein"].tolist()
+                if flagged:
+                    print(f"  Treatment-responsive (levodopa, Bonferroni, {tag}): {flagged}")
         out["severity"] = s
         print(f"  Severity: TRAIN nominal {s['train_nominal_p05_descriptive']}/{s['n_tested']} "
               f"(descriptive) | TEST nominal {s['test_nominal_p05']}, Bonferroni {s['test_bonferroni']}, "

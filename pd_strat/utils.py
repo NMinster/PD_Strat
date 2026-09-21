@@ -135,6 +135,15 @@ def short_sha(cols) -> str:
     return hashlib.sha1("\n".join(map(str, cols)).encode()).hexdigest()[:12]
 
 
+def load_protein_annotation() -> Dict[str, str]:
+    """UniProt accession -> gene symbol, from results/tables/protein_annotation.csv."""
+    p = TAB / "protein_annotation.csv"
+    if not p.exists():
+        return {}
+    df = pd.read_csv(p, dtype=str)
+    return dict(zip(df["uniprot"], df["gene"].fillna("")))
+
+
 def load_json(p: Path) -> dict:
     if p.exists():
         try:

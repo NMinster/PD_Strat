@@ -347,6 +347,8 @@ _ENDPOINTS = [
     ("DaTSCAN_putamen", "datscan_putamen"), ("DaTSCAN_caudate", "datscan_caudate"),
     ("DaTSCAN_striatum", "datscan_striatum"),
 ]
+from .config import EXTRA_BIOMARKERS as _EXTRA
+_ENDPOINTS += [(str(b.get("name")), str(b.get("name"))) for b in _EXTRA if b.get("name")]
 
 
 def _cross_endpoint(clin, splits, is_pd) -> pd.DataFrame:

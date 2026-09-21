@@ -161,13 +161,22 @@ def _mixed_model(tag, clin, y_all, keep_mask, bl: pd.DataFrame) -> Dict[str, Any
 
 def _cox(tag, tte: pd.DataFrame, bl: pd.DataFrame, clin) -> List[Dict[str, Any]]:
     from statsmodels.duration.hazard_regression import PHReg
+    from .config import EXTRA_BIOMARKERS
     rows = []
     demo = pd.DataFrame({
         "pid": [map_participant_id(str(x)) for x in clin.index],
         "age": pd.to_numeric(clin.get("_age"), errors="coerce").values,
         "male": clin.get("_sex", pd.Series(index=clin.index, dtype=object))
                     .astype(str).str.upper().str.startswith("M").astype(float).values,
-    }).groupby("pid").first().reset_index()
+    })
+    extra = []
+    for spec in EXTRA_BIOMARKERS:
+        n = str(spec.get("name", ""))
+        col = f"{n}_baseline" if f"{n}_baseline" in clin.columns else n
+        if col in clin.columns:
+            demo[n] = pd.to_numeric(clin[col], errors="coerce").values
+            extra.append(n)
+    demo = demo.groupby("pid").first().reset_index()
     for ep, g in tte.groupby("endpoint"):
         df = g.merge(bl, on="pid").merge(demo, on="pid", how="left").dropna(
             subset=["time", "event", "pred0", "baseline_y"])
@@ -178,23 +187,32 @@ def _cox(tag, tte: pd.DataFrame, bl: pd.DataFrame, clin) -> List[Dict[str, Any]]
                          "note": "insufficient"})
             continue
         z = lambda v: (v - v.mean()) / v.std(ddof=1)
-        for lab, cols in (("unadjusted", ["pred0"]),
-                          ("adj_baselineUPDRS", ["pred0", "baseline_y"]),
-                          ("adj_full", ["pred0", "baseline_y", "age", "male"])):
-            X = pd.DataFrame({c: (z(df[c]) if c != "male" else df[c]) for c in cols}).fillna(0.0)
+        specs = [("unadjusted", ["pred0"]),
+                 ("adj_baselineUPDRS", ["pred0", "baseline_y"]),
+                 ("adj_full", ["pred0", "baseline_y", "age", "male"])]
+        avail = [c for c in extra if c in df.columns and df[c].notna().sum() >= 30]
+        for c in avail:
+            specs.append((f"comparator_{c}_only", [c]))                      # HR is for the biomarker
+            specs.append((f"adj_full_plus_{c}", ["pred0", "baseline_y", "age", "male", c]))
+        for lab, cols in specs:
+            sub = df.dropna(subset=[c for c in cols if c in df.columns])
+            if len(sub) < 30 or sub["event"].sum() < 10:
+                continue
+            X = pd.DataFrame({c: (z(sub[c]) if c != "male" else sub[c]) for c in cols}).fillna(0.0)
             try:
-                res = PHReg(df["time"].values, X.values, status=df["event"].values,
+                res = PHReg(sub["time"].values, X.values, status=sub["event"].values,
                             ties="efron").fit()
                 hr = float(np.exp(res.params[0])); ci = np.exp(res.conf_int()[0])
                 risk = X.values @ res.params
-                rows.append({"split": tag, "endpoint": ep, "model": lab, "n": int(len(df)),
-                             "n_events": n_ev, "HR_per_SD_pred0": hr,
+                rows.append({"split": tag, "endpoint": ep, "model": lab, "n": int(len(sub)),
+                             "n_events": int(sub["event"].sum()),
+                             "first_term": cols[0], "HR_per_SD_pred0": hr,
                              "HR_ci_lo": float(ci[0]), "HR_ci_hi": float(ci[1]),
                              "p": float(res.pvalues[0]),
-                             "harrell_C": _harrell_c(df["time"].values, df["event"].values, risk)})
-                print(f"    {tag} Cox {ep} ({lab}): HR/SD={hr:.2f} [{ci[0]:.2f}, {ci[1]:.2f}] "
-                      f"p={res.pvalues[0]:.2e} C={rows[-1]['harrell_C']:.3f} "
-                      f"(n={len(df)}, events={n_ev})")
+                             "harrell_C": _harrell_c(sub["time"].values, sub["event"].values, risk)})
+                print(f"    {tag} Cox {ep} ({lab}): HR/SD[{cols[0]}]={hr:.2f} "
+                      f"[{ci[0]:.2f}, {ci[1]:.2f}] p={res.pvalues[0]:.2e} "
+                      f"C={rows[-1]['harrell_C']:.3f} (n={len(sub)}, events={int(sub['event'].sum())})")
             except Exception as e:
                 rows.append({"split": tag, "endpoint": ep, "model": lab, "note": str(e)})
     return rows

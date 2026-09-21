@@ -30,7 +30,8 @@ from .config import (
     TAB, ROB, RIDGE_ALPHAS, Y_LO, Y_HI, N_SVD, SEED, STABILITY_B,
     CUMULATIVE_K_GRID, LOCKED,
 )
-from .utils import map_participant_id, spearman_np, full_metrics, summary_update
+from .utils import (map_participant_id, spearman_np, full_metrics, summary_update,
+                    load_protein_annotation)
 from .features import svd_n_components
 
 
@@ -83,8 +84,10 @@ def run_panel_reduction(clin, X_prot, y_all, train_idx_y, groups_train, gkf,
     freq = {k: (ranks < k).mean(axis=0) for k in (20, 50, 100)}
     w_med = np.median(W, axis=0)
     sign_cons = (np.sign(W) == np.sign(w_med)[None, :]).mean(axis=0)
+    annot = load_protein_annotation()
     stab = pd.DataFrame({
-        "protein": prot_cols, "panel": [prot_to_panel.get(p, "unknown") for p in prot_cols],
+        "protein": prot_cols, "gene": [annot.get(p, "") for p in prot_cols],
+        "panel": [prot_to_panel.get(p, "unknown") for p in prot_cols],
         "w_full": w_full, "w_boot_median": w_med, "w_boot_sd": W.std(axis=0),
         "sign_consistency": sign_cons,
         "incl_freq_k20": freq[20], "incl_freq_k50": freq[50], "incl_freq_k100": freq[100],
@@ -151,6 +154,7 @@ def run_panel_reduction(clin, X_prot, y_all, train_idx_y, groups_train, gkf,
         out["stable_set_test"] = full_metrics(pte, y_te_full)
         print(f"  Stable set (n={len(stable_set)}) TEST rho={out['stable_set_test']['spearman']:.3f}")
     pd.DataFrame({"protein": out["k_star_proteins"],
+                  "gene": [annot.get(p, "") for p in out["k_star_proteins"]],
                   "panel": [prot_to_panel.get(p, "unknown") for p in out["k_star_proteins"]]}
                  ).to_csv(ROB / "reduced_panel_k_star.csv", index=False)
     summary_update({"panel_reduction": {k: v for k, v in out.items()

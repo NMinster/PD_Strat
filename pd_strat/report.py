@@ -413,6 +413,20 @@ def build_report(summary: Dict[str, Any]) -> str:
         L += ["Top 15 proteins (sorted by TEST p):", ""]
         L += _csv_table(ROB / "confirmatory_severity.csv", max_rows=15)
 
+    # ── 7d. Literature overlap ──────────────────────────────────────────
+    lo = summary.get("literature_overlap")
+    if lo:
+        L += ["## 7d. Overlap with published PD proteins (docs/literature_proteins.yaml)", ""]
+        L += _md_table([
+            {"_name": "curated proteins on panel", "value": f"{lo.get('n_on_panel')} / {lo.get('n_curated')}"},
+            {"_name": "curated ∩ locked list", "value": ", ".join(lo.get("curated_in_locked_list", [])) or "none"},
+            {"_name": "curated ∩ stable set", "value": ", ".join(lo.get("curated_in_stable_set", [])) or "none"},
+            {"_name": "curated ∩ k* panel", "value": ", ".join(lo.get("curated_in_k_star_panel", [])) or "none"},
+            {"_name": "treatment-responsive in locked list",
+             "value": ", ".join(lo.get("treatment_responsive_in_locked_list", [])) or "none"},
+        ], ["value"], "quantity")
+        L += _csv_table(TAB / "literature_overlap.csv", max_rows=40)
+
     # ── 8. Outputs ──────────────────────────────────────────────────────
     L += ["## 8. Output files", ""]
     for name, d in (("tables", TAB), ("figures", FIG), ("robustness", ROB)):

@@ -241,6 +241,7 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     """Load panels, return (wide_df, panel_protein_map)."""
     panel_dfs = []
     panel_map: Dict[str, List[str]] = {}
+    annot: List[Dict[str, str]] = []
 
     for name, path in panels_dict.items():
         if not os.path.exists(path):
@@ -248,6 +249,11 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
             continue
         df = pd.read_csv(path, low_memory=False)
         df["panel"] = name
+        # UniProt -> gene symbol (Olink 'Assay' column) for readable tables
+        if "Assay" in df.columns:
+            for u, g in (df[["UniProt", "Assay"]].dropna()
+                         .drop_duplicates("UniProt").itertuples(index=False)):
+                annot.append({"uniprot": str(u), "gene": str(g), "panel": name})
         if "Cumulative_QC" in df.columns and qc_filter:
             n0 = len(df)
             df = df[df["Cumulative_QC"].astype(str).str.upper()
@@ -277,6 +283,11 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     for pname in list(panel_map.keys()):
         panel_map[pname] = [c for c in panel_map[pname] if c in wide.columns]
         print(f"  Panel '{pname}': {len(panel_map[pname])} proteins in wide")
+
+    if annot:
+        (pd.DataFrame(annot).drop_duplicates("uniprot")
+           .to_csv(TAB / "protein_annotation.csv", index=False))
+        print(f"  [Annotation] {len(annot)} UniProt -> gene mappings saved")
 
     return wide.astype(np.float32), panel_map
 

@@ -41,7 +41,16 @@ keep_other_cohorts: false            # keep participants whose ID prefix is neit
 # tte_endpoints:
 #   - {name: "hy3", time_col: "time_to_hy3_months", event_col: "event_hy3"}
 
-# Cohort split (locked): PPMI (PP-) trains, PDBP (PD-) is the external test set
+# Optional external biomarkers merged by participant + visit (and carried as
+# <name>_baseline).  Added to the cross-endpoint table and used as a
+# comparator / adjuster in the Cox models.  Example for PPMI serum NfL:
+# extra_biomarkers:
+#   - {name: nfl, file: "PPMI_serum_NfL.csv", value_col: "NFL", log_transform: true}
+#   - {name: saa_positive, file: "PPMI_SAA.csv", value_col: "SAA_result"}
+
+# Cohort split (locked): PPMI (PP-) trains, PDBP (PD-) is the external test set.
+# `python run.py --reverse_cohorts` swaps them for the supplementary
+# reverse-direction run (results_reverse/).
 train_prefix: "PP-"
 test_prefix:  "PD-"
 

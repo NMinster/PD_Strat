@@ -52,6 +52,10 @@ _ap.add_argument("--no_rna", action="store_true", default=False,
                  help="Disable the optional RNA modality")
 _ap.add_argument("--report_only", action="store_true", default=False,
                  help="Only (re)generate SUMMARY_REPORT.md from a previous run")
+_ap.add_argument("--reverse_cohorts", action="store_true", default=False,
+                 help="Swap TRAIN/TEST prefixes (e.g. PDBP->PPMI) for the "
+                      "supplementary reverse-direction run; results go to "
+                      "<project>/results_reverse unless --out_dir is given")
 FLAGS, _UNKNOWN_ARGS = _ap.parse_known_args()
 
 
@@ -82,7 +86,12 @@ def _cfg(key: str, default=None):
 
 # ── Directory layout ───────────────────────────────────────────────────────
 DATA_DIR = Path(FLAGS.data_dir or _cfg("data_dir", "S:/AMP-PD"))
-OUT = Path(FLAGS.out_dir or _cfg("out_dir", PROJECT_ROOT / "results"))
+_default_out = PROJECT_ROOT / ("results_reverse" if FLAGS.reverse_cohorts else "results")
+OUT = Path(FLAGS.out_dir or (_default_out if FLAGS.reverse_cohorts
+                             else _cfg("out_dir", _default_out)))
+_train_pfx, _test_pfx = str(_cfg("train_prefix", "PP-")), str(_cfg("test_prefix", "PD-"))
+if FLAGS.reverse_cohorts:
+    _train_pfx, _test_pfx = _test_pfx, _train_pfx
 ROOT = OUT.parent
 TAB  = OUT / "tables"
 FIG  = OUT / "figures"
@@ -92,8 +101,8 @@ for p in (OUT, TAB, FIG, ROB):
 
 # ── Locked analysis plan (frozen for manuscript) ────────────────────────────
 LOCKED: Dict[str, Any] = {
-    "train_prefix":       str(_cfg("train_prefix", "PP-")),
-    "test_prefix":        str(_cfg("test_prefix", "PD-")),
+    "train_prefix":       _train_pfx,
+    "test_prefix":        _test_pfx,
     "id_key":             "participant_id",
     "cv_group_col":       "patno",
     "n_cv_folds":         5,
@@ -173,6 +182,15 @@ CUMULATIVE_K_GRID = list(_cfg("cumulative_k_grid",
 PROGRESSION_MIN_VISITS       = int(_cfg("progression_min_visits", 2))
 PROGRESSION_MIN_SPAN_MONTHS  = float(_cfg("progression_min_span_months", 3))
 TTE_ENDPOINTS = _cfg("tte_endpoints", None)     # optional explicit column mapping
+
+# ── Optional external biomarkers (NfL, SAA, ...) merged into the clinical table
+# config.yaml:
+#   extra_biomarkers:
+#     - {name: nfl, file: "PPMI_serum_NfL.csv", value_col: "NFL"}
+# Each becomes a column `<name>` (visit-matched) plus `<name>_baseline`, is added
+# to the cross-endpoint table, and is used as a comparator/adjuster in the Cox
+# models.
+EXTRA_BIOMARKERS: List[Dict[str, Any]] = list(_cfg("extra_biomarkers", []) or [])
 
 # ── Raw AMP-PD release files ───────────────────────────────────────────────
 RELEASE_PREFIX = str(_cfg("release_prefix", "releases_2023_v4release_1027"))
@@ -260,8 +278,11 @@ def print_banner():
     print(f"  Config file          : {CFG_PATH or '(defaults)'}")
     print(f"  Data dir             : {DATA_DIR}")
     print(f"  Output dir           : {OUT}")
-    print(f"  TRAIN cohort prefix  : {TRAIN_PREFIX}")
+    rev = "   (REVERSED direction, --reverse_cohorts)" if FLAGS.reverse_cohorts else ""
+    print(f"  TRAIN cohort prefix  : {TRAIN_PREFIX}{rev}")
     print(f"  TEST  cohort prefix  : {TEST_PREFIX}")
+    if EXTRA_BIOMARKERS:
+        print(f"  Extra biomarkers     : {[b.get('name') for b in EXTRA_BIOMARKERS]}")
     print(f"  Proteomics tissue    : {PROTEOMICS_TISSUE}")
     print(f"  Proteomics panels    : {list(PROTEOMICS_PANELS.keys())}")
     print(f"  QC filter            : Cumulative_QC == {PROT_QC_FILTER}")
