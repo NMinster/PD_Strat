@@ -66,21 +66,18 @@ def run_figures(
 
         # ── TEST raw scatter (omics-only) ────────────────────────────
         if (test_idx_omics.size > 0 and test_pred.size > 0
-                and has_any_omics is not None):
+                and prot_ok_test is not None):
             y_te = y_all[test_idx_omics]
-            mask_te_full = (np.isfinite(test_pred)
-                           & np.isfinite(y_all[test_idx]))
-            mask_te = np.zeros_like(mask_te_full, dtype=bool)
-            mask_te[has_any_omics[test_idx]] = (
-                mask_te_full[has_any_omics[test_idx]])
+            mask_te = (np.isfinite(test_pred)
+                       & np.isfinite(y_all[test_idx])
+                       & prot_ok_test)
             if mask_te.any():
                 plt.figure(figsize=(4, 4))
                 plt.scatter(y_all[test_idx][mask_te],
                             test_pred[mask_te], s=6, alpha=0.3)
                 plt.xlabel("UPDRS (true)")
                 plt.ylabel("Severity (TEST raw)")
-                rho_te = spearman_np(
-                    test_pred[has_any_omics[test_idx]], y_te)
+                rho_te = spearman_np(test_pred[prot_ok_test], y_te)
                 plt.title(f"TEST raw (omics-only) \u03c1={rho_te:.3f}")
                 m1 = min(y_all[test_idx][mask_te].min(),
                          test_pred[mask_te].min())
@@ -93,11 +90,11 @@ def run_figures(
 
         # ── TEST chosen scatter (omics-only) ─────────────────────────
         if (test_idx.size > 0 and chosen_ser is not None
-                and has_any_omics is not None):
+                and prot_ok_test is not None):
             y_te = y_all[test_idx]
             mask_te2 = (np.isfinite(chosen_ser)
                         & np.isfinite(y_te)
-                        & has_any_omics[test_idx])
+                        & prot_ok_test)
             if mask_te2.any():
                 plt.figure(figsize=(4, 4))
                 plt.scatter(y_te[mask_te2], chosen_ser[mask_te2],
@@ -218,11 +215,8 @@ def run_figures(
             data = [pd.to_numeric(values[labs == k_], errors="coerce")
                     for k_ in range(K)]
             plt.figure(figsize=(4.6, 3.6))
-            plt.boxplot(
-                [d[~np.isnan(d)] for d in data],
-                labels=[f"C{k_}" for k_ in range(K)],
-                showfliers=False,
-            )
+            plt.boxplot([d[~np.isnan(d)] for d in data], showfliers=False)
+            plt.xticks(range(1, K + 1), [f"C{k_}" for k_ in range(K)])
             plt.ylabel(ylab)
             plt.title(title)
             plt.tight_layout()

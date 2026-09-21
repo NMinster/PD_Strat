@@ -1,0 +1,59 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PD-Deep Precision Suite v2.1 — run configuration
+#
+# Every key here is optional; anything omitted falls back to the defaults in
+# pd_strat/config.py.  Command-line flags (python run.py --help) override this
+# file.  Use forward slashes in Windows paths (S:/AMP-PD) or quote them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Folder that contains the raw AMP-PD release files
+data_dir: "S:/AMP-PD"
+
+# Where results/ is written (default: <project>/results)
+# out_dir: "S:/AMP-PD/pd_strat_results"
+
+# File-name prefix shared by the AMP-PD release files
+release_prefix: "releases_2023_v4release_1027"
+
+# Raw clinical files used to assemble results/tables/clinical_unified.csv
+# (relative names are resolved against data_dir).  Defaults shown.
+clinical_files:
+  updrs_i:      "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_I.csv"
+  updrs_ii:     "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_II.csv"
+  updrs_iii:    "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_III.csv"
+  updrs_iv:     "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_IV.csv"
+  upsit:        "releases_2023_v4release_1027_clinical_UPSIT.csv"
+  demographics: "Demographics.csv"
+  case_control: "releases_2023_v4release_1027_amp_pd_case_control.csv"
+
+# Assembly options
+updrs3_prefer_off_state: true        # use OFF-medication Part III rows when a visit has both ON/OFF
+updrs_part_iv_missing_as_zero: true  # Part IV absent at a visit -> 0 (I, II, III are always required)
+upsit_fill_from_baseline: true       # carry a participant's earliest UPSIT forward to later visits
+keep_other_cohorts: false            # keep participants whose ID prefix is neither TRAIN nor TEST
+
+# Cohort split (locked): PPMI (PP-) trains, PDBP (PD-) is the external test set
+train_prefix: "PP-"
+test_prefix:  "PD-"
+
+# Proteomics: Olink Explore panels.  PLA = plasma, CSF = cerebrospinal fluid.
+proteomics_tissue: "PLA"
+proteomics_panel_names: [oncology, neurology, inflammation, cardiometabolic]
+prot_qc_filter: "PASS"               # Cumulative_QC value to keep
+prot_completeness: 0.50              # min fraction of proteins observed per sample
+prot_target_feature_count: 1463      # deterministic top-N feature freeze
+
+# Optional RNA modality — disabled unless rna_path is set.
+# The salmon gene matrix (…rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv)
+# is ~3 GB and needs roughly 16 GB of RAM to load; enable only if you have it.
+# rna_path: "releases_2023_v4release_1027_rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv"
+rna_log1p: auto                      # auto | true | false  (log1p raw TPM/counts before z-scoring)
+rna_target_n_genes: 5000
+rna_exclude_batches: ["PP-43", "PP-70", "PP-71", "PP-74", "PP-75"]
+
+# Model / robustness knobs (locked defaults; lower boot_B / coef_boot_B for a quick run)
+n_svd_components: 128
+panel_svd_components: 32
+boot_B: 50
+coef_boot_B: 100
+seed: 42

@@ -23,7 +23,8 @@ from .config import (
     CFG, TAB, TRAIN_PREFIX, TEST_PREFIX,
     PROTEOMICS_PANELS, PROT_QC_FILTER, PROT_COMPLETENESS_THRESHOLD,
     HC_MODE, N_SVD, CFG_PROT_TARGET_N, SEED,
-    META_PATH, MANIFEST_PATH,
+    META_PATH, MANIFEST_PATH, CASE_CONTROL_PATH,
+    RNA_PATH, RNA_LOG1P,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
     RNA_EXCLUDE_BATCHES,
 )
@@ -97,8 +98,10 @@ def load_clinical() -> Tuple[pd.DataFrame, str, str, str, str]:
     clin_path = TAB / "clinical_unified.csv"
     if not clin_path.exists():
         raise FileNotFoundError(
-            "Missing results/tables/clinical_unified.csv -- run assembly first.")
-    clin = pd.read_csv(clin_path)
+            f"Missing {clin_path} -- run without --skip_assembly so it is "
+            "built from the raw AMP-PD files, or supply your own file.")
+    clin = pd.read_csv(clin_path, low_memory=False)
+    print(f"\n{'=' * 60}\nCLINICAL DATA\n{'=' * 60}")
 
     # ── ID inference ────────────────────────────────────────────────────
     id_key = choose_id(clin)
@@ -197,8 +200,10 @@ def _is_hc_rows(df_case: pd.DataFrame):
 
 
 def _load_case_control_table() -> Optional[pd.DataFrame]:
-    cc_path = CFG.get("case_control_path", "")
+    cc_path = CASE_CONTROL_PATH or CFG.get("case_control_path", "")
     if not cc_path or not os.path.exists(cc_path):
+        print(f"  [HC] case/control table not found ({cc_path}) -> "
+              f"z-scoring will fall back to endpoint-blind median/MAD")
         return None
     df = pd.read_csv(cc_path, sep=None, engine="python", encoding="utf-8-sig")
     if "participant_id" not in df.columns:
@@ -445,6 +450,56 @@ def completeness_audit(z_prot: pd.DataFrame,
 # ║  §2c  RNA LOADING                                                        ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
+def _looks_like_pid(x) -> bool:
+    return str(x).upper().startswith((TRAIN_PREFIX, TEST_PREFIX))
+
+
+def _read_rna_matrix(path: Path) -> pd.DataFrame:
+    """Read a gene-expression table in either orientation.
+
+    Accepts CSV/TSV with samples as rows (participant_id column) or the
+    AMP-PD salmon layout with genes as rows and sample IDs as columns.
+    Sample IDs are collapsed to participants (mean across samples).
+    """
+    sep = "\t" if path.suffix.lower() in (".tsv", ".txt") else ","
+    size_gb = path.stat().st_size / 1e9
+    if size_gb > 1:
+        print(f"  [RNA] file is {size_gb:.1f} GB -- loading needs roughly "
+              f"{size_gb * 5:.0f} GB RAM; this can take several minutes")
+    raw = pd.read_csv(path, sep=sep, low_memory=False)
+    first = raw.columns[0]
+    n_pid_cols = sum(_looks_like_pid(c) for c in raw.columns)
+    if n_pid_cols > 0.5 * len(raw.columns):
+        # genes x samples -> transpose
+        raw = raw.set_index(first)
+        raw = raw.loc[:, [c for c in raw.columns if _looks_like_pid(c)]]
+        raw = raw.apply(pd.to_numeric, errors="coerce").T
+        print(f"  [RNA] transposed genes x samples matrix: {raw.shape}")
+    else:
+        for id_col in ("participant_id", "sample_id", "PATNO", first):
+            if id_col in raw.columns:
+                break
+        raw.index = raw[id_col].astype(str).values
+        raw = raw.drop(columns=[id_col], errors="ignore")
+        raw = raw.select_dtypes(include=[np.number])
+    raw.index = [map_participant_id(str(x)) for x in raw.index]
+    raw = raw.astype(np.float32)
+
+    log_it = RNA_LOG1P
+    if str(log_it).lower() == "auto":
+        vals = raw.values
+        finite = vals[np.isfinite(vals)]
+        log_it = finite.size > 0 and finite.min() >= 0 and finite.max() > 50
+    if log_it:
+        raw = np.log1p(raw.clip(lower=0))
+        print("  [RNA] applied log1p to raw expression values")
+
+    if raw.index.has_duplicates:
+        raw = raw.groupby(level=0).mean()
+        print(f"  [RNA] averaged multiple samples per participant -> {raw.shape}")
+    return raw
+
+
 def load_rna(clin: pd.DataFrame,
              is_train: pd.Series) -> Tuple[pd.DataFrame, bool]:
     """Load optional RNA modality. Returns (z_rna, HAS_RNA)."""
@@ -453,10 +508,13 @@ def load_rna(clin: pd.DataFrame,
     print(f"{'=' * 60}")
 
     rna_path = TAB / "z_rna.csv"
-    rna_raw_path = Path(CFG.get("rna_path",
-        r"S:/AMP-PD/releases_2023_v4release_1027_rnaseq_gene_expression.csv"))
+    rna_raw_path = Path(RNA_PATH) if RNA_PATH else None
 
     z_rna = pd.DataFrame(index=clin.index)
+
+    if rna_raw_path is None and not rna_path.exists():
+        print("  [SKIP] RNA disabled (no 'rna_path' in config.yaml / --no_rna)")
+        return z_rna, False
 
     # Try cached
     if rna_path.exists():
@@ -475,18 +533,7 @@ def load_rna(clin: pd.DataFrame,
     elif rna_raw_path.exists():
         print(f"  Loading raw RNA from: {rna_raw_path}")
         try:
-            raw = pd.read_csv(rna_raw_path, low_memory=False)
-            if "participant_id" in raw.columns:
-                id_col = "participant_id"
-            elif "PATNO" in raw.columns:
-                id_col = "PATNO"
-            else:
-                id_col = raw.columns[0]
-            raw.index = [map_participant_id(str(x)) for x in raw[id_col].values]
-            raw = raw.drop(columns=[id_col], errors="ignore")
-            raw = raw.select_dtypes(include=[np.number])
-            if raw.index.has_duplicates:
-                raw = raw[~raw.index.duplicated(keep="first")]
+            raw = _read_rna_matrix(rna_raw_path)
             raw = raw.reindex(clin.index)
             print(f"  [RNA/raw] samples={raw.notna().any(axis=1).sum()}, "
                   f"genes={raw.shape[1]}")
