@@ -277,6 +277,7 @@ RNA_SVD_NC = int(_cfg("rna_svd_components", 64))
 RNA_EXCLUDE_BATCHES = list(_cfg("rna_exclude_batches",
     ["PP-43", "PP-70", "PP-71", "PP-74", "PP-75"]))
 RNA_LOG1P = _cfg("rna_log1p", "auto")          # auto | true | false
+RNA_PREFILTER_GENES = int(_cfg("rna_prefilter_genes", 15000))   # streaming pre-filter
 
 # ── Manifest / meta paths ──────────────────────────────────────────────────
 MANIFEST_PATH = TAB / "feature_manifest.json"

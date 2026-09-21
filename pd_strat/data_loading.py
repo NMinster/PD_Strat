@@ -28,8 +28,9 @@ from .config import (
     FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
     PROT_FEATURE_CAP, PROT_EXCLUDE, PROTEOMICS_VISIT_MATCHING,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
-    RNA_EXCLUDE_BATCHES,
+    RNA_EXCLUDE_BATCHES, RNA_PREFILTER_GENES,
 )
+import warnings
 from .utils import (
     _to_str_index, choose_id, map_participant_id, infer_visit_code,
     resolve_column, short_sha, load_json, save_manifest,
@@ -294,7 +295,7 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
             vkey = vkey.fillna(tok).fillna(fb).fillna(bl)
         if "sample_id" in df_all.columns:
             s = df_all["sample_id"].astype(str)
-            m_blm = s.str.extract(r"BLM(\d{1,3})", flags=re.I, expand=False).map(
+            m_blm = s.str.extract(r"[-_][A-Z]*M(\d{1,3})T\d*", flags=re.I, expand=False).map(
                 lambda x: f"M{int(x)}" if pd.notna(x) else pd.NA)
             vkey = vkey.fillna(m_blm)
     n_vk = int(vkey.notna().sum())
@@ -346,13 +347,13 @@ def _align_to_clin_rows(Z: pd.DataFrame, clin: pd.DataFrame) -> pd.DataFrame:
     if n_unm:
         unm = Z.index[~matched]
         vis = pd.Series(unm.get_level_values(1)).value_counts().head(6).to_dict()
-        print(f"  [Align] {n_unm}/{len(Z)} proteomic samples have no clinical "
+        print(f"  [Align] {n_unm}/{len(Z)} omics samples have no clinical "
               f"visit with the same (participant, visit) key and are unused; "
               f"most common unmatched visit keys: {vis}")
     out = Z.reindex(keys)
     out.index = clin.index
     print(f"  [Align] {int(out.notna().any(axis=1).sum())} clinical rows carry a "
-          f"visit-matched proteomic sample "
+          f"visit-matched sample "
           f"({out.index[out.notna().any(axis=1)].nunique()} participants)")
     return out
 
@@ -569,50 +570,107 @@ def _looks_like_pid(x) -> bool:
     return str(x).upper().startswith((TRAIN_PREFIX, TEST_PREFIX))
 
 
-def _read_rna_matrix(path: Path) -> pd.DataFrame:
-    """Read a gene-expression table in either orientation.
+_VISIT_IN_SAMPLE = re.compile(r"[-_][A-Z]*M(\d{1,3})T\d*", re.I)   # ...-BLM0T1 / -SVM12T1
 
-    Accepts CSV/TSV with samples as rows (participant_id column) or the
-    AMP-PD salmon layout with genes as rows and sample IDs as columns.
-    Sample IDs are collapsed to participants (mean across samples).
+
+def _sample_keys(sample_ids) -> pd.Index:
+    """(participant, visit) MultiIndex from AMP-PD sample IDs; visit 'M?' when absent."""
+    pids, vks = [], []
+    for s in sample_ids:
+        s = str(s)
+        pids.append(map_participant_id(s))
+        m = _VISIT_IN_SAMPLE.search(s)
+        vks.append(f"M{int(m.group(1))}" if m else "M?")
+    return pd.MultiIndex.from_arrays([pids, vks])
+
+
+def _decide_log(vals: np.ndarray) -> bool:
+    if str(RNA_LOG1P).lower() != "auto":
+        return bool(RNA_LOG1P)
+    finite = vals[np.isfinite(vals)]
+    return finite.size > 0 and finite.min() >= 0 and finite.max() > 50
+
+
+def _read_rna_matrix(path: Path) -> pd.DataFrame:
+    """Read a gene-expression table in either orientation, memory-safely.
+
+    * AMP-PD salmon layout (genes x samples, sample IDs as columns): streamed
+      in two passes.  Pass 1 computes per-gene observation fraction and
+      log-variance on TRAIN samples only (outcome-blind) and keeps the top
+      ``rna_prefilter_genes``; pass 2 re-reads only those genes.  Peak memory
+      ~ prefilter_genes x samples x 4 bytes instead of the full matrix.
+    * Samples-as-rows CSV (participant_id / sample_id column): read directly.
+
+    Returns samples x genes with a (participant, visit) MultiIndex when the
+    sample IDs carry a visit token, else a participant index.
     """
     sep = "\t" if path.suffix.lower() in (".tsv", ".txt") else ","
     size_gb = path.stat().st_size / 1e9
-    if size_gb > 1:
-        print(f"  [RNA] file is {size_gb:.1f} GB -- loading needs roughly "
-              f"{size_gb * 5:.0f} GB RAM; this can take several minutes")
-    raw = pd.read_csv(path, sep=sep, low_memory=False)
-    first = raw.columns[0]
-    n_pid_cols = sum(_looks_like_pid(c) for c in raw.columns)
-    if n_pid_cols > 0.5 * len(raw.columns):
-        # genes x samples -> transpose
-        raw = raw.set_index(first)
-        raw = raw.loc[:, [c for c in raw.columns if _looks_like_pid(c)]]
-        raw = raw.apply(pd.to_numeric, errors="coerce").T
-        print(f"  [RNA] transposed genes x samples matrix: {raw.shape}")
+    head = pd.read_csv(path, sep=sep, nrows=5)
+    first = head.columns[0]
+    n_pid_cols = sum(_looks_like_pid(c) for c in head.columns)
+
+    if n_pid_cols > 0.5 * len(head.columns):
+        sample_cols = [c for c in head.columns if _looks_like_pid(c)]
+        train_cols = [c for c in sample_cols if str(c).upper().startswith(TRAIN_PREFIX)]
+        stat_cols = train_cols if len(train_cols) >= 30 else sample_cols
+        print(f"  [RNA] genes x samples matrix ({size_gb:.1f} GB): {len(sample_cols)} samples "
+              f"({len(train_cols)} TRAIN); streaming in chunks, pre-filter top "
+              f"{RNA_PREFILTER_GENES} genes by TRAIN log-variance")
+        # ── pass 1: per-gene statistics ────────────────────────────────
+        genes, obs, var = [], [], []
+        log_it = None
+        for chunk in pd.read_csv(path, sep=sep, index_col=0, usecols=[first] + stat_cols,
+                                 chunksize=2000, dtype={c: np.float32 for c in stat_cols}):
+            X = chunk.values
+            if log_it is None:
+                log_it = _decide_log(X)
+                print(f"  [RNA] log1p transform: {log_it}")
+            if log_it:
+                X = np.log1p(np.clip(X, 0, None))
+            genes.extend(chunk.index.astype(str))
+            obs.extend(np.mean(np.isfinite(X), axis=1))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                var.extend(np.nanvar(X, axis=1))
+        obs = np.array(obs); var = np.nan_to_num(np.array(var), nan=0.0)
+        ok = (obs >= RNA_COMPLETENESS_THRESHOLD * 0.5) & (var > 0)
+        order = np.argsort(-np.where(ok, var, -1))[:RNA_PREFILTER_GENES]
+        keep = set(np.array(genes)[order])
+        print(f"  [RNA] pass 1: {len(genes)} genes -> {len(keep)} kept")
+        # ── pass 2: re-read the kept genes only ────────────────────────
+        parts = []
+        for chunk in pd.read_csv(path, sep=sep, index_col=0, usecols=[first] + sample_cols,
+                                 chunksize=2000, dtype={c: np.float32 for c in sample_cols}):
+            sub = chunk[chunk.index.astype(str).isin(keep)]
+            if len(sub):
+                parts.append(sub)
+        raw = pd.concat(parts).T                     # samples x genes
+        if log_it:
+            raw = np.log1p(raw.clip(lower=0))
+        raw.index = _sample_keys(raw.index)
+        print(f"  [RNA] pass 2: samples x genes = {raw.shape}")
     else:
-        for id_col in ("participant_id", "sample_id", "PATNO", first):
+        raw = pd.read_csv(path, sep=sep, low_memory=False)
+        for id_col in ("sample_id", "participant_id", "PATNO", first):
             if id_col in raw.columns:
                 break
-        raw.index = raw[id_col].astype(str).values
-        raw = raw.drop(columns=[id_col], errors="ignore")
-        raw = raw.select_dtypes(include=[np.number])
-    raw.index = [map_participant_id(str(x)) for x in raw.index]
-    raw = raw.astype(np.float32)
+        ids = raw[id_col].astype(str).values
+        raw = raw.drop(columns=[id_col], errors="ignore").select_dtypes(include=[np.number]).astype(np.float32)
+        if _decide_log(raw.values):
+            raw = np.log1p(raw.clip(lower=0)); print("  [RNA] applied log1p")
+        raw.index = _sample_keys(ids)
 
-    log_it = RNA_LOG1P
-    if str(log_it).lower() == "auto":
-        vals = raw.values
-        finite = vals[np.isfinite(vals)]
-        log_it = finite.size > 0 and finite.min() >= 0 and finite.max() > 50
-    if log_it:
-        raw = np.log1p(raw.clip(lower=0))
-        print("  [RNA] applied log1p to raw expression values")
-
-    if raw.index.has_duplicates:
+    # visit-level when the IDs carried a visit token, else participant-level
+    vk = raw.index.get_level_values(1)
+    if PROTEOMICS_VISIT_MATCHING and (vk != "M?").mean() >= 0.5:
+        raw = raw.groupby(level=[0, 1]).mean()
+        print(f"  [RNA] {raw.shape[0]} samples at (participant, visit) level "
+              f"({raw.index.get_level_values(0).nunique()} participants)")
+    else:
         raw = raw.groupby(level=0).mean()
-        print(f"  [RNA] averaged multiple samples per participant -> {raw.shape}")
-    return raw
+        print(f"  [RNA] participant-level (mean over samples, broadcast to visits): {raw.shape}")
+    return raw.astype(np.float32)
 
 
 def load_rna(clin: pd.DataFrame,
@@ -631,51 +689,63 @@ def load_rna(clin: pd.DataFrame,
         print("  [SKIP] RNA disabled (no 'rna_path' in config.yaml / --no_rna)")
         return z_rna, False
 
-    # Try cached
+    # Try cached (sample-level rows keyed "pid|visit", or legacy participant rows)
     if rna_path.exists():
         df = pd.read_csv(rna_path, index_col=0)
-        def _pid(x):
-            return str(x).upper().startswith(("PP-", "PD-"))
-        if sum(_pid(c) for c in df.columns) > 0.6 * len(df.columns):
-            df = df.T
-        df.index = [map_participant_id(i) for i in df.index.astype(str)]
-        if df.index.has_duplicates:
+        idx = df.index.astype(str)
+        if idx.str.contains(r"\|").mean() > 0.5:
+            keys = idx.str.split("|", n=1, expand=True)
+            df.index = pd.MultiIndex.from_arrays(
+                [[map_participant_id(p) for p in keys.get_level_values(0)],
+                 keys.get_level_values(1).astype(str)])
             df = df[~df.index.duplicated(keep="first")]
-        df = df.reindex(clin.index)
+            df = _align_to_clin_rows(df, clin)
+        else:
+            df.index = [map_participant_id(i) for i in idx]
+            df = df[~df.index.duplicated(keep="first")].reindex(clin.index)
         print(f"  [Pin] z_rna.csv: shape={df.shape}, "
-              f"non-null={df.notna().any(axis=1).sum()}")
+              f"rows with data={df.notna().any(axis=1).sum()}")
         z_rna = df
     elif rna_raw_path.exists():
         print(f"  Loading raw RNA from: {rna_raw_path}")
         try:
             raw = _read_rna_matrix(rna_raw_path)
-            raw = raw.reindex(clin.index)
-            print(f"  [RNA/raw] samples={raw.notna().any(axis=1).sum()}, "
-                  f"genes={raw.shape[1]}")
+            visit_matched = isinstance(raw.index, pd.MultiIndex)
+            pid_level = pd.Index(raw.index.get_level_values(0) if visit_matched else raw.index)
+            print(f"  [RNA/raw] samples={raw.shape[0]}, participants={pid_level.nunique()}, "
+                  f"genes={raw.shape[1]}, visit-matched={visit_matched}")
 
-            hc_ids = _select_train_hc_ids(raw.dropna(how="all").index,
-                                           is_train, min_n=30)
+            hc_ids = _select_train_hc_ids(pd.Index(pid_level.unique()), is_train, min_n=30)
             if len(hc_ids) >= 30:
-                mu = raw.loc[hc_ids].mean(axis=0)
-                sd = raw.loc[hc_ids].std(axis=0).replace(0, np.nan).fillna(1.0)
+                hc_rows = pid_level.isin(hc_ids)
+                mu = raw[hc_rows].mean(axis=0)
+                sd = raw[hc_rows].std(axis=0).replace(0, np.nan).fillna(1.0)
                 Z = (raw - mu) / sd
-                print(f"  [RNA/HC] Global TRAIN anchoring (n_hc={len(hc_ids)})")
+                print(f"  [RNA/HC] Global TRAIN anchoring (n_hc={len(hc_ids)} participants, "
+                      f"{int(hc_rows.sum())} samples)")
             else:
-                tr_ids = clin.index[is_train]
-                tr_raw = raw.loc[raw.index.intersection(tr_ids)]
+                tr_rows = pid_level.isin(clin.index[is_train])
+                tr_raw = raw[tr_rows]
                 mu = tr_raw.median(axis=0)
                 mad = (tr_raw - mu).abs().median(axis=0)
                 sd = (mad * 1.4826).replace(0, np.nan).fillna(1.0)
                 Z = (raw - mu) / sd
-                print(f"  [RNA/HC] Endpoint-blind median/MAD (n={len(tr_raw)})")
+                print(f"  [RNA/HC] Endpoint-blind median/MAD (n={len(tr_raw)} samples)")
 
-            Z = Z.clip(-10, 10).reindex(clin.index).astype(np.float32)
+            Z = Z.clip(-10, 10).astype(np.float32)
+            Z_samples = Z
+            Z = _align_to_clin_rows(Z, clin) if visit_matched else Z.reindex(clin.index)
             Z = stable_top_features(Z, RNA_TARGET_N_GENES, "RNA",
                                     train_mask=is_train.values)
-            Z.to_csv(rna_path)
-            print(f"  [Pin] wrote z_rna.csv: shape={Z.shape}")
+            Zc = Z_samples.loc[:, Z.columns]
+            if visit_matched:
+                Zc.index = [f"{p}|{v}" for p, v in Zc.index]
+            Zc.to_csv(rna_path)
+            print(f"  [Pin] wrote z_rna.csv (sample level): {Zc.shape}; aligned rows with data="
+                  f"{int(Z.notna().any(axis=1).sum())}")
             z_rna = Z
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"  [WARN] RNA loading failed: {e}")
     else:
         print(f"  [SKIP] No RNA data found at {rna_raw_path}")

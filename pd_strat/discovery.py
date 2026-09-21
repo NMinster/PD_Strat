@@ -149,13 +149,12 @@ class _PLS(BaseEstimator, RegressorMixin):
 
 
 class _SafeSVD(TruncatedSVD):
-    def fit(self, X, y=None):
-        self.n_components = int(min(self.n_components, X.shape[1] - 1, X.shape[0] - 2))
-        return super().fit(X, y)
+    """TruncatedSVD whose n_components is capped by the fold's sample size.
+    (TruncatedSVD.fit delegates to fit_transform, so only that is overridden.)"""
 
     def fit_transform(self, X, y=None):
-        self.fit(X, y)
-        return super().transform(X)
+        self.n_components = int(max(1, min(self.n_components, X.shape[1] - 1, X.shape[0] - 2)))
+        return super().fit_transform(X, y)
 
 
 def _pre(prot_idx, clin_idx, reduce: Optional[int]):
@@ -189,10 +188,10 @@ def _zoo(task: str, prot_idx, clin_idx, n_prot: int) -> Dict[str, Tuple[Pipeline
         Z["SVR"] = (Pipeline([("pre", _pre(prot_idx, clin_idx, red)), ("m", SVR())]),
                     {"m__C": [1, 10, 100], "m__gamma": ["scale"], "m__epsilon": [0.5, 2.0]})
         Z["RandomForest"] = (Pipeline([("pre", _pre(prot_idx, clin_idx, None)),
-                                       ("m", RandomForestRegressor(n_estimators=400, random_state=SEED, n_jobs=-1))]),
+                                       ("m", RandomForestRegressor(n_estimators=300, random_state=SEED, n_jobs=1))]),
                              {"m__min_samples_leaf": [3, 6], "m__max_features": ["sqrt", 0.3]})
         Z["ExtraTrees"] = (Pipeline([("pre", _pre(prot_idx, clin_idx, None)),
-                                     ("m", ExtraTreesRegressor(n_estimators=400, random_state=SEED, n_jobs=-1))]),
+                                     ("m", ExtraTreesRegressor(n_estimators=300, random_state=SEED, n_jobs=1))]),
                            {"m__min_samples_leaf": [3, 6]})
         Z["HistGBT"] = (Pipeline([("pre", _pre(prot_idx, clin_idx, None)),
                                   ("m", HistGradientBoostingRegressor(random_state=SEED, max_iter=300,
@@ -210,7 +209,7 @@ def _zoo(task: str, prot_idx, clin_idx, n_prot: int) -> Dict[str, Tuple[Pipeline
                                      ("m", LogisticRegression(penalty="l1", solver="liblinear", max_iter=2000))]),
                            {"m__C": [0.05, 0.2, 1.0]})
         Z["RandomForest"] = (Pipeline([("pre", _pre(prot_idx, clin_idx, None)),
-                                       ("m", RandomForestClassifier(n_estimators=400, random_state=SEED, n_jobs=-1))]),
+                                       ("m", RandomForestClassifier(n_estimators=300, random_state=SEED, n_jobs=1))]),
                              {"m__min_samples_leaf": [3, 6], "m__max_features": ["sqrt", 0.3]})
         Z["HistGBT"] = (Pipeline([("pre", _pre(prot_idx, clin_idx, None)),
                                   ("m", HistGradientBoostingClassifier(random_state=SEED, max_iter=300,
@@ -328,6 +327,9 @@ def run_discovery(clin, z_prot, M_prot, y_all, cohort, tv) -> Dict[str, Any]:
     # targets --------------------------------------------------------------
     fast_thr = float(np.nanpercentile(tr["tg"]["slope_per_year"], 66.7))
     out["fast_progressor_threshold_slope_per_year"] = fast_thr
+    # For the cross-sectional reference target the clinical comparator must not
+    # contain the outcome itself (baseline UPDRS / Part III / H&Y).
+    _drop_for_target = {"severity_baseline": {"updrs_total_bl", "updrs_iii_bl", "hoehn_yahr_bl"}}
     targets = {
         "severity_baseline": ("reg", lambda f: f["tg"]["y0"].values.astype(float)),
         "slope_per_year": ("reg", lambda f: f["tg"]["slope_per_year"].values.astype(float)),
@@ -345,8 +347,11 @@ def run_discovery(clin, z_prot, M_prot, y_all, cohort, tv) -> Dict[str, Any]:
             print(f"\n  [{tname}] insufficient outcomes (n={int(ok.sum())}) -> skipped")
             continue
         print(f"\n  --- target: {tname} ({task}, n={int(ok.sum())}) ---")
-        Xall = np.hstack([tr["Xp"], tr["Xc"]])[ok]; yv = y[ok]
-        prot_idx = np.arange(n_prot); clin_idx = np.arange(n_prot, n_prot + tr["Xc"].shape[1])
+        keep_c = [i for i, nm in enumerate(tr["cnames"]) if nm not in _drop_for_target.get(tname, set())]
+        Xall = np.hstack([tr["Xp"], tr["Xc"][:, keep_c]])[ok]; yv = y[ok]
+        prot_idx = np.arange(n_prot); clin_idx = np.arange(n_prot, n_prot + len(keep_c))
+        if keep_c != list(range(tr["Xc"].shape[1])):
+            print(f"    clinical comparator for this target: {[tr['cnames'][i] for i in keep_c]}")
         oof: Dict[Tuple[str, str], np.ndarray] = {}
         for fs, (use_p, use_c) in fsets.items():
             pi = prot_idx if use_p else np.array([], int); ci = clin_idx if use_c else np.array([], int)
@@ -402,7 +407,7 @@ def run_discovery(clin, z_prot, M_prot, y_all, cohort, tv) -> Dict[str, Any]:
         if te is not None:
             yt = getter(te); okt = np.isfinite(yt)
             if okt.sum() >= 20 and not (task == "clf" and min((yt[okt] == 1).sum(), (yt[okt] == 0).sum()) < 8):
-                Xt = np.hstack([te["Xp"], te["Xc"]])[okt]
+                Xt = np.hstack([te["Xp"], te["Xc"][:, keep_c]])[okt]
                 pt = _predict(est, Xt, task)
                 row["n_test"] = int(okt.sum()); row["test_best"] = _metric(task, yt[okt], pt)
                 qt = None

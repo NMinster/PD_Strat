@@ -102,11 +102,15 @@ prot_qc_filter: "PASS"               # Cumulative_QC value to keep
 prot_completeness: 0.50              # min fraction of proteins observed per sample
 prot_target_feature_count: 1463      # deterministic top-N feature freeze
 
-# Optional RNA modality — disabled unless rna_path is set.
-# The salmon gene matrix (…rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv)
-# is ~3 GB and needs roughly 16 GB of RAM to load; enable only if you have it.
-# rna_path: "releases_2023_v4release_1027_rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv"
+# Optional RNA modality — disabled unless rna_path is set (relative to data_dir
+# or absolute).  The 3 GB AMP-PD salmon gene matrix is streamed in two passes
+# (outcome-blind pre-filter to `rna_prefilter_genes` by TRAIN log-variance), so
+# peak memory is ~1-2 GB and the first load takes a few minutes; the result is
+# cached at sample level in results/tables/z_rna.csv.  Samples are matched to
+# clinical visits from the sample ID (…-BLM0T1 / -SVM12T1).
+# rna_path: "genes/releases_2023_v4release_1027_rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv"
 rna_log1p: auto                      # auto | true | false  (log1p raw TPM/counts before z-scoring)
+rna_prefilter_genes: 15000
 rna_target_n_genes: 5000
 rna_exclude_batches: ["PP-43", "PP-70", "PP-71", "PP-74", "PP-75"]
 
