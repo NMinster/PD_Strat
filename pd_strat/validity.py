@@ -91,6 +91,48 @@ def _fit_predict(bff, X, M, y_all, train_pos, pred_pos):
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  (0) who is actually in the modelled rows?                               ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def population_table(clin, cohort, tv) -> pd.DataFrame:
+    """PD / HC / OTHER composition of the rows and participants that enter the
+    severity model, per split — the numbers Table 1 must report."""
+    print(f"\n{'=' * 60}")
+    print("POPULATION COMPOSITION OF MODELLED ROWS (proteomics + UPDRS)")
+    print(f"{'=' * 60}")
+    is_pd = cohort["is_pd_flag"].values.astype(bool)
+    is_hc = cohort["is_control"].values.astype(bool)
+    grp_all = np.where(is_hc, "HC", np.where(is_pd, "PD", "OTHER"))
+    diag = clin["diagnosis"].astype(str).values if "diagnosis" in clin.columns else None
+    rows = []
+    for split, pos in (("TRAIN", tv["train_idx_y"]), ("TEST", tv["test_idx_omics"])):
+        if len(pos) == 0:
+            continue
+        pids = _pids(clin, pos)
+        y = tv["y_all"][pos]
+        for g in ("PD", "HC", "OTHER"):
+            m = grp_all[pos] == g
+            if m.sum() == 0:
+                continue
+            vpp = pd.Series(pids[m]).value_counts()
+            rows.append({"split": split, "group": g, "n_rows": int(m.sum()),
+                         "n_participants": int(vpp.size),
+                         "rows_per_participant_median": float(vpp.median()),
+                         "updrs_mean": float(np.nanmean(y[m])),
+                         "updrs_sd": float(np.nanstd(y[m])),
+                         "updrs_max": float(np.nanmax(y[m]))})
+            print(f"  {split:<5} {g:<5} rows={int(m.sum()):>5}  participants={vpp.size:>4}  "
+                  f"UPDRS {np.nanmean(y[m]):5.1f} +- {np.nanstd(y[m]):4.1f}")
+            if g == "OTHER" and diag is not None:
+                top = pd.Series(diag[pos][m]).value_counts().head(5).to_dict()
+                print(f"        OTHER diagnoses: {top}")
+    df = pd.DataFrame(rows)
+    df.to_csv(TAB / "population_composition.csv", index=False)
+    summary_update({"population_composition": rows})
+    return df
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  (a) severity vs diagnosis                                               ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
@@ -235,9 +277,15 @@ def _partial_rho(pred, y, Xc):
 
 
 def _extended_covariates(clin, X, M, y_all, bff, train_idx_y, groups_train, gkf,
-                         test_idx_omics, oof_pred, test_pred_omics) -> Dict[str, Any]:
-    print("\n  --- (c) Extended covariate adjustment ---")
-    out: Dict[str, Any] = {}
+                         test_idx_omics, oof_pred, test_pred_omics,
+                         label: str = "all") -> Dict[str, Any]:
+    print(f"\n  --- (c) Extended covariate adjustment [{label}] ---")
+    out: Dict[str, Any] = {"population": label,
+                           "n_train_rows": int(len(train_idx_y)),
+                           "n_test_rows": int(len(test_idx_omics))}
+    if len(train_idx_y) < 40:
+        print("    [SKIP] too few rows")
+        return out
     Xc_tr, names, fill = _design(clin, train_idx_y)
     if Xc_tr is None:
         print("    [SKIP] no usable covariates")
@@ -332,8 +380,31 @@ def _extended_covariates(clin, X, M, y_all, bff, train_idx_y, groups_train, gkf,
                 rows.append({"split": split, "model": mdl, **mets})
             else:
                 rows.append({"split": split, "model": mdl, "spearman": mets})
-    pd.DataFrame(rows).to_csv(TAB / "validity_extended_covariates.csv", index=False)
+    pd.DataFrame(rows).to_csv(TAB / f"validity_extended_covariates_{label}.csv", index=False)
     return out
+
+
+def _extended_covariates_by_population(clin, X, M, y_all, bff, tv, is_pd,
+                                       oof_pred, test_pred_omics, primary_pop):
+    """Run (c) on the primary population and, when controls are present,
+    again within PD only — covariates such as medication state and disease
+    duration encode diagnosis in a mixed population and inflate the
+    covariates-only model."""
+    train_idx_y, test_idx_omics = tv["train_idx_y"], tv["test_idx_omics"]
+    res = {primary_pop: _extended_covariates(
+        clin, X, M, y_all, bff, train_idx_y, tv["groups_train"], tv["gkf"],
+        test_idx_omics, oof_pred, test_pred_omics, label=primary_pop)}
+    if primary_pop != "pd_only":
+        sel_tr = is_pd[train_idx_y]
+        sel_te = is_pd[test_idx_omics] if len(test_idx_omics) else np.zeros(0, bool)
+        tr, te = train_idx_y[sel_tr], test_idx_omics[sel_te]
+        gr = tv["groups_all"][tr]
+        if len(tr) >= 40 and len(pd.unique(gr)) >= 10:
+            gkf_pd = GroupKFold(n_splits=max(2, min(LOCKED["n_cv_folds"], len(pd.unique(gr)))))
+            res["PD"] = _extended_covariates(
+                clin, X, M, y_all, bff, tr, gr, gkf_pd, te,
+                oof_pred[sel_tr], test_pred_omics[sel_te], label="PD")
+    return res
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -542,7 +613,7 @@ def run_validity(clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
     res: Dict[str, Any] = {"primary_population": severity_population}
     res["severity_vs_diagnosis"] = _severity_vs_diagnosis(clin, y_all, splits, is_pd, is_hc)
 
-    if severity_population == "all":
+    if severity_population in ("all", "pd_hc"):
         res["refit_pd_only"] = _population_refit(
             clin, X_prot, M_prot, y_all, bff, groups_all,
             train_idx_y, test_idx_omics, is_pd, "pd_only")
@@ -552,9 +623,9 @@ def run_validity(clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
             tv["train_idx_y_all"], tv["test_idx_omics_all"],
             np.ones(len(clin), bool), "all_population")
 
-    res["extended_covariates"] = _extended_covariates(
-        clin, X_prot, M_prot, y_all, bff, train_idx_y, groups_train, gkf,
-        test_idx_omics, oof_pred, test_pred_omics)
+    res["extended_covariates"] = _extended_covariates_by_population(
+        clin, X_prot, M_prot, y_all, bff, tv, is_pd,
+        oof_pred, test_pred_omics, severity_population)
     ce = _cross_endpoint(clin, splits, is_pd)
     res["cross_endpoint"] = ce.to_dict("records") if not ce.empty else []
     y_train_max = float(np.nanmax(y_all[train_idx_y]))

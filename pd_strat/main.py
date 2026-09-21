@@ -131,6 +131,12 @@ def main():
               f"(severity_population=pd_only)")
         is_train_sev = is_train & cohort["is_pd_flag"]
         is_test_sev = is_test & cohort["is_pd_flag"]
+    elif SEVERITY_POPULATION == "pd_hc":
+        print(f"\n[Population] severity model restricted to PD cases + healthy "
+              f"controls; 'OTHER' case/control status excluded (severity_population=pd_hc)")
+        keep = cohort["is_pd_flag"] | cohort["is_control"]
+        is_train_sev = is_train & keep
+        is_test_sev = is_test & keep
     else:
         is_train_sev, is_test_sev = is_train, is_test
     tv = setup_targets_and_cv(clin, z_prot, M_prot, is_train_sev, is_test_sev)
@@ -150,6 +156,9 @@ def main():
     test_idx_omics = tv["test_idx_omics"]
     y_te_full, has_test_y = tv["y_te_full"], tv["has_test_y"]
     UPDRS_STATS = tv["UPDRS_STATS"]
+
+    from .validity import population_table
+    _stage("population_table", population_table, clin, cohort, tv, optional=True)
 
     if len(train_idx_y) < 20:
         raise RuntimeError(

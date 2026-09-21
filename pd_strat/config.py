@@ -52,6 +52,9 @@ _ap.add_argument("--no_rna", action="store_true", default=False,
                  help="Disable the optional RNA modality")
 _ap.add_argument("--report_only", action="store_true", default=False,
                  help="Only (re)generate SUMMARY_REPORT.md from a previous run")
+_ap.add_argument("--exclude_proteins", default=None,
+                 help="Comma-separated UniProt accessions to drop before modelling "
+                      "(e.g. P20711 = DDC); overrides prot_exclude in config.yaml")
 _ap.add_argument("--reverse_cohorts", action="store_true", default=False,
                  help="Swap TRAIN/TEST prefixes (e.g. PDBP->PPMI) for the "
                       "supplementary reverse-direction run; results go to "
@@ -166,6 +169,13 @@ PROT_FEATURE_CAP   = int(_cfg("prot_feature_cap", 1168))
 # whose plasma level rises with levodopa/DDC-inhibitor treatment.  Use for a
 # medication-sensitivity re-run; empty by default.
 PROT_EXCLUDE: List[str] = [str(x).strip().upper() for x in (_cfg("prot_exclude", []) or [])]
+if FLAGS.exclude_proteins:
+    PROT_EXCLUDE = [x.strip().upper() for x in FLAGS.exclude_proteins.split(",") if x.strip()]
+
+# Match each proteomic sample to its own clinical visit (participant + visit
+# key).  False reproduces the legacy behaviour of averaging all of a
+# participant's samples and broadcasting the average to every visit.
+PROTEOMICS_VISIT_MATCHING = bool(_cfg("proteomics_visit_matching", True))
 
 # ── Population for the severity model ──────────────────────────────────────
 # "all"     : every TRAIN/TEST row with UPDRS (PD cases + healthy controls)
@@ -293,7 +303,10 @@ def print_banner():
     print(f"  K selection          : min BIC (sil>0, AMI>={LOCKED['ami_threshold']})")
     print(f"  Prediction clamp     : [{Y_LO}, {Y_HI}]")
     print(f"  Primary estimand     : {LOCKED['primary_estimand']}")
-    print(f"  Severity population  : {SEVERITY_POPULATION}")
+    print(f"  Severity population  : {SEVERITY_POPULATION}   (all | pd_hc | pd_only)")
+    print(f"  Proteomics alignment : {'visit-matched samples' if PROTEOMICS_VISIT_MATCHING else 'participant-mean broadcast (legacy)'}")
+    if PROT_EXCLUDE:
+        print(f"  Excluded proteins    : {PROT_EXCLUDE}")
     print(f"  Feature selection    : {FEATURE_SELECTION} "
           f"(obs>={PROT_MIN_OBS_FRAC:.0%}, MAD>={PROT_MIN_MAD}, |r|<={PROT_CORR_THRESH}, "
           f"cap={PROT_FEATURE_CAP})")

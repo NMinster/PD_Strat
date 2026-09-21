@@ -408,6 +408,13 @@ def _load_tte(path: str) -> Optional[pd.DataFrame]:
             if cand:
                 pairs.append((stem or tc, tc, cand[0]))
     if not pairs:
+        low = {c: c.lower() for c in df.columns}
+        tcols = [c for c in df.columns if c != pid and re.search(r"time|tte|years|months|days", low[c])]
+        ecols = [c for c in df.columns if c != pid and re.search(r"event|status|censor|reached|occur", low[c])]
+        if len(tcols) == 1 and len(ecols) == 1:
+            pairs.append(("endpoint", tcols[0], ecols[0]))
+            print(f"    [TTE] single endpoint detected: time='{tcols[0]}', event='{ecols[0]}'")
+    if not pairs:
         print(f"    [TTE] could not pair time/event columns in {list(df.columns)} -> "
               f"set 'tte_endpoints' in config.yaml")
         return None

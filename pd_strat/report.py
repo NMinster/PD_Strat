@@ -184,6 +184,12 @@ def build_report(summary: Dict[str, Any]) -> str:
     # ── 2. Sample flow ──────────────────────────────────────────────────
     L += ["## 2. Sample flow", ""]
     L += _csv_table(TAB / "sample_flow_table.csv")
+    pc = summary.get("population_composition")
+    if pc:
+        L += ["**Composition of the modelled rows (proteomic sample + UPDRS)**", ""]
+        L += _md_table(pc, ["split", "group", "n_participants", "n_rows",
+                            "rows_per_participant_median", "updrs_mean", "updrs_sd",
+                            "updrs_max"])
     us = summary.get("updrs_scale")
     if isinstance(us, dict):
         L += ["**UPDRS scale (TRAIN, usable rows)**", ""]
@@ -259,19 +265,27 @@ def build_report(summary: Dict[str, Any]) -> str:
                       if f"{s}_participant_ci" in rf}
                 if ci:
                     L += _ci_table(ci)
-        ec = val.get("extended_covariates")
-        if ec:
+        ec_all = val.get("extended_covariates")
+        if ec_all:
             L += ["### 3i. Extended covariate adjustment", ""]
-            L += [f"Covariates: {', '.join(ec.get('covariates', []))}", ""]
-            for s in ("OOF", "TEST"):
-                if s in ec:
-                    L += [f"**{s}** (partial ρ of proteomics given covariates = "
-                          f"{_f(ec[s].get('partial_rho_prot_given_cov'))})", ""]
-                    L += _metrics_table({k: v for k, v in ec[s].items() if isinstance(v, dict)})
-            if ec.get("strata"):
-                L += ["**Strata**", ""]
-                L += _md_table([{"_name": k, "n": v["n"], "rho": v["rho"]}
-                                for k, v in ec["strata"].items()], ["n", "rho"], "stratum")
+            L += ["In a population that contains controls, medication state and disease "
+                  "duration encode diagnosis, so the covariates-only model is inflated; "
+                  "the **PD** block is the one to report for within-PD claims.", ""]
+            blocks = ec_all if all(isinstance(v, dict) and "population" in v
+                                   for v in ec_all.values()) else {"all": ec_all}
+            for pop, ec in blocks.items():
+                L += [f"#### Population: {pop} (TRAIN rows {ec.get('n_train_rows')}, "
+                      f"TEST rows {ec.get('n_test_rows')})", ""]
+                L += [f"Covariates: {', '.join(ec.get('covariates', []))}", ""]
+                for s in ("OOF", "TEST"):
+                    if s in ec:
+                        L += [f"**{s}** (partial ρ of proteomics given covariates = "
+                              f"{_f(ec[s].get('partial_rho_prot_given_cov'))})", ""]
+                        L += _metrics_table({k: v for k, v in ec[s].items() if isinstance(v, dict)})
+                if ec.get("strata"):
+                    L += ["**Strata**", ""]
+                    L += _md_table([{"_name": k, "n": v["n"], "rho": v["rho"]}
+                                    for k, v in ec["strata"].items()], ["n", "rho"], "stratum")
         if val.get("cross_endpoint"):
             L += ["### 3j. Cross-endpoint validation (participant-level Spearman ρ, 95% CI)", ""]
             ce = pd.DataFrame(val["cross_endpoint"])

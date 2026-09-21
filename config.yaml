@@ -55,9 +55,18 @@ train_prefix: "PP-"
 test_prefix:  "PD-"
 
 # Population used to fit/evaluate the severity model.
-#   all      = PD cases + healthy controls with UPDRS (validity package then reports PD-only refit)
-#   pd_only  = PD cases only  (validity package then reports the all-population refit)
-severity_population: "all"
+#   all      = every row with UPDRS: PD cases, healthy controls AND 'OTHER'
+#              case/control status (prodromal, SWEDD, ...) — legacy behaviour
+#   pd_hc    = PD cases + healthy controls only
+#   pd_only  = PD cases only  (the within-PD severity question)
+# The validity package always reports the PD-only refit (or, for pd_only,
+# the all-population refit) so both numbers are available.
+severity_population: "pd_hc"
+
+# Match each proteomic sample to its own clinical visit.  false = legacy
+# behaviour (average all of a participant's samples, broadcast to every
+# visit) — only for reproducing the old numbers.
+proteomics_visit_matching: true
 
 # Outcome-blind feature selection (3 stages, TRAIN only): MAD/observation filter,
 # |r|>0.95 redundancy pruning (higher-MAD member kept), cap by MAD rank.

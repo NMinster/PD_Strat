@@ -26,7 +26,7 @@ from .config import (
     META_PATH, MANIFEST_PATH, CASE_CONTROL_PATH,
     RNA_PATH, RNA_LOG1P,
     FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
-    PROT_FEATURE_CAP, PROT_EXCLUDE,
+    PROT_FEATURE_CAP, PROT_EXCLUDE, PROTEOMICS_VISIT_MATCHING,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
     RNA_EXCLUDE_BATCHES,
 )
@@ -273,12 +273,46 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     print(f"\n  Total: {df_all.shape[0]:,} rows, "
           f"{df_all['UniProt'].nunique()} proteins, "
           f"{df_all['participant_id'].nunique()} subjects")
-    wide = (df_all.pivot_table(index="participant_id", columns="UniProt",
-                               values="NPX", aggfunc="mean"))
-    wide.index = [map_participant_id(str(i)) for i in wide.index]
-    if wide.index.has_duplicates:
-        wide = wide.groupby(wide.index).mean()
-    print(f"  Wide: {wide.shape}")
+    df_all["pid"] = [map_participant_id(str(i)) for i in df_all["participant_id"]]
+
+    # ── visit key for each proteomic sample ─────────────────────────────
+    # One proteomic *sample* per (participant, visit).  Without this the old
+    # code averaged all of a participant's samples and broadcast the average
+    # onto every clinical visit, which invalidates row-level analyses.
+    vkey = pd.Series(pd.NA, index=df_all.index, dtype="object")
+    if PROTEOMICS_VISIT_MATCHING:
+        if "visit_month" in df_all.columns:
+            mn = pd.to_numeric(df_all["visit_month"], errors="coerce")
+            vkey = mn.round().map(lambda z: f"M{int(z)}" if pd.notna(z) else pd.NA)
+        if "visit_name" in df_all.columns:
+            v = df_all["visit_name"].astype(str).str.upper()
+            tok = v.str.extract(r"\b(M\d{1,3})\b", expand=False)
+            fb = v.str.extract(r"MONTH\s*(\d{1,3})", expand=False).map(
+                lambda x: f"M{int(x)}" if pd.notna(x) else pd.NA)
+            bl = v.where(v.str.contains(r"BASELINE|^BL$|^SC$|SCREEN", regex=True)).map(
+                lambda x: "M0" if pd.notna(x) else pd.NA)
+            vkey = vkey.fillna(tok).fillna(fb).fillna(bl)
+        if "sample_id" in df_all.columns:
+            s = df_all["sample_id"].astype(str)
+            m_blm = s.str.extract(r"BLM(\d{1,3})", flags=re.I, expand=False).map(
+                lambda x: f"M{int(x)}" if pd.notna(x) else pd.NA)
+            vkey = vkey.fillna(m_blm)
+    n_vk = int(vkey.notna().sum())
+    if PROTEOMICS_VISIT_MATCHING and n_vk >= 0.5 * len(df_all):
+        df_all["vkey"] = vkey.fillna("M0").astype(str)
+        wide = df_all.pivot_table(index=["pid", "vkey"], columns="UniProt",
+                                  values="NPX", aggfunc="mean")
+        print(f"  Wide (participant x visit): {wide.shape}  "
+              f"[visit key resolved on {n_vk:,}/{len(df_all):,} rows; "
+              f"{wide.index.get_level_values(0).nunique()} participants, "
+              f"{wide.shape[0]} samples]")
+    else:
+        if PROTEOMICS_VISIT_MATCHING:
+            print("  [WARN] no visit_month / visit_name / sample_id in the Olink "
+                  "files -> falling back to participant-level averaging")
+        wide = df_all.pivot_table(index="pid", columns="UniProt",
+                                  values="NPX", aggfunc="mean")
+        print(f"  Wide (participant-mean, broadcast to all visits): {wide.shape}")
 
     for pname in list(panel_map.keys()):
         panel_map[pname] = [c for c in panel_map[pname] if c in wide.columns]
@@ -290,6 +324,37 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
         print(f"  [Annotation] {len(annot)} UniProt -> gene mappings saved")
 
     return wide.astype(np.float32), panel_map
+
+
+def clin_row_keys(clin: pd.DataFrame) -> pd.MultiIndex:
+    """(participant, visit_code) key for every clinical row."""
+    vc = clin["visit_code"].astype("object") if "visit_code" in clin.columns \
+        else pd.Series("", index=clin.index, dtype=object)
+    vc = vc.where(vc.notna(), "").astype(str)
+    return pd.MultiIndex.from_arrays([clin.index.astype(str), vc.values])
+
+
+def _align_to_clin_rows(Z: pd.DataFrame, clin: pd.DataFrame) -> pd.DataFrame:
+    """Align a (participant, visit)-indexed table onto the clinical rows.
+
+    Rows whose visit has no proteomic sample become NaN (and are dropped
+    later by the completeness filter).  Reports unmatched samples.
+    """
+    keys = clin_row_keys(clin)
+    matched = Z.index.isin(keys)
+    n_unm = int((~matched).sum())
+    if n_unm:
+        unm = Z.index[~matched]
+        vis = pd.Series(unm.get_level_values(1)).value_counts().head(6).to_dict()
+        print(f"  [Align] {n_unm}/{len(Z)} proteomic samples have no clinical "
+              f"visit with the same (participant, visit) key and are unused; "
+              f"most common unmatched visit keys: {vis}")
+    out = Z.reindex(keys)
+    out.index = clin.index
+    print(f"  [Align] {int(out.notna().any(axis=1).sum())} clinical rows carry a "
+          f"visit-matched proteomic sample "
+          f"({out.index[out.notna().any(axis=1)].nunique()} participants)")
+    return out
 
 
 def load_proteomics(clin: pd.DataFrame,
@@ -305,18 +370,27 @@ def load_proteomics(clin: pd.DataFrame,
     panel_map_path = TAB / "panel_protein_map.json"
     panel_protein_map: Dict[str, List[str]] = {}
 
-    # Try cached
-    if csv_path.exists() and meta.get("hc_mode") == HC_MODE:
+    # Try cached (must have been built with the same visit-matching mode)
+    if (csv_path.exists() and meta.get("hc_mode") == HC_MODE
+            and bool(meta.get("visit_matched", False)) == bool(PROTEOMICS_VISIT_MATCHING)):
         df = pd.read_csv(csv_path, index_col=0)
-        def _pid_like(x):
-            return str(x).upper().startswith(("PP-", "PD-"))
-        if (sum(_pid_like(c) for c in df.columns) >
-                0.6 * len(df.columns)):
-            df = df.T
-        df.index = [map_participant_id(i) for i in df.index.astype(str)]
-        if df.index.has_duplicates:
+        if meta.get("visit_matched"):
+            keys = df.index.astype(str).str.split("|", n=1, expand=True)
+            df.index = pd.MultiIndex.from_arrays(
+                [[map_participant_id(p) for p in keys.get_level_values(0)],
+                 keys.get_level_values(1).astype(str)])
             df = df[~df.index.duplicated(keep="first")]
-        df = df.reindex(clin.index)
+            df = _align_to_clin_rows(df, clin)
+        else:
+            def _pid_like(x):
+                return str(x).upper().startswith(("PP-", "PD-"))
+            if (sum(_pid_like(c) for c in df.columns) >
+                    0.6 * len(df.columns)):
+                df = df.T
+            df.index = [map_participant_id(i) for i in df.index.astype(str)]
+            if df.index.has_duplicates:
+                df = df[~df.index.duplicated(keep="first")]
+            df = df.reindex(clin.index)
         df = apply_manifest(df, "prot")
         if PROT_EXCLUDE:
             drop = [c for c in df.columns if str(c).upper() in set(PROT_EXCLUDE)]
@@ -356,29 +430,37 @@ def load_proteomics(clin: pd.DataFrame,
         print("  [WARN] No proteomics data -- returning empty DataFrame")
         return pd.DataFrame(index=clin.index), {}
 
-    raw = raw.reindex(clin.index)
-    print(f"  [PROT/raw] samples={raw.notna().any(axis=1).sum()}, "
-          f"feats={raw.shape[1]}")
+    visit_matched = isinstance(raw.index, pd.MultiIndex)
+    pid_level = pd.Index(raw.index.get_level_values(0) if visit_matched else raw.index)
+    n_samples = int(raw.notna().any(axis=1).sum())
+    print(f"  [PROT/raw] samples={n_samples}, participants={pid_level.nunique()}, "
+          f"feats={raw.shape[1]}, visit-matched={visit_matched}")
 
-    # HC-anchored z-scoring
-    hc_ids = _select_train_hc_ids(raw.dropna(how="all").index, is_train,
-                                   min_n=30)
+    # HC-anchored z-scoring: statistics over TRAIN healthy-control *samples*
+    hc_ids = _select_train_hc_ids(pd.Index(pid_level.unique()), is_train, min_n=30)
     if len(hc_ids) >= 30:
-        mu = raw.loc[hc_ids].mean(axis=0)
-        sd = raw.loc[hc_ids].std(axis=0).replace(0, np.nan).fillna(1.0)
+        hc_rows = pid_level.isin(hc_ids)
+        mu = raw[hc_rows].mean(axis=0)
+        sd = raw[hc_rows].std(axis=0).replace(0, np.nan).fillna(1.0)
         Z = (raw - mu) / sd
-        print(f"  [HC] Global TRAIN anchoring (n_hc={len(hc_ids)})")
+        print(f"  [HC] Global TRAIN anchoring (n_hc={len(hc_ids)} participants, "
+              f"{int(hc_rows.sum())} samples)")
     else:
-        tr_ids = clin.index[is_train]
-        tr_raw = raw.loc[raw.index.intersection(tr_ids)]
+        tr_rows = pid_level.isin(clin.index[is_train])
+        tr_raw = raw[tr_rows]
         mu = tr_raw.median(axis=0)
         mad = (tr_raw - mu).abs().median(axis=0)
         sd = (mad * 1.4826).replace(0, np.nan).fillna(1.0)
         Z = (raw - mu) / sd
         print(f"  [HC] Endpoint-blind fallback: robust median/MAD on "
-              f"TRAIN (n={len(tr_raw)})")
+              f"TRAIN (n={len(tr_raw)} samples)")
 
-    Z = Z.clip(-10, 10).reindex(clin.index).astype(np.float32)
+    Z = Z.clip(-10, 10).astype(np.float32)
+    Z_samples = Z.copy()                      # unaligned, for the cache
+    if visit_matched:
+        Z = _align_to_clin_rows(Z, clin)
+    else:
+        Z = Z.reindex(clin.index)
     if PROT_EXCLUDE:
         drop = [c for c in Z.columns if str(c).upper() in set(PROT_EXCLUDE)]
         Z = Z.drop(columns=drop)
@@ -402,11 +484,17 @@ def load_proteomics(clin: pd.DataFrame,
         panel_map[pname] = [c for c in panel_map[pname] if c in z_cols_set]
     panel_protein_map = panel_map
 
-    Z.to_csv(csv_path)
+    # cache the *sample-level* table (one row per proteomic sample)
+    Zc = Z_samples.loc[:, Z.columns]
+    if visit_matched:
+        Zc.index = [f"{p}|{v}" for p, v in Zc.index]
+    Zc.to_csv(csv_path)
     json.dump(panel_map, open(panel_map_path, "w"), indent=2)
     sha = short_sha(Z.columns)
     meta_all = load_json(META_PATH)
-    meta_all[name_csv] = dict(hc_mode=HC_MODE, shape=list(Z.shape), sha12=sha)
+    meta_all[name_csv] = dict(hc_mode=HC_MODE, shape=list(Z.shape), sha12=sha,
+                              visit_matched=bool(visit_matched),
+                              n_samples=int(Zc.notna().any(axis=1).sum()))
     json.dump(meta_all, open(META_PATH, "w"), indent=2)
     print(f"  [Pin] wrote {name_csv}: shape={Z.shape}, sha={sha}")
     return Z, panel_protein_map
