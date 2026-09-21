@@ -82,8 +82,12 @@ def run_literature_overlap(prot_cols: List[str]) -> Dict[str, Any]:
                 if k in conf.columns:
                     r[k] = conf.loc[u, k]
         rows.append(r)
-    df = pd.DataFrame(rows).sort_values(["on_panel", "rank_full"], ascending=[False, True],
-                                        na_position="last")
+    df = pd.DataFrame(rows)
+    for col in ("rank_full", "incl_freq_k50", "w_boot_median"):
+        if col not in df.columns:
+            df[col] = np.nan
+    df = df.sort_values(["on_panel", "rank_full"], ascending=[False, True],
+                        na_position="last")
     df.to_csv(TAB / "literature_overlap.csv", index=False)
 
     # which of *our* highlighted proteins have literature support?
