@@ -263,6 +263,24 @@ def run_progression(clin, y_all, train_idx_y, oof_pred, test_idx_omics, test_pre
         merged.assign(split=tag).to_csv(TAB / f"progression_baseline_vs_slope_{tag}.csv",
                                         index=False)
         bl2 = bl.merge(slopes_s[["pid", "baseline_y"]], on="pid", how="inner")
+        # trajectory table for figures: every clinical visit of PD participants
+        # with a baseline prediction, labelled by predicted-severity tertile
+        try:
+            months = _months(clin)
+            pid_all = np.array([map_participant_id(str(x)) for x in clin.index])
+            traj = pd.DataFrame({"pid": pid_all, "months": months, "y": y_all})[mask].dropna()
+            q = np.nanpercentile(bl["pred0"], [33.3, 66.7])
+            tert = pd.Series(np.digitize(bl["pred0"], q) + 1, index=bl["pid"].values)
+            traj = traj[traj["pid"].isin(tert.index)]
+            traj["pred0_tertile"] = traj["pid"].map(tert).values
+            traj["pred0"] = traj["pid"].map(bl.set_index("pid")["pred0"]).values
+            traj.assign(split=tag).to_csv(TAB / f"progression_trajectories_{tag}.csv", index=False)
+            if tte is not None:
+                km = tte.merge(bl[["pid", "pred0"]], on="pid").assign(split=tag)
+                km["pred0_tertile"] = km["pid"].map(tert).values
+                km.to_csv(TAB / f"progression_km_{tag}.csv", index=False)
+        except Exception as e:
+            print(f"    [trajectories] skipped: {e}")
         if len(bl2) >= 20:
             out[f"{tag}_mixed"] = _mixed_model(tag, clin, y_all, mask, bl2)
         if tte is not None and len(bl2) >= 20:

@@ -380,6 +380,32 @@ def build_report(summary: Dict[str, Any]) -> str:
             L += ["**Progression by molecular subtype (TRAIN)**", ""]
             L += _generic(pr["subtype_progression"], depth=2)
 
+    # ── 5c. Discovery benchmark ─────────────────────────────────────────
+    dc = summary.get("discovery")
+    if dc and dc.get("best"):
+        L += ["## 5c. Discovery benchmark: does the baseline proteome predict progression "
+              "better than baseline clinical scoring?", ""]
+        L += [f"Pre-specified nested CV on TRAIN PD participants ({dc.get('n_configs_total')} "
+              f"model × feature-set configurations in total; the OOF-selected configuration per "
+              f"target was evaluated once on TEST). Clinical comparator features: "
+              f"{', '.join(dc.get('clinical_features', []))}. Fast progressor = slope ≥ "
+              f"{_f(dc.get('fast_progressor_threshold_slope_per_year'), 2)} points/year (TRAIN top tertile).", ""]
+        L += _md_table(dc["best"], ["target", "n_train", "n_configs_tested", "best_feature_set", "best_model",
+                                    "oof_clinical", "oof_best", "oof_delta_vs_clinical",
+                                    "oof_best_delta_ci_lo", "oof_best_delta_ci_hi", "perm_p",
+                                    "n_test", "test_clinical", "test_best", "test_delta_vs_clinical",
+                                    "test_best_delta_ci_lo", "test_best_delta_ci_hi", "test_best_delta_p"])
+        L += ["Metric: Spearman ρ for continuous targets, AUROC for fast-progressor. "
+              "A Δ whose CI excludes 0 on **TEST** is the only result that supports an "
+              "\"adds to neurologist scoring\" claim.", ""]
+        L += ["Full grid (OOF, pooled over repeats):", ""]
+        L += _csv_table(TAB / "discovery_grid.csv", max_rows=60)
+        if dc.get("enrichment"):
+            L += ["**Trial-enrichment implication (TEST, ranked by predicted risk)**", ""]
+            L += _md_table(dc["enrichment"], ["enrolled_fraction", "n_enrolled", "fast_progressor_rate",
+                                              "base_rate", "enrichment_factor", "mean_slope_enrolled",
+                                              "mean_slope_all", "relative_trial_sample_size"])
+
     # ── 6. Confounding ──────────────────────────────────────────────────
     conf = summary.get("msi_u_confounding")
     if conf:

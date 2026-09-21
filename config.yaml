@@ -88,6 +88,13 @@ participant_boot_B: 2000   # participant-level bootstrap CIs
 progression_min_visits: 2
 progression_min_span_months: 3
 
+# Discovery benchmark (§14): direct progression modelling, nested CV, TEST once.
+discovery_repeats: 3            # outer 5-fold repeats (3 -> 15 outer fits per config)
+discovery_inner_cv: 3
+discovery_permutations: 50      # permutation null for the selected config per target
+discovery_min_span_months: 12   # minimum follow-up to define a slope target
+discovery_models: []            # [] = all; e.g. [RidgeSVD, RandomForest, HistGBT]
+
 # Proteomics: Olink Explore panels.  PLA = plasma, CSF = cerebrospinal fluid.
 proteomics_tissue: "PLA"
 proteomics_panel_names: [oncology, neurology, inflammation, cardiometabolic]

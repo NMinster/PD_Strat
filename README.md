@@ -140,6 +140,28 @@ highlights, and the list of files written.
 | 7b Panel reduction | Stability selection; nested cumulative curve with k* chosen on OOF | `robustness/stability_selection.csv`, `robustness/cumulative_importance.csv`, `robustness/reduced_panel_k_star.csv` |
 | 7c Confirmatory | Locked 40 proteins: TEST replication of severity and protein×time models | `robustness/confirmatory_severity.csv`, `robustness/confirmatory_progression.csv`, `figures/confirmatory_forest.png` |
 
+| 5c Discovery benchmark | Does the baseline proteome predict *future* change better than baseline clinical scoring? Nested CV over a model zoo × feature sets × progression targets; TEST once; trial-enrichment curve | `discovery_grid.csv`, `discovery_best.csv`, `discovery_enrichment.csv`, `figures/fig_discovery_*.png`, `fig_trajectories_by_tertile.png`, `fig_km_*.png`, `fig_trial_enrichment.png` |
+
+### Discovery benchmark (§14) — how to read it honestly
+
+`discovery.py` fits ~9 regression / 6 classification model families (ridge-on-SVD,
+elastic net, PLS, RBF kernel ridge, SVR, random forest, extra trees, gradient
+boosting, MLP; logistic / SVC / tree ensembles) on three feature sets —
+**clinical only** (age, sex, disease duration, baseline UPDRS total & III,
+H&Y, UPSIT, levodopa: what a neurologist knows at baseline), **proteomics
+only**, and **both** — for four targets: baseline severity, UPDRS slope,
+24-month change, fast-progressor status (plus Cox when time-to-event data
+exist). Everything is repeated nested CV on TRAIN; the single OOF-selected
+proteomic configuration per target is evaluated once on TEST with a paired
+bootstrap Δ against the clinical model and a permutation p. The number of
+configurations tested is printed beside every result. **Only a TEST Δ whose
+CI excludes zero supports an "adds to clinical scoring" claim.**
+
+The whole zoo runs in minutes on CPU at AMP-PD sample sizes (≈100–200 PD
+participants per cohort); a GPU is not needed and deep networks would only
+overfit. If you scale to the newer PPMI Olink Explore 3072 release (thousands
+of samples) or add CSF, revisit that.
+
 See `docs/manuscript_review.md` for how these map onto the manuscript and
 `docs/TRIPOD_AI_checklist.md` for the reporting checklist.
 

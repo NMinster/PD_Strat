@@ -52,6 +52,8 @@ _ap.add_argument("--no_rna", action="store_true", default=False,
                  help="Disable the optional RNA modality")
 _ap.add_argument("--report_only", action="store_true", default=False,
                  help="Only (re)generate SUMMARY_REPORT.md from a previous run")
+_ap.add_argument("--skip_discovery", action="store_true", default=False,
+                 help="Skip the discovery benchmark (§14)")
 _ap.add_argument("--exclude_proteins", default=None,
                  help="Comma-separated UniProt accessions to drop before modelling "
                       "(e.g. P20711 = DDC); overrides prot_exclude in config.yaml")
@@ -201,6 +203,13 @@ TTE_ENDPOINTS = _cfg("tte_endpoints", None)     # optional explicit column mappi
 # to the cross-endpoint table, and is used as a comparator/adjuster in the Cox
 # models.
 EXTRA_BIOMARKERS: List[Dict[str, Any]] = list(_cfg("extra_biomarkers", []) or [])
+
+# ── Discovery benchmark (§14) ──────────────────────────────────────────────
+DISCOVERY_REPEATS        = int(_cfg("discovery_repeats", 3))       # outer 5-fold repeats
+DISCOVERY_INNER_CV       = int(_cfg("discovery_inner_cv", 3))
+DISCOVERY_PERMUTATIONS   = int(_cfg("discovery_permutations", 50))
+DISCOVERY_MIN_SPAN_MONTHS = float(_cfg("discovery_min_span_months", 12))
+DISCOVERY_MODELS: List[str] = list(_cfg("discovery_models", []) or [])   # [] = all
 
 # ── Raw AMP-PD release files ───────────────────────────────────────────────
 RELEASE_PREFIX = str(_cfg("release_prefix", "releases_2023_v4release_1027"))

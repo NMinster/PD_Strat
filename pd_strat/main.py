@@ -240,6 +240,14 @@ def main():
            test_pred[prot_ok_test] if len(test_idx_omics) else np.array([]),
            cohort, sub_results, optional=True)
 
+    # ── §14 Discovery benchmark (direct progression modelling) ────────
+    if FLAGS.skip_discovery:
+        print("\n[Discovery SKIPPED per --skip_discovery]")
+    else:
+        from .discovery import run_discovery
+        _stage("discovery", run_discovery, clin, z_prot, M_prot, y_all, cohort, tv,
+               optional=True)
+
     # ── §10 Robustness ────────────────────────────────────────────────
     if FLAGS.skip_robustness:
         print("\n[Robustness SKIPPED per --skip_robustness]")
@@ -282,6 +290,8 @@ def main():
            d_rna=d_rna, d_prot=d_prot, has_any_omics=has_any_omics,
            optional=True)
     _stage("extended_figures", run_extended_figures, optional=True)
+    from .figures_advanced import run_advanced_figures
+    _stage("advanced_figures", run_advanced_figures, optional=True)
 
     # ── §13 Flow table + summary report ───────────────────────────────
     save_flow_table()
