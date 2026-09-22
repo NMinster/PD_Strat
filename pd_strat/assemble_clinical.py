@@ -138,6 +138,20 @@ def _load_updrs_part(path: str, part: str) -> pd.DataFrame:
             extra_cols.append("hoehn_yahr")
             print(f"    [{label}] Hoehn & Yahr col='{hy}' "
                   f"({int(out['hoehn_yahr'].notna().sum())} values)")
+        # Visit-level "on PD medication?" flag (PPMI upd23a) — gives an
+        # untreated -> treated contrast within participants
+        med = _find_col(df, [r"^upd23a", r"medication_for_pd", r"on_pd_med", r"pd_medication"],
+                        "on PD medication (visit)", required=False)
+        if med is not None:
+            s = df[med].astype(str).str.strip().str.lower()
+            num = pd.to_numeric(df[med], errors="coerce")
+            out["pd_medicated"] = np.where(num.notna(), (num > 0).astype(float),
+                                  np.where(s.isin(["yes", "y", "true", "1"]), 1.0,
+                                  np.where(s.isin(["no", "n", "false", "0"]), 0.0, np.nan)))
+            extra_cols.append("pd_medicated")
+            print(f"    [{label}] visit-level medication col='{med}' "
+                  f"({int((out['pd_medicated'] == 1).sum())} medicated, "
+                  f"{int((out['pd_medicated'] == 0).sum())} unmedicated rows)")
         # Medication state of the exam (ON / OFF / unknown)
         state = _find_col(
             df, [r"clinical_state", r"on_off", r"med.*state", r"^upd23b"],
@@ -164,7 +178,7 @@ def _load_updrs_part(path: str, part: str) -> pd.DataFrame:
     out = out.dropna(subset=["visit_key", "score"])
     aggs = {"score": "mean"}
     for c in extra_cols:
-        aggs[c] = "mean" if c == "hoehn_yahr" else "first"
+        aggs[c] = "mean" if c == "hoehn_yahr" else ("max" if c == "pd_medicated" else "first")
     agg = (out.groupby(["participant_id", "visit_key"], as_index=False)
               .agg(aggs)
               .rename(columns={"score": f"mds_updrs_part_{part}_total"}))
@@ -614,7 +628,7 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
 
     cols = ["participant_id", "visit_name", "visit_month", "cohort",
             "case_control", "diagnosis", "updrs_total", p1, p2, p3, p4,
-            "hoehn_yahr", "updrs3_state", "upsit_total", "sex", "age_at_baseline",
+            "hoehn_yahr", "updrs3_state", "pd_medicated", "upsit_total", "sex", "age_at_baseline",
             "age", "age_at_diagnosis", "disease_duration_years",
             "on_levodopa", "on_other_dopaminergic", "ledd", "site",
             "race", "ethnicity"]

@@ -251,15 +251,24 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
             continue
         df = pd.read_csv(path, low_memory=False)
         df["panel"] = name
+        if not panel_dfs:
+            print(f"  [Panel columns] {list(df.columns)}")
         if MULTI_TISSUE:
             # keep plasma and CSF measurements of the same protein distinct
             df["UniProt"] = PANEL_TISSUE[name] + ":" + df["UniProt"].astype(str)
-        # UniProt -> gene symbol (Olink 'Assay' column) for readable tables
-        if "Assay" in df.columns:
-            for u, g in (df[["UniProt", "Assay"]].dropna()
+        # UniProt -> gene symbol for readable tables; the symbol column is
+        # named differently across Olink exports (Assay / gene_name / symbol ...)
+        sym_col = next((c for c in df.columns
+                        if re.search(r"^assay$|^gene(_?name|_?symbol)?$|^symbol$|hgnc|protein_name",
+                                     str(c), re.I)), None)
+        if sym_col is not None:
+            for u, g in (df[["UniProt", sym_col]].dropna()
                          .drop_duplicates("UniProt").itertuples(index=False)):
                 gene = f"{PANEL_TISSUE[name]}:{g}" if MULTI_TISSUE else str(g)
                 annot.append({"uniprot": str(u), "gene": gene, "panel": name})
+        elif not panel_dfs:
+            print("  [Annotation] no gene-symbol column found (looked for Assay / gene_name / "
+                  "symbol / hgnc); tables will show UniProt accessions only")
         if "Cumulative_QC" in df.columns and qc_filter:
             n0 = len(df)
             df = df[df["Cumulative_QC"].astype(str).str.upper()

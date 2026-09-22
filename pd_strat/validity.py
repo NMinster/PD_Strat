@@ -234,7 +234,7 @@ def _population_refit(clin, X, M, y_all, bff, groups_all,
 _NUMERIC_COVS = [("age", "_age"), ("disease_duration", "disease_duration_years"),
                  ("ledd", "ledd")]
 _CATEG_COVS = [("sex", "_sex"), ("site", "_site"), ("med_state", "updrs3_state"),
-               ("levodopa", "on_levodopa")]
+               ("levodopa", "on_levodopa"), ("medicated_visit", "pd_medicated")]
 
 
 def _design(clin, positions, ref_cols=None, fill=None):
@@ -347,6 +347,13 @@ def _extended_covariates(clin, X, M, y_all, bff, train_idx_y, groups_train, gkf,
                 mm = (st == s) & np.isfinite(pred) & np.isfinite(y)
                 if mm.sum() >= 20:
                     strata[f"{tag}_medstate_{s}"] = {
+                        "n": int(mm.sum()), "rho": spearman_np(pred[mm], y[mm])}
+        if "pd_medicated" in clin.columns:
+            mv = pd.to_numeric(clin["pd_medicated"].iloc[pos], errors="coerce").values
+            for lab, val in (("medicated_visit_yes", 1.0), ("medicated_visit_no", 0.0)):
+                mm = (mv == val) & np.isfinite(pred) & np.isfinite(y)
+                if mm.sum() >= 20:
+                    strata[f"{tag}_{lab}"] = {
                         "n": int(mm.sum()), "rho": spearman_np(pred[mm], y[mm])}
         if "on_levodopa" in clin.columns:
             lv = pd.to_numeric(clin["on_levodopa"].iloc[pos], errors="coerce").values

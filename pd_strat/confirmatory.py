@@ -82,8 +82,16 @@ def run_confirmatory(clin, z_prot, y_all, train_idx_y, test_idx_omics, prot_cols
     is_pd = cohort["is_pd_flag"].values.astype(bool)
     n_bonf = len(prots)
     annot = load_protein_annotation()
-    levo = (pd.to_numeric(clin["on_levodopa"], errors="coerce").values
-            if "on_levodopa" in clin.columns else None)
+    # medication contrast: prefer the visit-level flag (untreated -> treated
+    # within participants), fall back to participant-level "ever on levodopa"
+    if "pd_medicated" in clin.columns and pd.to_numeric(clin["pd_medicated"], errors="coerce").notna().sum() > 100:
+        levo = pd.to_numeric(clin["pd_medicated"], errors="coerce").values
+        print("  Medication screen uses visit-level 'pd_medicated' (Part III upd23a)")
+    elif "on_levodopa" in clin.columns:
+        levo = pd.to_numeric(clin["on_levodopa"], errors="coerce").values
+        print("  Medication screen uses participant-level 'on_levodopa'")
+    else:
+        levo = None
 
     # ── severity (+ medication-association screen) ──────────────────────
     sev_rows = []
