@@ -410,10 +410,40 @@ def fig_within_pd(made):
             _save(fig, "fig_model_comparison_forest.png", made)
 
 
+def fig_within_person(made):
+    """Consecutive-visit Δscore vs ΔUPDRS (the monitoring-biomarker picture)."""
+    plt = _style()
+    p = TAB / "longitudinal_pairs.csv"
+    if not p.exists():
+        return
+    d = pd.read_csv(p)
+    d = d[(d["target"] == "y") & (d["model"] == "primary")]
+    splits = [s for s in ("TRAIN", "TEST") if s in set(d["split"])]
+    if not splits:
+        return
+    fig, axes = plt.subplots(1, len(splits), figsize=(3.7 * len(splits), 3.4), squeeze=False)
+    for ax, split, col in zip(axes[0], splits, (C_TRAIN, C_TEST)):
+        s = d[d["split"] == split]
+        ax.axhline(0, color=AXIS, lw=0.8); ax.axvline(0, color=AXIS, lw=0.8)
+        ax.scatter(s["score"], s["tgt"], s=12, alpha=0.55, color=col, edgecolor=SURF, lw=0.5)
+        m = np.isfinite(s["score"]) & np.isfinite(s["tgt"])
+        if m.sum() > 5:
+            b = np.polyfit(s["score"][m], s["tgt"][m], 1)
+            xs = np.linspace(s["score"].min(), s["score"].max(), 20)
+            ax.plot(xs, np.polyval(b, xs), color=INK, lw=1.2)
+        ax.set_xlabel("Δ predicted severity between consecutive samples")
+        ax.set_ylabel("Δ MDS-UPDRS between the same visits")
+        ax.set_title(f"{split}: ρ = {spearman_np(s['score'].values, s['tgt'].values):.2f}, "
+                     f"{len(s)} visit pairs")
+    fig.suptitle("Within-person change: does the score move with the clinic?", fontsize=9, color=INK2, y=1.02)
+    fig.tight_layout()
+    _save(fig, "fig_within_person_coupling.png", made)
+
+
 def run_advanced_figures() -> List[str]:
     made: List[str] = []
     for fn in (fig_discovery, fig_trajectories, fig_km, fig_enrichment, fig_replication,
-               fig_protein_endpoint, fig_within_pd):
+               fig_protein_endpoint, fig_within_pd, fig_within_person):
         try:
             fn(made)
         except Exception as e:  # never let a figure kill the run

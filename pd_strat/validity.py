@@ -208,7 +208,7 @@ def _population_refit(clin, X, M, y_all, bff, groups_all,
           f"{out['OOF_participant_ci']['spearman']['hi']:.3f}]")
 
     pred_rows = pd.DataFrame({"participant_id": clin.index[tr], "split": "TRAIN_OOF",
-                              "pred": oof, "y": y_all[tr]})
+                              "pos": tr, "pred": oof, "y": y_all[tr]})
     if len(te) >= 10 and np.isfinite(y_all[te]).sum() >= 10:
         pte = _fit_predict(bff, X, M, y_all, tr, te)
         out["TEST_row"] = full_metrics(pte, y_all[te])
@@ -221,7 +221,7 @@ def _population_refit(clin, X, M, y_all, bff, groups_all,
               f"[{out['TEST_participant_ci']['spearman']['lo']:.3f}, "
               f"{out['TEST_participant_ci']['spearman']['hi']:.3f}]")
         pred_rows = pd.concat([pred_rows, pd.DataFrame({
-            "participant_id": clin.index[te], "split": "TEST", "pred": pte,
+            "participant_id": clin.index[te], "split": "TEST", "pos": te, "pred": pte,
             "y": y_all[te]})])
     pred_rows.to_csv(TAB / f"predictions_{label}.csv", index=False)
     return out

@@ -140,7 +140,8 @@ highlights, and the list of files written.
 | 7b Panel reduction | Stability selection; nested cumulative curve with k* chosen on OOF | `robustness/stability_selection.csv`, `robustness/cumulative_importance.csv`, `robustness/reduced_panel_k_star.csv` |
 | 7c Confirmatory | Locked 40 proteins: TEST replication of severity and protein×time models | `robustness/confirmatory_severity.csv`, `robustness/confirmatory_progression.csv`, `figures/confirmatory_forest.png` |
 
-| 5c Discovery benchmark | Does the baseline proteome predict *future* change better than baseline clinical scoring? Nested CV over a model zoo × feature sets × progression targets; TEST once; trial-enrichment curve | `discovery_grid.csv`, `discovery_best.csv`, `discovery_enrichment.csv`, `figures/fig_discovery_*.png`, `fig_trajectories_by_tertile.png`, `fig_km_*.png`, `fig_trial_enrichment.png` |
+| 5c Discovery benchmark | Does the baseline proteome predict *future* change better than baseline clinical scoring? Nested CV over a model zoo × feature sets × progression targets (incl. DaTSCAN putamen SBR at baseline and its annual change); TEST once; trial-enrichment curve | `discovery_grid.csv`, `discovery_best.csv`, `discovery_enrichment.csv`, `figures/fig_discovery_*.png`, `fig_trajectories_by_tertile.png`, `fig_km_*.png`, `fig_trial_enrichment.png` |
+| 5d Within-person coupling | Does the proteomic score *track* a person's own change (monitoring biomarker), separately from between-person differences? Mixed model with person-mean-centred score (within β vs between β), consecutive-visit Δ correlation, slope-vs-slope, per-protein replication | `longitudinal_coupling.csv`, `longitudinal_pairs.csv`, `longitudinal_protein_coupling.csv`, `figures/fig_within_person_coupling.png` |
 
 ### Discovery benchmark (§14) — how to read it honestly
 
@@ -149,9 +150,14 @@ elastic net, PLS, RBF kernel ridge, SVR, random forest, extra trees, gradient
 boosting, MLP; logistic / SVC / tree ensembles) on three feature sets —
 **clinical only** (age, sex, disease duration, baseline UPDRS total & III,
 H&Y, UPSIT, levodopa: what a neurologist knows at baseline), **proteomics
-only**, and **both** — for four targets: baseline severity, UPDRS slope,
+only**, and **both** — for four clinical targets: baseline severity, UPDRS slope,
 24-month change, fast-progressor status (plus Cox when time-to-event data
-exist). Everything is repeated nested CV on TRAIN; the single OOF-selected
+exist), and two objective imaging targets when DaTSCAN is present: baseline
+putamen SBR (scan within ±6 months of the baseline sample) and annualised
+putamen SBR change (≥2 scans spanning ≥12 months). The imaging targets are
+rater-independent, so a proteomic Δ over clinical there cannot be dismissed as
+rater noise; in AMP-PD they are PPMI-only (PDBP has no DaTSCAN), so they are
+nested-CV evidence without an external test. Everything is repeated nested CV on TRAIN; the single OOF-selected
 proteomic configuration per target is evaluated once on TEST with a paired
 bootstrap Δ against the clinical model and a permutation p. The number of
 configurations tested is printed beside every result. **Only a TEST Δ whose

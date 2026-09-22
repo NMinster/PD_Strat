@@ -406,6 +406,29 @@ def build_report(summary: Dict[str, Any]) -> str:
                                               "base_rate", "enrichment_factor", "mean_slope_enrolled",
                                               "mean_slope_all", "relative_trial_sample_size"])
 
+    # ── 5d. Within-person coupling ──────────────────────────────────────
+    lg = summary.get("longitudinal")
+    if lg and lg.get("coupling"):
+        L += ["## 5d. Within-person coupling: does change in the score track change in the clinic?", ""]
+        L += ["Mixed model `target ~ score_within + score_between + years + (1 | participant)` on PD "
+              "participants with ≥ 2 visit-matched samples. `within` = monitoring claim (per SD of "
+              "within-person deviation); `between` = cross-sectional severity. Also Spearman ρ of "
+              "consecutive-visit Δscore vs Δtarget (participant-bootstrap CI) and ρ of per-participant "
+              "slopes (≥ 3 samples over ≥ 12 months).", ""]
+        rows = [{**r, "target": ("UPDRS" if r.get("target") == "y" else "DaTSCAN putamen")}
+                for r in lg["coupling"]]
+        L += _md_table(rows, ["split", "model", "target", "n_participants", "n_samples",
+                              "within_beta_per_SD", "within_ci_lo", "within_ci_hi", "within_p",
+                              "between_beta_per_SD", "between_p",
+                              "n_consecutive_pairs", "rho_delta_score_delta_target", "rho_delta_ci_lo",
+                              "rho_delta_ci_hi", "n_slope_pairs", "rho_slope_score_slope_target",
+                              "rho_slope_ci_lo", "rho_slope_ci_hi"])
+        if lg.get("n_proteins_tested"):
+            L += [f"Protein-level (locked list): {lg.get('n_proteins_within_replicated_p05')} / "
+                  f"{lg.get('n_proteins_tested')} proteins show a same-sign within-person effect with "
+                  f"p < 0.05 in both cohorts.", ""]
+            L += _csv_table(TAB / "longitudinal_protein_coupling.csv", max_rows=15)
+
     # ── 6. Confounding ──────────────────────────────────────────────────
     conf = summary.get("msi_u_confounding")
     if conf:

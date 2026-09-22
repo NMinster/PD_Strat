@@ -128,6 +128,21 @@ def _targets(clin, y_all, base: pd.DataFrame, mask_rows: np.ndarray) -> pd.DataF
         delta24.append(float(tgt["y"].iloc[0] - r["y0"]) if len(tgt) else np.nan)
     out["slope_per_year"] = slope; out["delta_24m"] = delta24
     out["n_visits"] = n_vis; out["span_months"] = span
+    # DaTSCAN targets (objective; PPMI only): baseline putamen SBR and its
+    # annualised change over >= 12 months of follow-up scans
+    if "datscan_putamen" in clin.columns:
+        dat = pd.to_numeric(clin["datscan_putamen"], errors="coerce").values
+        drows = pd.DataFrame({"pid": pids, "months": months, "dat": dat}).dropna()
+        d0, dsl = [], []
+        for _, r in out.iterrows():
+            g = drows[(drows["pid"] == r["pid"]) & (drows["months"] >= r["m0"] - 6)].sort_values("months")
+            near = g[(g["months"] - r["m0"]).abs() <= 6]
+            d0.append(float(near["dat"].iloc[0]) if len(near) else np.nan)
+            if len(g) >= 2 and g["months"].max() - g["months"].min() >= 12:
+                dsl.append(12 * np.polyfit(g["months"].values, g["dat"].values, 1)[0])
+            else:
+                dsl.append(np.nan)
+        out["datscan_putamen_bl"] = d0; out["datscan_putamen_change_per_year"] = dsl
     return out
 
 
@@ -314,7 +329,10 @@ def run_discovery(clin, z_prot, M_prot, y_all, cohort, tv) -> Dict[str, Any]:
         frames[split] = dict(base=base, tg=tg, Xp=Xp, Xc=Xc, cnames=cnames)
         print(f"  [{split}] {len(base)} PD participants; clinical features: {cnames}; "
               f"slopes available: {int(tg['slope_per_year'].notna().sum())}, "
-              f"24-month change: {int(tg['delta_24m'].notna().sum())}")
+              f"24-month change: {int(tg['delta_24m'].notna().sum())}"
+              + (f", DaTSCAN baseline: {int(tg['datscan_putamen_bl'].notna().sum())}, "
+                 f"DaTSCAN change: {int(tg['datscan_putamen_change_per_year'].notna().sum())}"
+                 if "datscan_putamen_bl" in tg.columns else ""))
     if "TRAIN" not in frames:
         return out
     tr = frames["TRAIN"]; te = frames.get("TEST")
@@ -337,6 +355,11 @@ def run_discovery(clin, z_prot, M_prot, y_all, cohort, tv) -> Dict[str, Any]:
         "fast_progressor": ("clf", lambda f: np.where(np.isfinite(f["tg"]["slope_per_year"].values),
                                                      (f["tg"]["slope_per_year"].values >= fast_thr).astype(float), np.nan)),
     }
+    if "datscan_putamen_bl" in tr["tg"].columns:
+        targets["datscan_putamen_baseline"] = ("reg", lambda f: (f["tg"]["datscan_putamen_bl"].values.astype(float)
+                                                                if "datscan_putamen_bl" in f["tg"] else np.full(len(f["tg"]), np.nan)))
+        targets["datscan_putamen_change_per_year"] = ("reg", lambda f: (f["tg"]["datscan_putamen_change_per_year"].values.astype(float)
+                                                                       if "datscan_putamen_change_per_year" in f["tg"] else np.full(len(f["tg"]), np.nan)))
     fsets = {"clinical": (False, True), "proteomics": (True, False), "proteomics+clinical": (True, True)}
 
     grid_rows, best_rows, n_configs = [], [], 0

@@ -277,6 +277,13 @@ def main():
     # ── §11b Literature overlap (works with whatever tables exist) ────
     _stage("literature_overlap", run_literature_overlap, prot_cols, optional=True)
 
+    # ── §15 Within-person coupling (monitoring biomarker) ─────────────
+    from .longitudinal import run_longitudinal
+    _stage("longitudinal", run_longitudinal,
+           clin, z_prot, y_all, cohort, train_idx_y, oof_pred, test_idx_omics,
+           test_pred[prot_ok_test] if len(test_idx_omics) else np.array([]),
+           prot_cols, optional=True)
+
     # ── §12 Figures ───────────────────────────────────────────────────
     _stage("figures", run_figures,
            oof_pred=oof_pred, y_tr=y_all[train_idx_y], train_idx_y=train_idx_y,
