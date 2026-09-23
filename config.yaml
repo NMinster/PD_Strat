@@ -79,6 +79,7 @@ prot_feature_cap: 1168
 # PD treatment (P20711 = DDC rises with levodopa/DDC-inhibitor).  Run once with
 # the list empty (primary) and once with it set, using a different out_dir.
 prot_exclude: []            # e.g. ["P20711"]
+uniprot_lookup: true        # fetch gene symbols from rest.uniprot.org for unannotated accessions (cached in docs/uniprot_gene_map.csv)
 
 # Inference knobs (lower for a quick run; manuscript defaults shown)
 n_permutations: 100        # label-permutation null for OOF rho (empirical p)

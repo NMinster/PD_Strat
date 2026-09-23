@@ -99,7 +99,7 @@ def _visit_key(df: pd.DataFrame, label: str) -> pd.Series:
 
 
 def _month_from_key(vk: pd.Series) -> pd.Series:
-    return pd.to_numeric(vk.astype(str).str.extract(r"M(\d+)", expand=False),
+    return pd.to_numeric(vk.astype(str).str.extract(r"M(-?\d+)", expand=False),
                          errors="coerce")
 
 
@@ -373,6 +373,16 @@ def _load_datscan(path: str) -> Optional[pd.DataFrame]:
         return None
     out = pd.DataFrame({"participant_id": _norm_pid(df[pid]),
                         "visit_key": _visit_key(df, "DaTSCAN")})
+    # PPMI's diagnostic scan is done at screening, weeks *before* the baseline
+    # visit; it may carry a negative visit_month (M-1, M-2 ...).  Key it as the
+    # baseline scan so it lands on the M0 clinical row and on the baseline
+    # proteomic sample.
+    neg = out["visit_key"].astype(str).str.match(r"^M-\d+$")
+    if neg.any():
+        print(f"    [DaTSCAN] {int(neg.sum())} pre-baseline (negative-month) scans keyed as M0")
+        out.loc[neg, "visit_key"] = "M0"
+    vc = out["visit_key"].value_counts(dropna=False).head(8)
+    print("    [DaTSCAN] visit keys: " + ", ".join(f"{k}={v}" for k, v in vc.items()))
     if put:
         out["datscan_putamen"] = df[put].apply(pd.to_numeric, errors="coerce").mean(axis=1)
     if cau:

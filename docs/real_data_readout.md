@@ -68,3 +68,72 @@ cohorts), all row-level ("sample-level") claims, the top-10 = full-panel claim.
    progression claim.
 2. CSF (`--tissue CSF`, `--tissue PLA+CSF`, then `compare_runs`).
 3. Serum NfL as comparator (`extra_biomarkers`).
+
+---
+
+# Third run (2026-09-23): within-person coupling (§5d) and DaTSCAN targets
+
+Severity, progression, protein and panel-reduction numbers are unchanged from the
+run above (same cache, same seed). New evidence:
+
+## Within-person coupling — small, positive, replicated
+Mixed model `UPDRS ~ score_within + score_between + years + (1 | participant)` on PD
+participants with ≥ 2 visit-matched plasma samples (PPMI 97 / 431 samples; PDBP
+84 / 324).
+
+| | PPMI (OOF score) | PDBP (transported score) |
+|---|---|---|
+| within β per SD (UPDRS points) | 0.49 [−0.32, 1.30], p = 0.24 | **1.72 [0.69, 2.76], p = 0.001** |
+| between β per SD | 3.70, p = 0.014 | 7.30, p < 0.001 |
+| ρ(Δscore, ΔUPDRS), consecutive visits | **0.176 [0.05, 0.30]** (334 pairs) | **0.148 [0.01, 0.29]** (240 pairs) |
+| ρ(slope score, slope UPDRS) | −0.12 [−0.34, 0.10] (93) | 0.11 [−0.10, 0.31] (84) |
+| PD-only refit, within β | 0.17 [−0.62, 0.96] | 1.22 [0.17, 2.26], p = 0.022 |
+
+Reading: the score does move with a person's own motor change, and the
+consecutive-visit Δ correlation is positive with CI excluding zero in *both* cohorts.
+But the effect is small — ρ ≈ 0.15–0.18 is 2–3 % shared variance, and the within
+β is one fifth of the between β. Per-participant slopes do not correlate (too few
+samples per person: median 3–4). DaTSCAN within-person: null on 23 participants /
+49 same-visit scans (too small to say anything).
+
+Protein level (locked 40): 0/40 replicate at p < 0.05 in both cohorts; 30/40 same
+sign. Q5ZPR3 (PDBP within p = 0.013, PPMI 0.09) and P11215 (PDBP 0.026) are the
+candidates; neither survives 40 tests.
+
+**Framing:** "a plasma-proteomic severity correlate that also tracks within-person
+change, weakly (ρ ≈ 0.15, replicated), and is dominated by between-person
+differences". This is a legitimate, previously unreported longitudinal property of a
+plasma Olink score in PD. It is not a monitoring biomarker in any practical sense:
+1.7 UPDRS points per within-person SD is below the MCID and the score would not
+detect an individual's change.
+
+**Open confound:** within-person UPDRS change and within-person score change could
+both be driven by dose escalation (DDC / P20711 rises with levodopa-DDCi exposure and
+carries a positive weight). The next run reports a medication-state-adjusted within
+β and the Δ-correlation restricted to consecutive visits in the same exam state;
+`--exclude_proteins P20711 --out_dir results_noDDC` gives the DDC-free version. If
+the within β survives both, the confound is unlikely.
+
+## DaTSCAN as an objective target
+* Cross-endpoint (§3j, PPMI only, score never saw imaging): caudate SBR ρ = −0.33
+  [−0.52, −0.11], striatum −0.28 [−0.48, −0.05], putamen −0.13 [−0.35, +0.11]
+  (n = 71 PD participants). Direction is right (higher predicted severity, lower
+  dopamine-transporter binding). Putamen is floored early in PD, which is why caudate
+  carries the range. **This is the reviewer-proof "objective correlate" line — use it.**
+  It cannot replicate in PDBP (no DaTSCAN).
+* Discovery target *annualised putamen SBR change* (n = 70, nested CV): no proteomic
+  signal (best proteomic ρ 0.15 vs clinical 0.19). Clean null at low power.
+* Discovery target *baseline putamen SBR*: only 7 participants matched because PPMI's
+  screening scan is recorded before the baseline visit and was not being keyed to
+  M0. Fixed (negative-month scans → M0; baseline scan = closest within −12/+6 months of
+  the baseline sample). Re-run with `--force_assembly` to populate it.
+
+## What to say in the paper (updated)
+1. Replicated modest plasma-proteomic correlate of motor severity within PD
+   (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.
+2. It correlates with caudate DaT binding in PPMI (ρ −0.33) — rater-independent.
+3. It tracks within-person change weakly but reproducibly (Δ-ρ 0.18 / 0.15).
+4. Compressible to 12 proteins; Q5ZPR3, P11215, DDC replicate at the protein level
+   (DDC flagged as levodopa-responsive; DDC-free sensitivity run reported).
+5. Pre-specified negative: baseline proteome does not predict progression beyond
+   clinical scoring (126 configurations, TEST once, nothing excludes zero).

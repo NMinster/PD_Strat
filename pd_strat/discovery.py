@@ -129,20 +129,29 @@ def _targets(clin, y_all, base: pd.DataFrame, mask_rows: np.ndarray) -> pd.DataF
     out["slope_per_year"] = slope; out["delta_24m"] = delta24
     out["n_visits"] = n_vis; out["span_months"] = span
     # DaTSCAN targets (objective; PPMI only): baseline putamen SBR and its
-    # annualised change over >= 12 months of follow-up scans
+    # annualised change over >= 12 months of follow-up scans.  The baseline
+    # scan is the one closest to the baseline proteomic sample within
+    # [-12, +6] months (PPMI scans at screening, before the baseline visit;
+    # some participants' first usable sample is a later visit).
     if "datscan_putamen" in clin.columns:
         dat = pd.to_numeric(clin["datscan_putamen"], errors="coerce").values
         drows = pd.DataFrame({"pid": pids, "months": months, "dat": dat}).dropna()
-        d0, dsl = [], []
+        d0, dsl, dlag = [], [], []
         for _, r in out.iterrows():
-            g = drows[(drows["pid"] == r["pid"]) & (drows["months"] >= r["m0"] - 6)].sort_values("months")
-            near = g[(g["months"] - r["m0"]).abs() <= 6]
-            d0.append(float(near["dat"].iloc[0]) if len(near) else np.nan)
+            g = drows[(drows["pid"] == r["pid"]) & (drows["months"] >= r["m0"] - 12)].sort_values("months")
+            lag = g["months"] - r["m0"]
+            near = g[(lag >= -12) & (lag <= 6)]
+            if len(near):
+                k = (near["months"] - r["m0"]).abs().idxmin()
+                d0.append(float(near.loc[k, "dat"])); dlag.append(float(near.loc[k, "months"] - r["m0"]))
+            else:
+                d0.append(np.nan); dlag.append(np.nan)
             if len(g) >= 2 and g["months"].max() - g["months"].min() >= 12:
                 dsl.append(12 * np.polyfit(g["months"].values, g["dat"].values, 1)[0])
             else:
                 dsl.append(np.nan)
-        out["datscan_putamen_bl"] = d0; out["datscan_putamen_change_per_year"] = dsl
+        out["datscan_putamen_bl"] = d0; out["datscan_putamen_bl_lag_months"] = dlag
+        out["datscan_putamen_change_per_year"] = dsl
     return out
 
 

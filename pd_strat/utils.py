@@ -18,7 +18,7 @@ from scipy.stats import spearmanr, pearsonr
 
 from .config import (
     CFG, TAB, MANIFEST_PATH, META_PATH, SEED, Y_LO, Y_HI,
-    PROT_COMPLETENESS_THRESHOLD,
+    PROT_COMPLETENESS_THRESHOLD, PROJECT_ROOT,
 )
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -135,13 +135,128 @@ def short_sha(cols) -> str:
     return hashlib.sha1("\n".join(map(str, cols)).encode()).hexdigest()[:12]
 
 
-def load_protein_annotation() -> Dict[str, str]:
-    """UniProt accession -> gene symbol, from results/tables/protein_annotation.csv."""
+_GENE_CACHE = PROJECT_ROOT / "docs" / "uniprot_gene_map.csv"
+_CURATED = PROJECT_ROOT / "docs" / "literature_proteins.yaml"
+
+
+def _base_accession(key: str) -> str:
+    """'CSF:P06756-2' -> 'P06756' (tissue prefix and isoform suffix removed)."""
+    k = str(key).split(":", 1)[-1].strip()
+    return k.split("-", 1)[0].split(",", 1)[0]
+
+
+def _read_gene_sources() -> Dict[str, str]:
+    """Accession -> gene from every local source (Olink export, cache, curated list)."""
+    m: Dict[str, str] = {}
+    if _CURATED.exists():
+        try:
+            import yaml
+            data = yaml.safe_load(open(_CURATED, encoding="utf-8")) or {}
+            prots = data.get("proteins", {}) if isinstance(data, dict) else {}
+            items = prots.items() if isinstance(prots, dict) else \
+                [(e.get("uniprot"), e) for e in prots if isinstance(e, dict)]
+            for u, entry in items:
+                g = (entry or {}).get("gene") if isinstance(entry, dict) else None
+                if u and g:
+                    m[str(u)] = str(g)
+        except Exception:
+            pass
+    if _GENE_CACHE.exists():
+        df = pd.read_csv(_GENE_CACHE, dtype=str).fillna("")
+        m.update({u: g for u, g in zip(df["uniprot"], df["gene"]) if g})
     p = TAB / "protein_annotation.csv"
-    if not p.exists():
+    if p.exists():
+        df = pd.read_csv(p, dtype=str).fillna("")
+        m.update({u: g for u, g in zip(df["uniprot"], df["gene"]) if g})
+    return m
+
+
+def load_protein_annotation() -> Dict[str, str]:
+    """UniProt accession -> gene symbol (Olink export, cached UniProt lookup, curated list).
+
+    Keys with a tissue prefix ('PLA:', 'CSF:') resolve through the bare accession.
+    """
+    m = _read_gene_sources()
+    if not m:
         return {}
-    df = pd.read_csv(p, dtype=str)
-    return dict(zip(df["uniprot"], df["gene"].fillna("")))
+
+    class _Annot(dict):
+        def get(self, key, default=""):
+            if key in self:
+                return dict.get(self, key)
+            base = _base_accession(key)
+            if base in self:
+                g = dict.get(self, base)
+                return f"{str(key).split(':', 1)[0]}:{g}" if ":" in str(key) else g
+            return default
+    return _Annot(m)
+
+
+def _uniprot_fetch(accessions: List[str], timeout: float = 30.0) -> Dict[str, str]:
+    """Batch query rest.uniprot.org for primary gene symbols."""
+    import urllib.request
+    import urllib.parse
+    out: Dict[str, str] = {}
+    for i in range(0, len(accessions), 100):
+        chunk = accessions[i:i + 100]
+        q = " OR ".join(f"accession:{a}" for a in chunk)
+        url = ("https://rest.uniprot.org/uniprotkb/search?"
+               + urllib.parse.urlencode({"query": q, "fields": "accession,gene_primary",
+                                         "format": "tsv", "size": 500}))
+        req = urllib.request.Request(url, headers={"User-Agent": "pd_strat/2.1 (gene-symbol lookup)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            txt = resp.read().decode("utf-8", errors="replace")
+        for line in txt.splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                out[parts[0].strip()] = parts[1].strip().split(";")[0].strip()
+    return out
+
+
+def ensure_gene_annotation(prot_cols: List[str]) -> Dict[str, str]:
+    """Make sure every modelled protein has a gene symbol where one can be had.
+
+    Olink exports from AMP-PD carry only UniProt accessions.  Accessions not
+    annotated by the export or the local cache are looked up on UniProt (when
+    ``uniprot_lookup`` is on and the network allows) and cached in
+    docs/uniprot_gene_map.csv so later runs and --report_only stay offline.
+    """
+    from .config import UNIPROT_LOOKUP
+    have = _read_gene_sources()
+    bases = sorted({_base_accession(c) for c in prot_cols})
+    missing = [b for b in bases if b and b not in have]
+    print(f"\n[Annotation] {len(bases)} accessions; {len(bases) - len(missing)} with gene symbol")
+    fetched: Dict[str, str] = {}
+    if missing and UNIPROT_LOOKUP:
+        try:
+            fetched = _uniprot_fetch(missing)
+            print(f"  [Annotation] UniProt lookup: {len(fetched)}/{len(missing)} resolved")
+        except Exception as e:  # offline / proxy / rate limit -> accessions only
+            print(f"  [Annotation] UniProt lookup unavailable ({type(e).__name__}: {e}); "
+                  f"tables will show accessions for {len(missing)} proteins. "
+                  f"Set uniprot_lookup: false to silence.")
+    elif missing:
+        print(f"  [Annotation] uniprot_lookup off; {len(missing)} proteins without symbol")
+    if fetched:
+        rows = [{"uniprot": u, "gene": g, "source": "uniprot_rest"} for u, g in fetched.items()]
+        if _GENE_CACHE.exists():
+            old = pd.read_csv(_GENE_CACHE, dtype=str).fillna("")
+            rows = old.to_dict("records") + [r for r in rows if r["uniprot"] not in set(old["uniprot"])]
+        _GENE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).drop_duplicates("uniprot").sort_values("uniprot").to_csv(_GENE_CACHE, index=False)
+        have.update(fetched)
+    # results-local table used by the report and figures
+    def _sym(c: str) -> str:
+        g = have.get(_base_accession(c), "")
+        return f"{c.split(':', 1)[0]}:{g}" if (g and ":" in c) else g
+    rows = [{"uniprot": c, "gene": _sym(c)} for c in prot_cols]
+    p = TAB / "protein_annotation.csv"
+    if p.exists():
+        old = pd.read_csv(p, dtype=str).fillna("")
+        extra = old[~old["uniprot"].isin({r["uniprot"] for r in rows})]
+        rows += extra[["uniprot", "gene"]].to_dict("records")
+    pd.DataFrame(rows).drop_duplicates("uniprot").to_csv(p, index=False)
+    return load_protein_annotation()
 
 
 def load_json(p: Path) -> dict:

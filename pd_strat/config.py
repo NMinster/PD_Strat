@@ -194,6 +194,9 @@ SEVERITY_POPULATION = str(_cfg("severity_population", "all")).lower()
 
 # ── Resampling / inference knobs ───────────────────────────────────────────
 N_PERMUTATIONS  = int(_cfg("n_permutations", 100))
+# UniProt accession -> gene symbol via rest.uniprot.org for accessions the
+# Olink files do not annotate (cached in docs/uniprot_gene_map.csv)
+UNIPROT_LOOKUP  = bool(_cfg("uniprot_lookup", True))
 STABILITY_B     = int(_cfg("stability_B", 200))
 PAIRED_BOOT_B   = int(_cfg("paired_boot_B", 1000))
 PLR_BOOT_B      = int(_cfg("participant_boot_B", 2000))

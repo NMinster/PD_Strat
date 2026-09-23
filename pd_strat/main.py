@@ -124,6 +124,9 @@ def main():
     USE_PANEL_AWARE   = feat["USE_PANEL_AWARE"]
     summary_update({"d_prot": int(d_prot), "d_rna": int(d_rna),
                     "panel_aware": bool(USE_PANEL_AWARE)})
+    # gene symbols for every modelled accession (Olink export / cache / UniProt)
+    from .utils import ensure_gene_annotation
+    _stage("gene_annotation", ensure_gene_annotation, prot_cols, optional=True)
 
     # ── §4  Targets, masks, CV ────────────────────────────────────────
     if SEVERITY_POPULATION == "pd_only":

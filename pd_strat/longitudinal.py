@@ -45,6 +45,16 @@ def _frame(clin, y_all, pos, pred, is_pd) -> pd.DataFrame:
                        "months": months[p], "y": y_all[p], "score": pred[m], "pos": p})
     if "datscan_putamen" in clin.columns:
         df["dat"] = pd.to_numeric(clin["datscan_putamen"].iloc[p], errors="coerce").values
+    # time-varying medication context of the exam: Part III state (ON/OFF/UNK)
+    # combined with the visit-level "on PD medication" flag when present
+    state = np.array(["UNK"] * len(p), dtype=object)
+    if "updrs3_state" in clin.columns:
+        state = clin["updrs3_state"].iloc[p].astype(str).str.upper().replace({"NAN": "UNK"}).values.astype(object)
+    flag = np.array(["?"] * len(p), dtype=object)
+    if "pd_medicated" in clin.columns:
+        pm = pd.to_numeric(clin["pd_medicated"].iloc[p], errors="coerce").values
+        flag = np.where(pm == 1, "treated", np.where(pm == 0, "untreated", "?")).astype(object)
+    df["med"] = np.char.add(np.char.add(state.astype(str), "|"), flag.astype(str))
     return df.sort_values(["pid", "months"]).reset_index(drop=True)
 
 
@@ -88,15 +98,41 @@ def coupling(df: pd.DataFrame, target: str = "y", label: str = "") -> Dict[str, 
     if fb:
         out.update({"between_beta_per_SD": fb["beta"], "between_ci_lo": fb["ci_lo"],
                     "between_ci_hi": fb["ci_hi"], "between_p": fb["p"]})
+    # Sensitivity: exam medication state as a time-varying covariate.  Dose
+    # escalation tracks progression, and levodopa-responsive proteins (DDC)
+    # would couple to UPDRS through treatment rather than pathology; if the
+    # within beta survives this adjustment that route is less likely.
+    if "med" in d.columns:
+        lv = d["med"].value_counts()
+        lv = lv[lv >= 10]
+        if len(lv) >= 2:
+            dm = d[d["med"].isin(lv.index)].copy()
+            fm = _fit_mixed("tgt ~ score_w + score_b + years + C(med)", dm, dm["pid"], "score_w")
+            out["medadj_levels"] = "/".join(f"{k}:{int(v)}" for k, v in lv.items())
+            if fm:
+                out.update({"within_beta_medadj": fm["beta"], "within_ci_lo_medadj": fm["ci_lo"],
+                            "within_ci_hi_medadj": fm["ci_hi"], "within_p_medadj": fm["p"]})
+            else:
+                # e.g. medication state changes in lock-step with visit time
+                out["medadj_note"] = "not estimable (medication state collinear with time / participant)"
     # consecutive-visit differences
     dd = d.groupby("pid")[["months", "score", "tgt"]].diff().dropna()
     dd["pid"] = d.loc[dd.index, "pid"].values
+    if "med" in d.columns:
+        prev = d.groupby("pid")["med"].shift()
+        dd["same_med"] = (d.loc[dd.index, "med"].values == prev.loc[dd.index].values)
     dd = dd[dd["months"] > 0]
     if len(dd) >= 20:
         out["n_consecutive_pairs"] = int(len(dd))
         out["rho_delta_score_delta_target"] = spearman_np(dd["score"].values, dd["tgt"].values)
         lo, hi = _boot_rho(dd["score"].values, dd["tgt"].values, dd["pid"].values)
         out["rho_delta_ci_lo"], out["rho_delta_ci_hi"] = lo, hi
+        if "same_med" in dd.columns and dd["same_med"].sum() >= 20:
+            ds = dd[dd["same_med"]]
+            out["n_pairs_same_medstate"] = int(len(ds))
+            out["rho_delta_same_medstate"] = spearman_np(ds["score"].values, ds["tgt"].values)
+            lo, hi = _boot_rho(ds["score"].values, ds["tgt"].values, ds["pid"].values)
+            out["rho_delta_same_medstate_ci_lo"], out["rho_delta_same_medstate_ci_hi"] = lo, hi
     # slope vs slope
     rows = []
     for pid, g in d.groupby("pid"):
@@ -155,6 +191,18 @@ def run_longitudinal(clin, z_prot, y_all, cohort, train_idx_y, oof_pred,
                       f"rho(dScore,dTarget)={r.get('rho_delta_score_delta_target', np.nan):+.3f} "
                       f"[{r.get('rho_delta_ci_lo', np.nan):+.2f}, {r.get('rho_delta_ci_hi', np.nan):+.2f}] | "
                       f"rho(slopes)={r.get('rho_slope_score_slope_target', np.nan):+.3f} (n={r.get('n_slope_pairs', 0)})")
+                if "within_beta_medadj" in r:
+                    print(f"        med-state adjusted: within b={r['within_beta_medadj']:+.2f} "
+                          f"[{r['within_ci_lo_medadj']:+.2f}, {r['within_ci_hi_medadj']:+.2f}] "
+                          f"p={r['within_p_medadj']:.3f} (levels {r['medadj_levels']}) | "
+                          f"rho(dScore,dTarget | same med state)="
+                          f"{r.get('rho_delta_same_medstate', np.nan):+.3f} "
+                          f"(n={r.get('n_pairs_same_medstate', 0)})")
+                elif "medadj_note" in r:
+                    print(f"        med-state adjusted: {r['medadj_note']} (levels {r['medadj_levels']}) | "
+                          f"rho(dScore,dTarget | same med state)="
+                          f"{r.get('rho_delta_same_medstate', np.nan):+.3f} "
+                          f"(n={r.get('n_pairs_same_medstate', 0)})")
             else:
                 print(f"  {split:<5} {model:<8} -> {tname}: insufficient longitudinal samples "
                       f"(n={r['n_participants']} participants)")
