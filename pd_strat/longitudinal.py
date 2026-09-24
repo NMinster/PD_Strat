@@ -197,6 +197,8 @@ def run_longitudinal(clin, z_prot, y_all, cohort, train_idx_y, oof_pred,
                           f"p={r['within_p_medadj']:.3f} (levels {r['medadj_levels']}) | "
                           f"rho(dScore,dTarget | same med state)="
                           f"{r.get('rho_delta_same_medstate', np.nan):+.3f} "
+                          f"[{r.get('rho_delta_same_medstate_ci_lo', np.nan):+.2f}, "
+                          f"{r.get('rho_delta_same_medstate_ci_hi', np.nan):+.2f}] "
                           f"(n={r.get('n_pairs_same_medstate', 0)})")
                 elif "medadj_note" in r:
                     print(f"        med-state adjusted: {r['medadj_note']} (levels {r['medadj_levels']}) | "

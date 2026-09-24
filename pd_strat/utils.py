@@ -192,24 +192,69 @@ def load_protein_annotation() -> Dict[str, str]:
     return _Annot(m)
 
 
-def _uniprot_fetch(accessions: List[str], timeout: float = 30.0) -> Dict[str, str]:
-    """Batch query rest.uniprot.org for primary gene symbols."""
+_UNIPROT_ACC_RE = re.compile(r"^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})$")
+
+
+def _uniprot_get(accessions: List[str], timeout: float) -> Dict[str, str]:
+    """One request to the /uniprotkb/accessions endpoint (TSV: accession, primary gene)."""
     import urllib.request
     import urllib.parse
+    url = ("https://rest.uniprot.org/uniprotkb/accessions?"
+           + urllib.parse.urlencode({"accessions": ",".join(accessions),
+                                     "fields": "accession,gene_primary", "format": "tsv"}))
+    req = urllib.request.Request(url, headers={"User-Agent": "pd_strat/2.1 (gene-symbol lookup)",
+                                               "Accept": "text/plain; format=tsv"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        txt = resp.read().decode("utf-8", errors="replace")
     out: Dict[str, str] = {}
-    for i in range(0, len(accessions), 100):
-        chunk = accessions[i:i + 100]
-        q = " OR ".join(f"accession:{a}" for a in chunk)
-        url = ("https://rest.uniprot.org/uniprotkb/search?"
-               + urllib.parse.urlencode({"query": q, "fields": "accession,gene_primary",
-                                         "format": "tsv", "size": 500}))
-        req = urllib.request.Request(url, headers={"User-Agent": "pd_strat/2.1 (gene-symbol lookup)"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            txt = resp.read().decode("utf-8", errors="replace")
-        for line in txt.splitlines()[1:]:
-            parts = line.split("\t")
-            if len(parts) >= 2 and parts[0] and parts[1]:
-                out[parts[0].strip()] = parts[1].strip().split(";")[0].strip()
+    for line in txt.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            out[parts[0].strip()] = parts[1].strip().split(";")[0].strip()
+    return out
+
+
+def _uniprot_fetch(accessions: List[str], timeout: float = 30.0) -> Dict[str, str]:
+    """Batch query rest.uniprot.org for primary gene symbols.
+
+    Tokens that are not UniProt accessions are skipped up front; a batch the
+    server rejects (HTTP 400, one bad token spoils the batch) is bisected so the
+    good accessions still resolve.  Raises only when the *first* request fails
+    for a non-400 reason (offline, proxy, timeout).
+    """
+    import urllib.error
+    valid = [a for a in accessions if _UNIPROT_ACC_RE.match(a)]
+    if len(valid) < len(accessions):
+        print(f"  [Annotation] {len(accessions) - len(valid)} tokens are not UniProt accessions "
+              f"(e.g. {[a for a in accessions if not _UNIPROT_ACC_RE.match(a)][:3]}) -> skipped")
+    out: Dict[str, str] = {}
+    pending = [valid[i:i + 100] for i in range(0, len(valid), 100)]
+    first = True
+    while pending:
+        chunk = pending.pop(0)
+        try:
+            out.update(_uniprot_get(chunk, timeout))
+            first = False
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            if e.code == 400 and len(chunk) > 1:
+                half = len(chunk) // 2
+                pending[:0] = [chunk[:half], chunk[half:]]
+                if first:
+                    print(f"  [Annotation] UniProt rejected a batch (400: {body.strip()}); bisecting")
+                first = False
+                continue
+            if e.code == 400:
+                print(f"  [Annotation] UniProt rejected {chunk[0]} ({body.strip()})")
+                first = False
+                continue
+            if first:
+                raise
+            print(f"  [Annotation] UniProt HTTP {e.code} on a batch; continuing with what resolved")
     return out
 
 

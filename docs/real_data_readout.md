@@ -128,6 +128,32 @@ the within β survives both, the confound is unlikely.
   M0. Fixed (negative-month scans → M0; baseline scan = closest within −12/+6 months of
   the baseline sample). Re-run with `--force_assembly` to populate it.
 
+## Fourth run (2026-09-24, `--force_assembly`): DaTSCAN populated, medication sensitivity
+
+* **DaTSCAN fix confirmed**: 925 screening scans keyed to M0; baseline target now
+  77 participants (was 7); cross-endpoint n = 77: caudate ρ = −0.35 [−0.53, −0.14],
+  striatum −0.31 [−0.50, −0.10], putamen −0.20 [−0.41, +0.02].
+* **Direct prediction of DaTSCAN from the proteome is null** (nested CV, PPMI only):
+  baseline putamen SBR — proteomics-only models are *negative* (−0.11 to −0.26, i.e.
+  noise), clinical 0.23, combined 0.14; annual SBR change — proteomics 0.14 vs clinical
+  0.12, Δ CI [−0.30, +0.31]. So the imaging evidence is *correlational* (the
+  UPDRS-trained score tracks caudate DaT loss), not predictive at n ≈ 75.
+* **Within-person coupling survives medication-state adjustment in the mixed model**:
+  PDBP within β 1.72 → 1.55 [0.51, 2.58], p = 0.003; PPMI 0.49 → 0.55 [−0.26, 1.36].
+  But the consecutive-visit Δ correlation *restricted to pairs in the same exam
+  state* roughly halves: PPMI 0.176 → 0.085 (238 pairs), PDBP 0.148 → 0.099 (195
+  pairs) — CIs in `longitudinal_coupling.csv`
+  (`rho_delta_same_medstate_ci_*`). Visits that span an untreated → treated
+  transition contribute a real share of the coupling. PD-only-refit score in PDBP:
+  0.99 [−0.04, 2.02], p = 0.06 after adjustment; same-state Δ-ρ ≈ 0.
+* **DDC is medication-associated at the visit level** (locked-list screen now uses
+  `pd_medicated`/upd23a): β = 0.82 per medicated visit, p < 0.001, Bonferroni; also
+  Q9NP84. 9/40 locked proteins are nominally medication-associated (P56159 p = 0.002,
+  Q9H3G5 0.014, Q13232 0.018). This *supersedes* the earlier "DDC not
+  medication-associated" line, which used the participant-level ever-on-levodopa flag.
+  The DDC-excluded run (`--exclude_proteins P20711 --out_dir results_noDDC`) is now
+  required, not optional, and the within-person coupling should be re-read from it.
+
 ## What to say in the paper (updated)
 1. Replicated modest plasma-proteomic correlate of motor severity within PD
    (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.
