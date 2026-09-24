@@ -163,6 +163,69 @@ bootstrap Δ against the clinical model and a permutation p. The number of
 configurations tested is printed beside every result. **Only a TEST Δ whose
 CI excludes zero supports an "adds to clinical scoring" claim.**
 
+### PPMI-native Olink releases (Projects 9000, 293, 277, 314, 318, 214)
+
+The loader reads PPMI's own layout (`PATNO`, `EVENT_ID`, `UNIPROT`, `ASSAY`,
+`QC_WARNING`, `NPX`; CSV or parquet or xlsx) as well as the AMP-PD harmonised
+files. PATNOs become `PP-<patno>` so they join the AMP-PD clinical tables;
+`EVENT_ID` codes (BL, V04, …) map to months on the PPMI schedule; the `ASSAY`
+column supplies gene symbols. A panel may list several files: later files win
+for the same (participant, visit, protein), so PDBP can come from AMP-PD and
+PPMI from the bridged Project 9000 release:
+
+```yaml
+proteomics_panels:
+  PLA:
+    oncology:        [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_oncology.csv,
+                      PPMI_Project_9000_Plasma_ONC_NPX_23Sep2026.csv]
+    neurology:       [..._PLA-PPEA-D03_neurology.csv,       PPMI_Project_9000_Plasma_NEURO_NPX_23Sep2026.csv]
+    inflammation:    [..._PLA-PPEA-D03_inflammation.csv,    PPMI_Project_9000_Plasma_INF_NPX_23Sep2026.csv]
+    cardiometabolic: [..._PLA-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_Plasma_Cardio_NPX_23Sep2026.csv]
+  CSF:
+    oncology:        [..._CSF-PPEA-D03_oncology.csv,        PPMI_Project_9000_CSF_ONC_NPX_23Sep2026.csv]
+    neurology:       [..._CSF-PPEA-D03_neurology.csv,       PPMI_Project_9000_CSF_NEU_NPX_23Sep2026.csv]
+    inflammation:    [..._CSF-PPEA-D03_inflammation.csv,    PPMI_Project_9000_CSF_INF_NPX_23Sep2026.csv]
+    cardiometabolic: [..._CSF-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_CSF_Cardio_NPX_23Sep2026.csv]
+```
+
+`--tissue CSF` / `--tissue PLA+CSF` pick the matching block. A single-file
+release with a panel/block column (Olink Explore HT, Project 293 plasma or 277
+CSF) is one entry; it is split into panels by that column, and
+`prot_feature_cap` should be raised (e.g. 5000):
+
+```yaml
+proteomics_panels:
+  PLA:
+    explore_ht: ppmi_proj293_plasma_screened_extended_npx_20251121.parquet
+prot_feature_cap: 5000
+```
+
+Explore HT and Explore 1536 are different assays; do not mix them across
+cohorts inside one panel unless the overlap is what you want to model.
+
+Comparator biomarkers from a long Olink table (Target 48 Neurodegeneration,
+NULISA export) are picked by assay:
+
+```yaml
+extra_biomarkers:
+  - {name: nfl,  file: PPMI_Project_318_Plasma_23Sep2026.csv, assay: NEFL}
+  - {name: gfap, file: PPMI_Project_318_Plasma_23Sep2026.csv, assay: GFAP}
+```
+
+Before wiring a new file, look at it:
+
+```bat
+python -m pd_strat.inspect_file "S:/AMP-PD/ppmi_proj293_plasma_screened_extended_npx_20251121.parquet"
+```
+
+which prints columns, dtypes, examples, and how the pipeline would interpret
+the file (layout, participants, proteins, visits, QC values). Parquet needs
+`pyarrow`, xlsx needs `openpyxl` (both in `environment.yml`; `conda env update -f environment.yml`).
+
+Participants that are new in Project 222 / PPMI LITE and absent from the AMP-PD
+v4 clinical tables have no UPDRS row to join and are reported as unmatched by
+`[Align]`; bringing them in requires PPMI's own clinical exports.
+
 ### Plasma vs CSF vs combined
 
 ```bat

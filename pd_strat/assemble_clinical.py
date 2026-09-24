@@ -49,8 +49,13 @@ def _read(path: str) -> pd.DataFrame:
         raise FileNotFoundError(
             f"Required AMP-PD file not found: {path}\n"
             f"  -> check 'data_dir' / 'clinical_files' in config.yaml")
-    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig",
-                     dtype=str)
+    ext = Path(path).suffix.lower()
+    if ext in (".parquet", ".pq", ".xlsx", ".xls"):
+        from .olink_io import read_table
+        df = read_table(path).astype(str)
+    else:
+        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig",
+                         dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -472,6 +477,29 @@ def _load_extra_biomarkers() -> List[pd.DataFrame]:
             continue
         print(f"  Biomarker '{name}': {Path(path).name}")
         df = _read(path)
+        # Long Olink table (Target 48 / Explore / NULISA export): pick one assay
+        # by gene symbol or UniProt and use its NPX as the value
+        sel = spec.get("assay") or spec.get("uniprot")
+        if sel:
+            from .olink_io import normalize_olink
+            nd = normalize_olink(df, path, name)
+            key = "UniProt" if spec.get("uniprot") else "Assay"
+            if key not in nd.columns:
+                print(f"    [{name}] no {key} column in {list(nd.columns)[:12]} -> skipped")
+                continue
+            hit = nd[nd[key].astype(str).str.upper() == str(sel).upper()].copy()
+            if hit.empty:
+                print(f"    [{name}] assay '{sel}' not found; examples: "
+                      f"{nd[key].astype(str).drop_duplicates().head(8).tolist()} -> skipped")
+                continue
+            if "Cumulative_QC" in hit.columns:
+                hit = hit[hit["Cumulative_QC"].astype(str).str.upper() == "PASS"]
+            hit[name] = hit["NPX"]
+            if "visit_month" in hit.columns:
+                hit["visit_month"] = hit["visit_month"].astype(str)
+            df = hit.astype(str)
+            spec = {**spec, "value_col": name}
+            print(f"    [{name}] Olink long table: assay '{sel}', {len(df):,} measurements")
         pid = _find_col(df, _PID_PATTERNS, "participant_id")
         vc = spec.get("value_col")
         val = _find_col(df, [rf"^{re.escape(str(vc))}$"] if vc else [rf"^{re.escape(name)}$", name],

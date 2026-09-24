@@ -276,14 +276,31 @@ def _panel_file(tissue: str, name: str) -> str:
             f"olink-explore_protein-expression_{tissue}-PPEA-D03_{name}.csv")
 
 
-if _cfg("proteomics_panels", None) and not FLAGS.tissue:
-    _DEFAULT_PANELS = dict(_cfg("proteomics_panels"))
+_PANELS_CFG = _cfg("proteomics_panels", None)
+# `proteomics_panels` may be flat ({name: file}) or nested by tissue
+# ({PLA: {name: file}, CSF: {name: file}}); nested entries follow --tissue.
+if isinstance(_PANELS_CFG, dict) and _PANELS_CFG and \
+        all(isinstance(v, dict) for v in _PANELS_CFG.values()):
+    _by_t = {str(k).upper(): dict(v) for k, v in _PANELS_CFG.items()}
+    missing_t = [t for t in PROTEOMICS_TISSUES if t not in _by_t]
+    if missing_t:
+        raise SystemExit(f"proteomics_panels has no entry for tissue {missing_t}; "
+                         f"available: {list(_by_t)}")
+    if MULTI_TISSUE:
+        _DEFAULT_PANELS = {f"{t}_{name}": path for t in PROTEOMICS_TISSUES
+                           for name, path in _by_t[t].items()}
+    else:
+        _DEFAULT_PANELS = dict(_by_t[PROTEOMICS_TISSUES[0]])
+elif _PANELS_CFG and not FLAGS.tissue:
+    _DEFAULT_PANELS = dict(_PANELS_CFG)
 elif MULTI_TISSUE:
     _DEFAULT_PANELS = {f"{t}_{name}": _panel_file(t, name)
                        for t in PROTEOMICS_TISSUES for name in _PANEL_NAMES}
 else:
     _DEFAULT_PANELS = {name: _panel_file(PROTEOMICS_TISSUES[0], name) for name in _PANEL_NAMES}
-PROTEOMICS_PANELS: Dict[str, str] = {k: _data_path(v) for k, v in _DEFAULT_PANELS.items()}
+PROTEOMICS_PANELS: Dict[str, Any] = {
+    k: ([_data_path(str(x)) for x in v] if isinstance(v, (list, tuple)) else _data_path(str(v)))
+    for k, v in _DEFAULT_PANELS.items()}
 # panel name -> tissue tag used to prefix protein IDs in multi-tissue mode
 PANEL_TISSUE: Dict[str, str] = {k: (k.split("_", 1)[0] if MULTI_TISSUE else PROTEOMICS_TISSUES[0])
                                 for k in PROTEOMICS_PANELS}

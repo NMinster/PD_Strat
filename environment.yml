@@ -10,3 +10,5 @@ dependencies:
   - statsmodels>=0.14
   - matplotlib>=3.7
   - pyyaml>=6
+  - pyarrow>=14          # PPMI parquet releases (Projects 293, 277, 314)
+  - openpyxl>=3.1        # PPMI xlsx releases (Project 288 NULISA)

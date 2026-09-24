@@ -103,6 +103,21 @@ discovery_models: []            # [] = all; e.g. [RidgeSVD, RandomForest, HistGB
 #   python -m pd_strat.compare_runs results results_CSF results_PLA_CSF
 proteomics_tissue: "PLA"
 proteomics_panel_names: [oncology, neurology, inflammation, cardiometabolic]
+# PPMI-native releases (see README "PPMI-native Olink releases"): list several
+# files per panel; later files win for the same participant/visit/protein.
+# proteomics_panels:
+#   PLA:
+#     oncology:        [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_oncology.csv, PPMI_Project_9000_Plasma_ONC_NPX_23Sep2026.csv]
+#     neurology:       [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_neurology.csv, PPMI_Project_9000_Plasma_NEURO_NPX_23Sep2026.csv]
+#     inflammation:    [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_inflammation.csv, PPMI_Project_9000_Plasma_INF_NPX_23Sep2026.csv]
+#     cardiometabolic: [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_Plasma_Cardio_NPX_23Sep2026.csv]
+#   CSF:
+#     oncology:        [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_oncology.csv, PPMI_Project_9000_CSF_ONC_NPX_23Sep2026.csv]
+#     neurology:       [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_neurology.csv, PPMI_Project_9000_CSF_NEU_NPX_23Sep2026.csv]
+#     inflammation:    [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_inflammation.csv, PPMI_Project_9000_CSF_INF_NPX_23Sep2026.csv]
+#     cardiometabolic: [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_CSF_Cardio_NPX_23Sep2026.csv]
+# extra_biomarkers:
+#   - {name: nfl,  file: PPMI_Project_318_Plasma_23Sep2026.csv, assay: NEFL}
 prot_qc_filter: "PASS"               # Cumulative_QC value to keep
 prot_completeness: 0.50              # min fraction of proteins observed per sample
 prot_target_feature_count: 1463      # deterministic top-N feature freeze

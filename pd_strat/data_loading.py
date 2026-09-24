@@ -245,14 +245,46 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     panel_map: Dict[str, List[str]] = {}
     annot: List[Dict[str, str]] = []
 
+    from .olink_io import read_table, normalize_olink
     for name, path in panels_dict.items():
-        if not os.path.exists(path):
+        # a panel may come from several files (e.g. AMP-PD file for PDBP +
+        # PPMI Project 9000 file for PPMI); later files win for the same
+        # (participant, visit, protein)
+        paths = [p for p in (path if isinstance(path, (list, tuple)) else [path])]
+        paths = [str(p) for p in paths if os.path.exists(str(p))]
+        if not paths:
             print(f"  [WARN] Panel '{name}' not found: {path}")
             continue
-        df = pd.read_csv(path, low_memory=False)
-        df["panel"] = name
+        parts = []
+        for p in paths:
+            d = normalize_olink(read_table(p), p, name)
+            print(f"  {name}: {Path(p).name}: {len(d):,} rows, layout={d.attrs.get('layout')}, "
+                  f"{d['participant_id'].nunique():,} participants")
+            d["_src"] = len(parts)
+            parts.append(d)
+        df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        if len(parts) > 1 and "visit_month" in df.columns:
+            key = ["participant_id", "visit_month", "UniProt"]
+            n0 = len(df)
+            df = df.sort_values("_src", kind="stable").drop_duplicates(key, keep="last")
+            print(f"  {name}: {n0 - len(df):,} measurements present in more than one file -> "
+                  f"kept the later file's value")
+        df = df.drop(columns=["_src"])
         if not panel_dfs:
-            print(f"  [Panel columns] {list(df.columns)}")
+            print(f"  [Panel columns] {list(df.columns)}  (layout: {df.attrs.get('layout')})")
+        split_col = next((c for c in ["panel", "Block", "block", "BLOCK"]
+                          if c in df.columns and df[c].nunique() > 1), None)
+        if split_col is not None and len(panels_dict) == 1:
+            # one file carrying several panels / blocks (Explore HT, 3072): keep
+            # them as separate panels so panel-aware modelling still applies
+            sub = []
+            for pn, g in df.groupby(df[split_col].astype(str)):
+                g = g.copy(); g["panel"] = f"{name}_{re.sub(r'[^A-Za-z0-9]+', '_', pn).strip('_').lower()}"
+                sub.append(g)
+            df = pd.concat(sub, ignore_index=True)
+            print(f"  {name}: split into {df['panel'].nunique()} panels by the file's panel/block column")
+        else:
+            df["panel"] = name
         if MULTI_TISSUE:
             # keep plasma and CSF measurements of the same protein distinct
             df["UniProt"] = PANEL_TISSUE[name] + ":" + df["UniProt"].astype(str)
@@ -278,7 +310,8 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
         else:
             print(f"  {name}: {df.shape[0]:,} rows, "
                   f"{df['UniProt'].nunique()} proteins")
-        panel_map[name] = sorted(df["UniProt"].dropna().unique().tolist())
+        for pn, g in df.groupby(df["panel"].astype(str)):
+            panel_map[pn] = sorted(g["UniProt"].dropna().unique().tolist())
         panel_dfs.append(df)
 
     if not panel_dfs:
