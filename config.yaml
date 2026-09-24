@@ -1,0 +1,142 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PD-Deep Precision Suite v2.1 — run configuration
+#
+# Every key here is optional; anything omitted falls back to the defaults in
+# pd_strat/config.py.  Command-line flags (python run.py --help) override this
+# file.  Use forward slashes in Windows paths (S:/AMP-PD) or quote them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Folder that contains the raw AMP-PD release files
+data_dir: "S:/AMP-PD"
+
+# Where results/ is written (default: <project>/results)
+# out_dir: "S:/AMP-PD/pd_strat_results"
+
+# File-name prefix shared by the AMP-PD release files
+release_prefix: "releases_2023_v4release_1027"
+
+# Raw clinical files used to assemble results/tables/clinical_unified.csv
+# (relative names are resolved against data_dir).  Defaults shown.
+clinical_files:
+  updrs_i:      "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_I.csv"
+  updrs_ii:     "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_II.csv"
+  updrs_iii:    "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_III.csv"
+  updrs_iv:     "releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_IV.csv"
+  upsit:        "releases_2023_v4release_1027_clinical_UPSIT.csv"
+  demographics: "Demographics.csv"
+  case_control: "releases_2023_v4release_1027_amp_pd_case_control.csv"
+  # optional files (skipped when absent)
+  med_history:   "releases_2023_v4release_1027_clinical_PD_Medical_History.csv"   # age at diagnosis -> disease duration
+  datscan:       "releases_2023_v4release_1027_clinical_DaTSCAN_SBR.csv"          # cross-endpoint validation
+  time_to_event: "endpoints_time_to_event.csv"                                     # Cox models (see tte_endpoints)
+
+# Assembly options
+updrs3_prefer_off_state: true        # use OFF-medication Part III rows when a visit has both ON/OFF
+updrs_part_iv_missing_as_zero: true  # Part IV absent at a visit -> 0 (I, II, III are always required)
+upsit_fill_from_baseline: true       # carry a participant's earliest UPSIT forward to later visits
+keep_other_cohorts: false            # keep participants whose ID prefix is neither TRAIN nor TEST
+
+# Time-to-event column pairs.  Auto-detected from column names when omitted;
+# set explicitly if the auto-detection message says it could not pair them.
+# tte_endpoints:
+#   - {name: "hy3", time_col: "time_to_hy3_months", event_col: "event_hy3"}
+
+# Optional external biomarkers merged by participant + visit (and carried as
+# <name>_baseline).  Added to the cross-endpoint table and used as a
+# comparator / adjuster in the Cox models.  Example for PPMI serum NfL:
+# extra_biomarkers:
+#   - {name: nfl, file: "PPMI_serum_NfL.csv", value_col: "NFL", log_transform: true}
+#   - {name: saa_positive, file: "PPMI_SAA.csv", value_col: "SAA_result"}
+
+# Cohort split (locked): PPMI (PP-) trains, PDBP (PD-) is the external test set.
+# `python run.py --reverse_cohorts` swaps them for the supplementary
+# reverse-direction run (results_reverse/).
+train_prefix: "PP-"
+test_prefix:  "PD-"
+
+# Population used to fit/evaluate the severity model.
+#   all      = every row with UPDRS: PD cases, healthy controls AND 'OTHER'
+#              case/control status (prodromal, SWEDD, ...) — legacy behaviour
+#   pd_hc    = PD cases + healthy controls only
+#   pd_only  = PD cases only  (the within-PD severity question)
+# The validity package always reports the PD-only refit (or, for pd_only,
+# the all-population refit) so both numbers are available.
+severity_population: "pd_hc"
+
+# Match each proteomic sample to its own clinical visit.  false = legacy
+# behaviour (average all of a participant's samples, broadcast to every
+# visit) — only for reproducing the old numbers.
+proteomics_visit_matching: true
+
+# Outcome-blind feature selection (3 stages, TRAIN only): MAD/observation filter,
+# |r|>0.95 redundancy pruning (higher-MAD member kept), cap by MAD rank.
+feature_selection: "mad_corr_cap"      # or "variance_topn" (legacy)
+prot_min_obs_frac: 0.30
+prot_min_mad: 0.01
+prot_corr_thresh: 0.95
+prot_feature_cap: 1168
+# Medication-sensitivity re-run: drop proteins whose plasma level is altered by
+# PD treatment (P20711 = DDC rises with levodopa/DDC-inhibitor).  Run once with
+# the list empty (primary) and once with it set, using a different out_dir.
+prot_exclude: []            # e.g. ["P20711"]
+uniprot_lookup: true        # fetch gene symbols from rest.uniprot.org for unannotated accessions (cached in docs/uniprot_gene_map.csv)
+
+# Inference knobs (lower for a quick run; manuscript defaults shown)
+n_permutations: 100        # label-permutation null for OOF rho (empirical p)
+stability_B: 200           # bootstrap stability selection resamples
+paired_boot_B: 1000        # paired participant-level model comparison
+participant_boot_B: 2000   # participant-level bootstrap CIs
+progression_min_visits: 2
+progression_min_span_months: 3
+
+# Discovery benchmark (§14): direct progression modelling, nested CV, TEST once.
+discovery_repeats: 3            # outer 5-fold repeats (3 -> 15 outer fits per config)
+discovery_inner_cv: 3
+discovery_permutations: 50      # permutation null for the selected config per target
+discovery_min_span_months: 12   # minimum follow-up to define a slope target
+discovery_models: []            # [] = all; e.g. [RidgeSVD, RandomForest, HistGBT]
+
+# Proteomics: Olink Explore panels.  PLA = plasma, CSF = cerebrospinal fluid.
+# PLA (plasma) | CSF | "PLA+CSF" (both compartments as one feature set; proteins
+# prefixed PLA:/CSF:).  Or on the command line: python run.py --tissue CSF
+# (writes to results_CSF/).  Compare runs on the same participants with:
+#   python -m pd_strat.compare_runs results results_CSF results_PLA_CSF
+proteomics_tissue: "PLA"
+proteomics_panel_names: [oncology, neurology, inflammation, cardiometabolic]
+# PPMI-native releases (see README "PPMI-native Olink releases"): list several
+# files per panel; later files win for the same participant/visit/protein.
+# proteomics_panels:
+#   PLA:
+#     oncology:        [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_oncology.csv, PPMI_Project_9000_Plasma_ONC_NPX_23Sep2026.csv]
+#     neurology:       [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_neurology.csv, PPMI_Project_9000_Plasma_NEURO_NPX_23Sep2026.csv]
+#     inflammation:    [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_inflammation.csv, PPMI_Project_9000_Plasma_INF_NPX_23Sep2026.csv]
+#     cardiometabolic: [releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_Plasma_Cardio_NPX_23Sep2026.csv]
+#   CSF:
+#     oncology:        [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_oncology.csv, PPMI_Project_9000_CSF_ONC_NPX_23Sep2026.csv]
+#     neurology:       [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_neurology.csv, PPMI_Project_9000_CSF_NEU_NPX_23Sep2026.csv]
+#     inflammation:    [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_inflammation.csv, PPMI_Project_9000_CSF_INF_NPX_23Sep2026.csv]
+#     cardiometabolic: [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_CSF_Cardio_NPX_23Sep2026.csv]
+# extra_biomarkers:
+#   - {name: nfl,  file: PPMI_Project_318_Plasma_23Sep2026.csv, assay: NEFL}
+prot_qc_filter: "PASS"               # Cumulative_QC value to keep
+prot_completeness: 0.50              # min fraction of proteins observed per sample
+prot_target_feature_count: 1463      # deterministic top-N feature freeze
+
+# Optional RNA modality — disabled unless rna_path is set (relative to data_dir
+# or absolute).  The 3 GB AMP-PD salmon gene matrix is streamed in two passes
+# (outcome-blind pre-filter to `rna_prefilter_genes` by TRAIN log-variance), so
+# peak memory is ~1-2 GB and the first load takes a few minutes; the result is
+# cached at sample level in results/tables/z_rna.csv.  Samples are matched to
+# clinical visits from the sample ID (…-BLM0T1 / -SVM12T1).
+# rna_path: "genes/releases_2023_v4release_1027_rnaseq-WB-RWTS_salmon_quantification_matrix.genes.tsv"
+rna_log1p: auto                      # auto | true | false  (log1p raw TPM/counts before z-scoring)
+rna_prefilter_genes: 15000
+rna_target_n_genes: 5000
+rna_exclude_batches: ["PP-43", "PP-70", "PP-71", "PP-74", "PP-75"]
+
+# Model / robustness knobs (locked defaults; lower boot_B / coef_boot_B for a quick run)
+n_svd_components: 128
+panel_svd_components: 32
+boot_B: 50
+coef_boot_B: 100
+seed: 42

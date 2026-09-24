@@ -1,0 +1,14 @@
+name: pd_strat
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.10
+  - scikit-learn>=1.3
+  - statsmodels>=0.14
+  - matplotlib>=3.7
+  - pyyaml>=6
+  - pyarrow>=14          # PPMI parquet releases (Projects 293, 277, 314)
+  - openpyxl>=3.1        # PPMI xlsx releases (Project 288 NULISA)

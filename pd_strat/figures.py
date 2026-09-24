@@ -14,8 +14,144 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .config import FIG, TAB, SEED
+from .config import FIG, TAB, ROB, SEED
 from .utils import spearman_np, summary
+
+
+def run_extended_figures():
+    """Figures for the validity / progression / panel-reduction packages.
+
+    Reads the CSV tables written by those modules so it can be re-run
+    stand-alone after the fact.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"figure.dpi": 300, "font.size": 8})
+    made = []
+
+    # PD-only participant-level scatter (OOF + TEST)
+    p = TAB / "predictions_pd_only.csv"
+    if p.exists():
+        df = pd.read_csv(p)
+        df["pid"] = df["participant_id"].astype(str).str.split("-").str[:2].str.join("-")
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
+        for ax, split, col in zip(axes, ("TRAIN_OOF", "TEST"), ("#3b6ea5", "#c0504d")):
+            s = df[df["split"] == split].groupby("pid")[["pred", "y"]].mean().dropna()
+            if len(s) < 5:
+                ax.set_visible(False); continue
+            ax.scatter(s["y"], s["pred"], s=10, alpha=0.6, color=col, edgecolor="none")
+            lim = [min(s["y"].min(), s["pred"].min()), max(s["y"].max(), s["pred"].max())]
+            ax.plot(lim, lim, "--", color="grey", lw=0.8)
+            ax.set_xlabel("Observed UPDRS (participant mean)")
+            ax.set_ylabel("Predicted UPDRS (participant mean)")
+            ax.set_title(f"PD only — {split.replace('_', ' ')}  ρ={spearman_np(s['pred'].values, s['y'].values):.3f}  n={len(s)}")
+        fig.tight_layout(); fig.savefig(FIG / "pd_only_participant_scatter.png"); plt.close(fig)
+        made.append("pd_only_participant_scatter.png")
+
+    # Cross-endpoint forest (PD, participant level)
+    p = TAB / "validity_cross_endpoint.csv"
+    if p.exists():
+        ce = pd.read_csv(p)
+        ce = ce[ce["population"] == "PD"]
+        if len(ce):
+            eps = list(dict.fromkeys(ce["endpoint"]))
+            fig, ax = plt.subplots(figsize=(5.2, 0.35 * len(eps) + 1.4))
+            for i, split in enumerate(("OOF", "TEST")):
+                s = ce[ce["split"] == split].set_index("endpoint").reindex(eps)
+                yv = np.arange(len(eps)) + (0.18 if split == "TEST" else -0.18)
+                ax.errorbar(s["rho_participant"], yv,
+                            xerr=[s["rho_participant"] - s["ci_lo_participant"],
+                                  s["ci_hi_participant"] - s["rho_participant"]],
+                            fmt="o" if split == "OOF" else "s", ms=4, capsize=2,
+                            color="#3b6ea5" if split == "OOF" else "#c0504d", label=split)
+            ax.axvline(0, color="grey", lw=0.8, ls="--")
+            ax.set_yticks(range(len(eps))); ax.set_yticklabels(eps); ax.invert_yaxis()
+            ax.set_xlabel("Spearman ρ with predicted severity (participant level, 95% CI)")
+            ax.legend(frameon=False); fig.tight_layout()
+            fig.savefig(FIG / "cross_endpoint_forest.png"); plt.close(fig)
+            made.append("cross_endpoint_forest.png")
+
+    # Progression: baseline predicted severity vs slope
+    frames = [pd.read_csv(TAB / f"progression_baseline_vs_slope_{s}.csv")
+              for s in ("TRAIN", "TEST") if (TAB / f"progression_baseline_vs_slope_{s}.csv").exists()]
+    if frames:
+        fig, axes = plt.subplots(1, len(frames), figsize=(3.6 * len(frames), 3.4), squeeze=False)
+        for ax, df in zip(axes[0], frames):
+            ax.scatter(df["pred0"], df["slope_per_year"], s=10, alpha=0.6, edgecolor="none")
+            m = np.isfinite(df["pred0"]) & np.isfinite(df["slope_per_year"])
+            if m.sum() > 5:
+                b = np.polyfit(df["pred0"][m], df["slope_per_year"][m], 1)
+                xs = np.linspace(df["pred0"].min(), df["pred0"].max(), 20)
+                ax.plot(xs, np.polyval(b, xs), color="k", lw=1)
+            ax.axhline(0, color="grey", lw=0.6, ls="--")
+            ax.set_xlabel("Baseline predicted UPDRS"); ax.set_ylabel("UPDRS slope (points / year)")
+            ax.set_title(f"{df['split'].iloc[0]}  ρ={spearman_np(df['pred0'].values, df['slope_per_year'].values):.3f}  n={len(df)}")
+        fig.tight_layout(); fig.savefig(FIG / "progression_baseline_vs_slope.png"); plt.close(fig)
+        made.append("progression_baseline_vs_slope.png")
+
+    # Nested cumulative-importance curve
+    p = ROB / "cumulative_importance.csv"
+    if p.exists():
+        cu = pd.read_csv(p)
+        fig, ax = plt.subplots(figsize=(4.4, 3.2))
+        ax.plot(cu["k"], cu["oof_rho"], "o-", ms=3, label="OOF (nested ranking)")
+        if "test_rho" in cu:
+            ax.plot(cu["k"], cu["test_rho"], "s--", ms=3, label="TEST (descriptive)")
+        ks = summary.get("panel_reduction", {}).get("k_star")
+        if ks:
+            ax.axvline(ks, color="grey", lw=0.8, ls=":", label=f"k* = {ks} (OOF rule)")
+        ax.set_xscale("log"); ax.set_xlabel("Number of proteins (k)"); ax.set_ylabel("Spearman ρ")
+        ax.legend(frameon=False, fontsize=7); fig.tight_layout()
+        fig.savefig(FIG / "cumulative_importance_curve.png"); plt.close(fig)
+        made.append("cumulative_importance_curve.png")
+
+    # Stability selection: top 25 inclusion frequency
+    p = ROB / "stability_selection.csv"
+    if p.exists():
+        st = pd.read_csv(p).sort_values("incl_freq_k50", ascending=False).head(25)
+        fig, ax = plt.subplots(figsize=(4.6, 0.22 * len(st) + 1))
+        ax.barh(range(len(st)), st["incl_freq_k50"], color=np.where(st["w_boot_median"] > 0, "#c0504d", "#3b6ea5"))
+        ax.set_yticks(range(len(st))); ax.set_yticklabels(st["protein"], fontsize=6); ax.invert_yaxis()
+        ax.axvline(0.8, color="grey", ls="--", lw=0.8)
+        ax.set_xlabel("Inclusion frequency in top-50 (bootstrap)  red = higher → worse")
+        fig.tight_layout(); fig.savefig(FIG / "stability_selection_top25.png"); plt.close(fig)
+        made.append("stability_selection_top25.png")
+
+    # Confirmatory forest: TRAIN vs TEST betas
+    p = ROB / "confirmatory_severity.csv"
+    if p.exists():
+        cf = pd.read_csv(p)
+        if "train_beta" in cf and "test_beta" in cf:
+            cf = cf.dropna(subset=["train_beta", "test_beta"]).head(40)
+            fig, ax = plt.subplots(figsize=(5.0, 0.22 * len(cf) + 1.2))
+            yv = np.arange(len(cf))
+            ax.errorbar(cf["train_beta"], yv - 0.18, xerr=1.96 * cf["train_se"], fmt="o", ms=3,
+                        capsize=1.5, color="#3b6ea5", label="TRAIN (descriptive)")
+            ax.errorbar(cf["test_beta"], yv + 0.18, xerr=1.96 * cf["test_se"], fmt="s", ms=3,
+                        capsize=1.5, color="#c0504d", label="TEST (replication)")
+            ax.axvline(0, color="grey", lw=0.8, ls="--")
+            ax.set_yticks(yv); ax.set_yticklabels(cf["protein"], fontsize=6); ax.invert_yaxis()
+            ax.set_xlabel("β (UPDRS points per SD protein), 95% CI"); ax.legend(frameon=False, fontsize=7)
+            fig.tight_layout(); fig.savefig(FIG / "confirmatory_forest.png"); plt.close(fig)
+            made.append("confirmatory_forest.png")
+
+    # Permutation null histogram
+    p = ROB / "permutation_null.csv"
+    if p.exists():
+        pn = pd.read_csv(p)
+        fig, ax = plt.subplots(figsize=(3.8, 2.8))
+        ax.hist(pn["rho"], bins=20, color="#bbb", edgecolor="white")
+        obs = summary.get("oof_spearman")
+        if obs is not None:
+            ax.axvline(obs, color="#c0504d", lw=1.5, label=f"observed ρ = {obs:.3f}")
+            ax.legend(frameon=False, fontsize=7)
+        ax.set_xlabel("OOF ρ under label permutation"); ax.set_ylabel("count")
+        fig.tight_layout(); fig.savefig(FIG / "permutation_null.png"); plt.close(fig)
+        made.append("permutation_null.png")
+
+    print(f"[Figures/extended] {len(made)} saved: {made}")
+    return made
 
 
 def run_figures(
@@ -66,21 +202,18 @@ def run_figures(
 
         # ── TEST raw scatter (omics-only) ────────────────────────────
         if (test_idx_omics.size > 0 and test_pred.size > 0
-                and has_any_omics is not None):
+                and prot_ok_test is not None):
             y_te = y_all[test_idx_omics]
-            mask_te_full = (np.isfinite(test_pred)
-                           & np.isfinite(y_all[test_idx]))
-            mask_te = np.zeros_like(mask_te_full, dtype=bool)
-            mask_te[has_any_omics[test_idx]] = (
-                mask_te_full[has_any_omics[test_idx]])
+            mask_te = (np.isfinite(test_pred)
+                       & np.isfinite(y_all[test_idx])
+                       & prot_ok_test)
             if mask_te.any():
                 plt.figure(figsize=(4, 4))
                 plt.scatter(y_all[test_idx][mask_te],
                             test_pred[mask_te], s=6, alpha=0.3)
                 plt.xlabel("UPDRS (true)")
                 plt.ylabel("Severity (TEST raw)")
-                rho_te = spearman_np(
-                    test_pred[has_any_omics[test_idx]], y_te)
+                rho_te = spearman_np(test_pred[prot_ok_test], y_te)
                 plt.title(f"TEST raw (omics-only) \u03c1={rho_te:.3f}")
                 m1 = min(y_all[test_idx][mask_te].min(),
                          test_pred[mask_te].min())
@@ -93,11 +226,11 @@ def run_figures(
 
         # ── TEST chosen scatter (omics-only) ─────────────────────────
         if (test_idx.size > 0 and chosen_ser is not None
-                and has_any_omics is not None):
+                and prot_ok_test is not None):
             y_te = y_all[test_idx]
             mask_te2 = (np.isfinite(chosen_ser)
                         & np.isfinite(y_te)
-                        & has_any_omics[test_idx])
+                        & prot_ok_test)
             if mask_te2.any():
                 plt.figure(figsize=(4, 4))
                 plt.scatter(y_te[mask_te2], chosen_ser[mask_te2],
@@ -218,11 +351,8 @@ def run_figures(
             data = [pd.to_numeric(values[labs == k_], errors="coerce")
                     for k_ in range(K)]
             plt.figure(figsize=(4.6, 3.6))
-            plt.boxplot(
-                [d[~np.isnan(d)] for d in data],
-                labels=[f"C{k_}" for k_ in range(K)],
-                showfliers=False,
-            )
+            plt.boxplot([d[~np.isnan(d)] for d in data], showfliers=False)
+            plt.xticks(range(1, K + 1), [f"C{k_}" for k_ in range(K)])
             plt.ylabel(ylab)
             plt.title(title)
             plt.tight_layout()

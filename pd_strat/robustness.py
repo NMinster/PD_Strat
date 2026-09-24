@@ -22,7 +22,9 @@ from scipy.stats import chi2_contingency
 from .config import (
     TAB, ROB, LOCKED, RIDGE_ALPHAS, ENET_L1_RATIOS,
     Y_LO, Y_HI, N_SVD, PANEL_SVD_NC, SEED,
-    PROT_COMPLETENESS_THRESHOLD, CFG_PROT_TARGET_N,
+    PROT_COMPLETENESS_THRESHOLD, CFG_PROT_TARGET_N, N_PERMUTATIONS,
+    FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
+    PROT_FEATURE_CAP,
 )
 from .utils import (
     map_participant_id, full_metrics, spearman_np, eta2, summary_update,
@@ -132,9 +134,9 @@ def run_robustness(clin, z_prot, X_prot, M_prot, y_all,
         rob[f"{lbl}_rho"] = rho
 
     # ── 10e Permutation negative control ────────────────────────────────
-    print("\n[10e] Permutation negative control")
+    print(f"\n[10e] Permutation negative control (n={N_PERMUTATIONS})")
     perm_rhos = []
-    for pi in range(5):
+    for pi in range(N_PERMUTATIONS):
         y_perm = y_all.copy()
         np.random.seed(SEED + 1000 + pi)
         fin_mask = np.isfinite(y_perm[train_idx])
@@ -149,9 +151,20 @@ def run_robustness(clin, z_prot, X_prot, M_prot, y_all,
             oof_p[va] = np.clip(r.predict(Z_p[vp]), Y_LO, Y_HI).astype(np.float32)
         rho = spearman_np(oof_p, y_all[train_idx_y])
         perm_rhos.append(rho)
-        print(f"    Perm {pi+1}: rho={rho:.3f}")
-    rob["perm_rho_mean"] = float(np.nanmean(perm_rhos))
-    rob["perm_rhos"] = [float(x) for x in perm_rhos]
+        if pi < 5 or (pi + 1) % 25 == 0:
+            print(f"    Perm {pi+1}: rho={rho:.3f}")
+    perm_arr = np.array(perm_rhos, dtype=float)
+    rob["perm_rho_mean"] = float(np.nanmean(perm_arr))
+    rob["perm_rho_sd"] = float(np.nanstd(perm_arr))
+    rob["perm_rho_max"] = float(np.nanmax(perm_arr))
+    rob["perm_n"] = int(len(perm_arr))
+    if np.isfinite(rho_oof):
+        rob["perm_empirical_p"] = float((1 + np.sum(perm_arr >= rho_oof)) / (len(perm_arr) + 1))
+        print(f"    Permutation null: mean={rob['perm_rho_mean']:.3f} sd={rob['perm_rho_sd']:.3f} "
+              f"max={rob['perm_rho_max']:.3f}; observed={rho_oof:.3f} -> "
+              f"empirical p={rob['perm_empirical_p']:.4f}")
+    pd.DataFrame({"perm": np.arange(1, len(perm_arr) + 1), "rho": perm_arr}).to_csv(
+        ROB / "permutation_null.csv", index=False)
 
     # ── 10f Random feature baseline ─────────────────────────────────────
     print("\n[10f] Random feature baseline")
@@ -278,17 +291,28 @@ def run_robustness(clin, z_prot, X_prot, M_prot, y_all,
         oof_fc = np.full(len(train_idx_y), np.nan, dtype=np.float32)
         for _, (tr, va) in enumerate(gkf.split(train_idx_y, y_tr_nonan, groups_train)):
             fp, vp = train_idx_y[tr], train_idx_y[va]
-            z_ft = z_prot.iloc[fp]
-            mrate_f = z_ft.notna().mean(axis=0).values
-            var_f = np.nan_to_num(z_ft.values, nan=0.0).var(axis=0)
-            keep_f = (var_f > 0) & (mrate_f > 0)
-            if keep_f.sum() == 0:
-                oof_fc[va] = np.nan; continue
-            cols_k = np.array(prot_cols)[keep_f]
-            m_k, v_k = mrate_f[keep_f], var_f[keep_f]
-            order = np.lexsort((cols_k.astype(str), -v_k, -m_k))
-            target_n = min(CFG_PROT_TARGET_N, len(order))
-            fold_ci = np.array([prot_cols_set[c] for c in cols_k[order][:target_n]])
+            if FEATURE_SELECTION == "mad_corr_cap":
+                # same 3-stage selector as the global pass, fit on the fold only
+                from .feature_selection import select_protein_features
+                fold_mask = np.zeros(len(z_prot), dtype=bool); fold_mask[fp] = True
+                import io, contextlib
+                with contextlib.redirect_stdout(io.StringIO()):
+                    Z_sel, _ = select_protein_features(
+                        z_prot, fold_mask, PROT_MIN_OBS_FRAC, PROT_MIN_MAD,
+                        PROT_CORR_THRESH, PROT_FEATURE_CAP, f"PROT_fold")
+                fold_ci = np.array([prot_cols_set[c] for c in Z_sel.columns])
+            else:
+                z_ft = z_prot.iloc[fp]
+                mrate_f = z_ft.notna().mean(axis=0).values
+                var_f = np.nan_to_num(z_ft.values, nan=0.0).var(axis=0)
+                keep_f = (var_f > 0) & (mrate_f > 0)
+                if keep_f.sum() == 0:
+                    oof_fc[va] = np.nan; continue
+                cols_k = np.array(prot_cols)[keep_f]
+                m_k, v_k = mrate_f[keep_f], var_f[keep_f]
+                order = np.lexsort((cols_k.astype(str), -v_k, -m_k))
+                target_n = min(CFG_PROT_TARGET_N, len(order))
+                fold_ci = np.array([prot_cols_set[c] for c in cols_k[order][:target_n]])
             Xp_fc = X_prot[:, fold_ci]
             sc = StandardScaler(with_mean=False); sc.fit(Xp_fc[fp])
             Xtr_fc = sc.transform(Xp_fc[fp]); Xva_fc = sc.transform(Xp_fc[vp])
@@ -470,55 +494,8 @@ def run_robustness(clin, z_prot, X_prot, M_prot, y_all,
             print(f"    [WARN] {e}")
             traceback.print_exc()
 
-    # ── 10n Confirmatory protein analysis ───────────────────────────────
-    CONFIRM_N = LOCKED["confirmatory_n_proteins"]
-    print(f"\n[10n] Confirmatory protein analysis (top {CONFIRM_N})")
-    pi_path = ROB / "protein_importance.csv"
-    if pi_path.exists() and len(train_idx_y) >= 30:
-        prot_imp_df = pd.read_csv(pi_path)
-        if "sign_consistency" not in prot_imp_df.columns:
-            prot_imp_df["sign_consistency"] = 1.0
-        prot_imp_df["stable_importance"] = (
-            prot_imp_df.get("sign_consistency", 1.0) * prot_imp_df["abs_importance"])
-        confirm_list = (prot_imp_df.sort_values("stable_importance", ascending=False)
-                        .head(CONFIRM_N)["protein"].tolist())
-        pd.DataFrame({"protein": confirm_list}).to_csv(
-            ROB / "confirmatory_protein_list.csv", index=False)
-        print(f"    Locked: {len(confirm_list)} proteins, top 5: {confirm_list[:5]}")
-
-        try:
-            import statsmodels.formula.api as smf
-            prot_name_to_idx = {c: i for i, c in enumerate(prot_cols)}
-
-            # Severity mixed models
-            sev_rows = []
-            for prot in confirm_list:
-                cidx = prot_name_to_idx.get(prot)
-                if cidx is None: continue
-                pids = np.array([map_participant_id(str(x))
-                                 for x in clin.index[train_idx_y]])
-                dft = pd.DataFrame({
-                    f"p_{prot}": z_prot.iloc[train_idx_y, cidx].values,
-                    "updrs": y_all[train_idx_y], "pid": pids,
-                }).dropna()
-                if len(dft) < 20 or dft["pid"].nunique() < 10: continue
-                pcol = f"p_{prot}"
-                try:
-                    md = smf.mixedlm(f"updrs ~ {pcol}", dft, groups=dft["pid"])
-                    res = md.fit(reml=True, method="lbfgs", maxiter=300)
-                    beta = float(res.fe_params.get(pcol, np.nan))
-                    pval = float(res.pvalues.get(pcol, np.nan))
-                    sev_rows.append({"protein": prot, "train_beta": beta,
-                                     "train_pval": pval, "train_n": len(dft)})
-                except Exception:
-                    pass
-            if sev_rows:
-                sev_df = pd.DataFrame(sev_rows).sort_values("train_pval")
-                sev_df.to_csv(ROB / "confirmatory_severity.csv", index=False)
-                n_sig = (sev_df["train_pval"] < 0.05).sum()
-                print(f"    Severity: {n_sig}/{len(sev_df)} nominal p<0.05")
-        except ImportError:
-            print("    [SKIP] statsmodels not available")
+    # 10n (confirmatory protein analysis) now lives in confirmatory.py and
+    # runs after panel_reduction so the locked list is stability-weighted.
 
     # Save robustness
     pd.DataFrame([{k: v for k, v in rob.items()
