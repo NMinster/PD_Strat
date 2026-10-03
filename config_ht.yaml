@@ -1,0 +1,84 @@
+# Olink Explore HT run (PPMI only; ~5,400 proteins): plasma from Project 314 (PPMI LITE,
+# 2,267 participants), CSF from Project 277. PDBP has no HT data, so 30% of PPMI
+# participants are held out as TEST (deterministic, participant-level). Report it as an
+# internal holdout, not an external cohort.
+#   python run.py --config config_ht.yaml --out_dir results_ht
+#   python run.py --config config_ht.yaml --out_dir results_ht_CSF --tissue CSF
+# Generated from config.yaml; all other settings identical. Needs ~3 GB RAM and pyarrow.
+
+data_dir: S:/AMP-PD
+release_prefix: releases_2023_v4release_1027
+clinical_files:
+  updrs_i: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_I.csv
+  updrs_ii: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_II.csv
+  updrs_iii: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_III.csv
+  updrs_iv: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_IV.csv
+  upsit: releases_2023_v4release_1027_clinical_UPSIT.csv
+  demographics: Demographics.csv
+  case_control: releases_2023_v4release_1027_amp_pd_case_control.csv
+  med_history: releases_2023_v4release_1027_clinical_PD_Medical_History.csv
+  datscan: releases_2023_v4release_1027_clinical_DaTSCAN_SBR.csv
+  time_to_event: endpoints_time_to_event.csv
+updrs3_prefer_off_state: true
+updrs_part_iv_missing_as_zero: true
+upsit_fill_from_baseline: true
+keep_other_cohorts: false
+train_prefix: PP-
+test_prefix: PD-
+severity_population: pd_hc
+proteomics_visit_matching: true
+feature_selection: mad_corr_cap
+prot_min_obs_frac: 0.3
+prot_min_mad: 0.01
+prot_corr_thresh: 0.95
+prot_feature_cap: 5000
+prot_exclude: []
+uniprot_lookup: true
+n_permutations: 100
+stability_B: 200
+paired_boot_B: 1000
+participant_boot_B: 2000
+progression_min_visits: 2
+progression_min_span_months: 3
+discovery_repeats: 3
+discovery_inner_cv: 3
+discovery_permutations: 50
+discovery_min_span_months: 12
+discovery_models: []
+proteomics_tissue: PLA
+proteomics_panel_names:
+- oncology
+- neurology
+- inflammation
+- cardiometabolic
+prot_qc_filter: PASS
+prot_completeness: 0.5
+prot_target_feature_count: 1463
+rna_log1p: auto
+rna_prefilter_genes: 15000
+rna_target_n_genes: 5000
+rna_exclude_batches:
+- PP-43
+- PP-70
+- PP-71
+- PP-74
+- PP-75
+n_svd_components: 128
+panel_svd_components: 32
+boot_B: 50
+coef_boot_B: 100
+seed: 42
+proteomics_panels:
+  PLA:
+    explore_ht: ppmi_proj314_plasma_screened_extended_npx_20260522.parquet
+  CSF:
+    explore_ht: PPMI_Project_277_CSF_Screened_NPX_20260130.parquet
+holdout_fraction: 0.3
+holdout_seed: 2026
+extra_biomarkers:
+- name: nfl
+  file: PPMI_Project_318_Plasma_23Sep2026.csv
+  assay: NEFL
+- name: gfap
+  file: PPMI_Project_318_Plasma_23Sep2026.csv
+  assay: GFAP

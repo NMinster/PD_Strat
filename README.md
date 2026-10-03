@@ -165,6 +165,17 @@ CI excludes zero supports an "adds to clinical scoring" claim.**
 
 ### PPMI-native Olink releases (Projects 9000, 293, 277, 314, 318, 214)
 
+Two ready-made configs sit next to `config.yaml` and need no editing:
+
+```bat
+python run.py --config config_9000.yaml --out_dir results_9000    :: Explore 1536: AMP-PD (PDBP) + Project 9000 (PPMI), NfL/GFAP comparators
+python run.py --config config_ht.yaml   --out_dir results_ht      :: Explore HT: Project 314 plasma, 30% PPMI holdout as TEST
+python run.py --config config_ht.yaml   --out_dir results_ht_CSF --tissue CSF
+```
+
+The banner lists the files behind every panel, so a run that silently fell back
+to the AMP-PD files is visible at the top of the log.
+
 The loader reads PPMI's own layout (`PATNO`, `EVENT_ID`, `UNIPROT`, `ASSAY`,
 `QC_WARNING`, `NPX`; CSV or parquet or xlsx) as well as the AMP-PD harmonised
 files. PATNOs become `PP-<patno>` so they join the AMP-PD clinical tables;

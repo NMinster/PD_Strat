@@ -258,7 +258,9 @@ def normalize_olink(df: pd.DataFrame, path: str = "", label: str = "") -> pd.Dat
             if bad.any():
                 q = q.astype(object)
                 q[bad] = "ASSAY_" + aq.astype(object)[bad]
-        df["Cumulative_QC"] = pd.Categorical(q.astype(object))
+        q = q.astype(object)
+        q[pd.isna(q)] = "PASS"          # no flag recorded = not flagged
+        df["Cumulative_QC"] = pd.Categorical(q)
     if "NPX" in df.columns:
         df["NPX"] = pd.to_numeric(df["NPX"], errors="coerce")
     if "UniProt" in df.columns:

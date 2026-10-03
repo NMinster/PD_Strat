@@ -1,0 +1,102 @@
+# Project 9000 run: PDBP from the AMP-PD Explore 1536 files, PPMI from the bridged
+# PPMI Project 9000 release (196 + 222), NfL / GFAP comparators from Project 318.
+#   python run.py --config config_9000.yaml --out_dir results_9000
+#   python run.py --config config_9000.yaml --out_dir results_9000_CSF --tissue CSF
+# Generated from config.yaml; all other settings identical.
+
+data_dir: S:/AMP-PD
+release_prefix: releases_2023_v4release_1027
+clinical_files:
+  updrs_i: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_I.csv
+  updrs_ii: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_II.csv
+  updrs_iii: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_III.csv
+  updrs_iv: releases_2023_v4release_1027_clinical_MDS_UPDRS_Part_IV.csv
+  upsit: releases_2023_v4release_1027_clinical_UPSIT.csv
+  demographics: Demographics.csv
+  case_control: releases_2023_v4release_1027_amp_pd_case_control.csv
+  med_history: releases_2023_v4release_1027_clinical_PD_Medical_History.csv
+  datscan: releases_2023_v4release_1027_clinical_DaTSCAN_SBR.csv
+  time_to_event: endpoints_time_to_event.csv
+updrs3_prefer_off_state: true
+updrs_part_iv_missing_as_zero: true
+upsit_fill_from_baseline: true
+keep_other_cohorts: false
+train_prefix: PP-
+test_prefix: PD-
+severity_population: pd_hc
+proteomics_visit_matching: true
+feature_selection: mad_corr_cap
+prot_min_obs_frac: 0.3
+prot_min_mad: 0.01
+prot_corr_thresh: 0.95
+prot_feature_cap: 1168
+prot_exclude: []
+uniprot_lookup: true
+n_permutations: 100
+stability_B: 200
+paired_boot_B: 1000
+participant_boot_B: 2000
+progression_min_visits: 2
+progression_min_span_months: 3
+discovery_repeats: 3
+discovery_inner_cv: 3
+discovery_permutations: 50
+discovery_min_span_months: 12
+discovery_models: []
+proteomics_tissue: PLA
+proteomics_panel_names:
+- oncology
+- neurology
+- inflammation
+- cardiometabolic
+prot_qc_filter: PASS
+prot_completeness: 0.5
+prot_target_feature_count: 1463
+rna_log1p: auto
+rna_prefilter_genes: 15000
+rna_target_n_genes: 5000
+rna_exclude_batches:
+- PP-43
+- PP-70
+- PP-71
+- PP-74
+- PP-75
+n_svd_components: 128
+panel_svd_components: 32
+boot_B: 50
+coef_boot_B: 100
+seed: 42
+proteomics_panels:
+  PLA:
+    oncology:
+    - releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_oncology.csv
+    - PPMI_Project_9000_Plasma_ONC_NPX_23Sep2026.csv
+    neurology:
+    - releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_neurology.csv
+    - PPMI_Project_9000_Plasma_NEURO_NPX_23Sep2026.csv
+    inflammation:
+    - releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_inflammation.csv
+    - PPMI_Project_9000_Plasma_INF_NPX_23Sep2026.csv
+    cardiometabolic:
+    - releases_2023_v4release_1027_proteomics-PLA-PPEA-D03_olink-explore_protein-expression_PLA-PPEA-D03_cardiometabolic.csv
+    - PPMI_Project_9000_Plasma_Cardio_NPX_23Sep2026.csv
+  CSF:
+    oncology:
+    - releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_oncology.csv
+    - PPMI_Project_9000_CSF_ONC_NPX_23Sep2026.csv
+    neurology:
+    - releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_neurology.csv
+    - PPMI_Project_9000_CSF_NEU_NPX_23Sep2026.csv
+    inflammation:
+    - releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_inflammation.csv
+    - PPMI_Project_9000_CSF_INF_NPX_23Sep2026.csv
+    cardiometabolic:
+    - releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_cardiometabolic.csv
+    - PPMI_Project_9000_CSF_Cardio_NPX_23Sep2026.csv
+extra_biomarkers:
+- name: nfl
+  file: PPMI_Project_318_Plasma_23Sep2026.csv
+  assay: NEFL
+- name: gfap
+  file: PPMI_Project_318_Plasma_23Sep2026.csv
+  assay: GFAP
