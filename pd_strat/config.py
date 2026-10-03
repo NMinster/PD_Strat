@@ -348,6 +348,9 @@ def print_banner():
         print(f"  Extra biomarkers     : {[b.get('name') for b in EXTRA_BIOMARKERS]}")
     print(f"  Proteomics tissue    : {PROTEOMICS_TISSUE}")
     print(f"  Proteomics panels    : {list(PROTEOMICS_PANELS.keys())}")
+    for _k, _v in PROTEOMICS_PANELS.items():
+        _files = _v if isinstance(_v, (list, tuple)) else [_v]
+        print(f"      {_k:<16}: " + ", ".join(Path(str(f)).name for f in _files))
     print(f"  QC filter            : Cumulative_QC == {PROT_QC_FILTER}")
     print(f"  Protein completeness : >={PROT_COMPLETENESS_THRESHOLD*100:.0f}%")
     print(f"  HC anchoring mode    : {HC_MODE}")

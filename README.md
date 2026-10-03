@@ -230,6 +230,12 @@ extra_biomarkers:
   - {name: gfap, file: PPMI_Project_318_Plasma_23Sep2026.csv, assay: GFAP}
 ```
 
+The banner lists the files behind every panel, and `results/tables/z_prot.csv`
+is rebuilt automatically when the panel file list (path, size, mtime) changes,
+so editing `proteomics_panels` never silently reuses an old matrix. Explore HT
+files are read column-pruned with plate controls filtered inside pyarrow and
+strings kept categorical; a 22-million-row release needs roughly 3 GB of RAM.
+
 Before wiring a new file, look at it:
 
 ```bat

@@ -9,18 +9,24 @@ Readers and column normalisation for Olink files in the two layouts we meet:
   Project 318 Target-48 CSV, Project 214 prodromal):
   SAMPLEID, PATNO ("PPMI-3004" or 3004), EVENT_ID (BL, V04, …), OLINKID,
   UNIPROT, ASSAY, MISSINGFREQ, PANEL, PLATEID, QC_WARNING, LOD, NPX
+  (Explore HT adds SampleType, AssayType, Block, SampleQC, AssayQC)
 
 ``normalize_olink`` maps the second onto the first so every downstream step
 (visit matching, QC filter, gene symbols) is layout-agnostic.  PPMI PATNOs are
 rewritten to the AMP-PD ``PP-<patno>`` form so the clinical join works for
 every participant present in the AMP-PD clinical tables.
+
+Memory: Explore HT releases are 5-22 million rows.  ``read_olink`` prunes to
+the columns the pipeline uses, filters plate controls and control assays
+inside pyarrow, and keeps string columns categorical; ``normalize_olink``
+works on unique values and never expands a categorical to object.
 """
 from __future__ import annotations
 
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -45,44 +51,132 @@ _COL_ALIASES = {
     "Assay":          ["assay", "gene", "gene_name", "gene_symbol", "symbol", "hgnc"],
     "NPX":            ["npx", "pcnormalizednpx", "extnpx", "value", "abundance"],
     "Cumulative_QC":  ["cumulative_qc", "qc_warning", "sampleqc", "sample_qc", "qc", "assayqc"],
-    "panel":          ["panel", "panel_name", "block"],
+    "panel":          ["panel", "panel_name"],
     "OlinkID":        ["olinkid", "olink_id"],
 }
+# extra columns kept when present (filters / diagnostics)
+_EXTRA_KEEP = ["sampletype", "assaytype", "assayqc", "assay_qc", "block", "plateid", "tissue_type"]
+_CTRL_ASSAY_RE = re.compile(r"^(EXT|INC|AMP|DET|CTRL)\d*$", re.I)
 
 
-def read_table(path: str, **kw) -> pd.DataFrame:
-    """CSV / TSV / parquet / xlsx by extension."""
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  readers                                                                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _wanted_columns(all_cols: List[str]) -> List[str]:
+    low = {str(c).strip().lower(): c for c in all_cols}
+    keep: List[str] = []
+    for cands in _COL_ALIASES.values():
+        for c in cands:
+            if c in low and low[c] not in keep:
+                keep.append(low[c])
+    for c in _EXTRA_KEEP:
+        if c in low and low[c] not in keep:
+            keep.append(low[c])
+    return keep
+
+
+def read_table(path: str, columns: Optional[List[str]] = None, **kw) -> pd.DataFrame:
+    """CSV / TSV / parquet / xlsx by extension (full table unless `columns`)."""
     ext = Path(path).suffix.lower()
     if ext in (".parquet", ".pq"):
         try:
-            return pd.read_parquet(path)
+            return pd.read_parquet(path, columns=columns)
         except ImportError as e:  # pragma: no cover
             raise ImportError("Reading .parquet needs pyarrow: conda install -c conda-forge pyarrow "
                               "(or pip install pyarrow)") from e
     if ext in (".xlsx", ".xls"):
-        return pd.read_excel(path, sheet_name=kw.pop("sheet_name", 0))
-    if ext in (".tsv", ".txt"):
-        return pd.read_csv(path, sep="\t", low_memory=False, **kw)
-    return pd.read_csv(path, low_memory=False, **kw)
+        return pd.read_excel(path, sheet_name=kw.pop("sheet_name", 0), usecols=columns)
+    sep = "\t" if ext in (".tsv", ".txt") else ","
+    return pd.read_csv(path, sep=sep, low_memory=False, usecols=columns, **kw)
+
+
+def table_columns(path: str) -> List[str]:
+    ext = Path(path).suffix.lower()
+    if ext in (".parquet", ".pq"):
+        import pyarrow.parquet as pq
+        return list(pq.read_schema(path).names)
+    if ext in (".xlsx", ".xls"):
+        return list(pd.read_excel(path, nrows=0).columns)
+    sep = "\t" if ext in (".tsv", ".txt") else ","
+    return list(pd.read_csv(path, sep=sep, nrows=0).columns)
+
+
+def read_olink(path: str) -> pd.DataFrame:
+    """Memory-light read of an Olink long table: only the needed columns,
+    plate controls / control assays filtered at read time, strings categorical."""
+    ext = Path(path).suffix.lower()
+    cols = _wanted_columns(table_columns(path))
+    low = {str(c).lower(): c for c in cols}
+    if ext in (".parquet", ".pq"):
+        import pyarrow.parquet as pq
+        import pyarrow.compute as pc
+        import pyarrow.dataset as ds
+        filt = None
+        if "sampletype" in low:
+            filt = pc.field(low["sampletype"]) == "SAMPLE"
+        if "assaytype" in low:
+            f2 = pc.field(low["assaytype"]) == "assay"
+            filt = f2 if filt is None else (filt & f2)
+        tbl = ds.dataset(path, format="parquet").to_table(columns=cols, filter=filt)
+        df = tbl.to_pandas(strings_to_categorical=True, self_destruct=True)
+        del tbl
+        return df
+    df = read_table(path, columns=cols)
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].astype("category")
+    return df
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  normalisation                                                           ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _map_unique(s: pd.Series, fn: Callable[[object], object]) -> pd.Series:
+    """Apply fn to the unique values only and map back (categorical-safe)."""
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        cats = s.cat.categories
+        mapping = {c: fn(c) for c in cats}
+        out = s.map(mapping)
+        return out
+    uniq = pd.unique(s)
+    mapping = {u: fn(u) for u in uniq}
+    return s.map(mapping)
+
+
+def _pid_to_amp_one(v) -> str:
+    t = str(v).strip().upper()
+    if t in ("", "NAN", "NONE", "<NA>"):
+        return ""
+    if re.match(r"^(PP|PD|BF|HB|LB|LC|SU|SY)-", t):
+        return t
+    t = re.sub(r"^PPMI[-_ ]?", "", t)
+    t = re.sub(r"\.0$", "", t)
+    return f"PP-{t}"
 
 
 def ppmi_pid_to_amp(s: pd.Series) -> pd.Series:
-    """'PPMI-3004' / 'ppmi3004' / 3004 / '3004' -> 'PP-3004'; AMP-PD ids untouched."""
-    v = s.astype(str).str.strip().str.upper()
-    is_amp = v.str.match(r"^(PP|PD|BF|HB|LB|LC|SU|SY)-")
-    digits = v.str.replace(r"^PPMI[-_ ]?", "", regex=True).str.replace(r"\.0$", "", regex=True)
-    out = np.where(is_amp, v, "PP-" + digits)
-    return pd.Series(out, index=s.index, dtype="object")
+    """'PPMI-3004' / 'ppmi3004' / 3004.0 / '3004' -> 'PP-3004'; AMP-PD ids untouched."""
+    return _map_unique(s, _pid_to_amp_one)
+
+
+def _event_to_month_one(v) -> float:
+    t = str(v).strip().upper()
+    if t in PPMI_EVENT_MONTHS:
+        return float(PPMI_EVENT_MONTHS[t])
+    m = re.match(r"^M(-?\d{1,3})$", t)
+    if m:
+        return float(m.group(1))
+    try:
+        return float(t)
+    except ValueError:
+        return np.nan
 
 
 def event_to_month(s: pd.Series) -> pd.Series:
     """PPMI EVENT_ID -> month (NaN for unscheduled / unknown codes)."""
-    v = s.astype(str).str.strip().str.upper()
-    out = v.map(PPMI_EVENT_MONTHS)
-    # already an M<n> / MONTH n token or a bare number
-    tok = pd.to_numeric(v.str.extract(r"^M(-?\d{1,3})$", expand=False), errors="coerce")
-    num = pd.to_numeric(v, errors="coerce")
-    return pd.to_numeric(out, errors="coerce").fillna(tok).fillna(num)
+    return pd.to_numeric(_map_unique(s, _event_to_month_one), errors="coerce")
 
 
 def _pick(df: pd.DataFrame, target: str) -> Optional[str]:
@@ -93,15 +187,19 @@ def _pick(df: pd.DataFrame, target: str) -> Optional[str]:
     return None
 
 
+def _upper_unique(s: pd.Series) -> pd.Series:
+    return _map_unique(s, lambda v: str(v).strip().upper())
+
+
 def normalize_olink(df: pd.DataFrame, path: str = "", label: str = "") -> pd.DataFrame:
     """Return a copy with AMP-PD-style columns whatever the input layout.
 
     Adds ``layout`` in {"amp_pd", "ppmi"} to the attrs for logging.
     """
-    df = df.copy()
+    df = df.copy(deep=False)
     df.columns = [str(c).strip() for c in df.columns]
-    is_ppmi = _pick(df, "participant_id") is not None and \
-        str(_pick(df, "participant_id")).lower() == "patno"
+    pid_src = _pick(df, "participant_id")
+    is_ppmi = pid_src is not None and str(pid_src).lower() == "patno"
     ren = {}
     for tgt in _COL_ALIASES:
         src = _pick(df, tgt)
@@ -111,23 +209,28 @@ def normalize_olink(df: pd.DataFrame, path: str = "", label: str = "") -> pd.Dat
     if "participant_id" not in df.columns:
         raise KeyError(f"{Path(path).name}: no participant column (looked for "
                        f"{_COL_ALIASES['participant_id']}); columns = {list(df.columns)[:15]}")
-    # Explore HT / Target 48 exports carry plate controls and control assays
-    # as ordinary rows; drop them before anything else.
-    n0 = len(df)
     low = {str(c).lower(): c for c in df.columns}
+
+    # ── plate controls / control assays / no participant ───────────────
+    n0 = len(df)
+    keep = pd.Series(True, index=df.index)
     if "sampletype" in low:
-        st = df[low["sampletype"]].astype(str).str.upper().str.strip()
-        df = df[st.isin(["SAMPLE", "NAN", ""])]
+        st = _upper_unique(df[low["sampletype"]])
+        keep &= st.isin(["SAMPLE", "NAN", ""]).values
     if "assaytype" in low:
-        at = df[low["assaytype"]].astype(str).str.lower()
-        df = df[at.isin(["assay", "nan", ""])]
+        at = _map_unique(df[low["assaytype"]], lambda v: str(v).strip().lower())
+        keep &= at.isin(["assay", "nan", ""]).values
     if "UniProt" in df.columns:
-        df = df[~df["UniProt"].astype(str).str.match(r"^(EXT|INC|AMP|DET|CTRL)\d*$", case=False)]
-    pid_na = df["participant_id"].isna() | df["participant_id"].astype(str).str.strip().str.lower().isin(["", "nan", "none"])
-    df = df[~pid_na]
-    if len(df) < n0:
+        bad = {u for u in pd.unique(df["UniProt"].astype(object)) if _CTRL_ASSAY_RE.match(str(u))}
+        if bad:
+            keep &= ~df["UniProt"].isin(bad).values
+    pid_txt = _map_unique(df["participant_id"], lambda v: str(v).strip().lower())
+    keep &= ~pid_txt.isin(["", "nan", "none", "<na>"]).values
+    if not keep.all():
+        df = df[keep.values]
         print(f"    [{label or Path(path).name}] dropped {n0 - len(df):,} control-sample / "
               f"control-assay / no-participant rows ({len(df):,} kept)")
+
     if is_ppmi:
         df["participant_id"] = ppmi_pid_to_amp(df["participant_id"])
         if "visit_name" in df.columns:
@@ -136,37 +239,57 @@ def normalize_olink(df: pd.DataFrame, path: str = "", label: str = "") -> pd.Dat
                 df["visit_month"] = pd.to_numeric(df["visit_month"], errors="coerce").fillna(m)
             else:
                 df["visit_month"] = m
-            unk = df.loc[df["visit_month"].isna(), "visit_name"].astype(str).value_counts().head(6)
-            if len(unk):
+            und = df.loc[df["visit_month"].isna(), "visit_name"]
+            if len(und):
+                unk = und.astype(str).value_counts().head(6)
                 print(f"    [{label or Path(path).name}] EVENT_IDs without a fixed month "
                       f"(rows dropped from visit matching): {unk.to_dict()}")
     if "Cumulative_QC" in df.columns:
-        q = df["Cumulative_QC"].astype(str).str.strip().str.upper()
-        # Olink flags: PASS / WARN / MANUAL_WARN / EXCLUDED ; AMP-PD: PASS / FAIL
-        q = pd.Series(np.where(q.isin(["PASS", "OK", "NONE", "", "NAN"]), "PASS", q), index=df.index)
+        q = _map_unique(df["Cumulative_QC"],
+                        lambda v: "PASS" if str(v).strip().upper() in ("PASS", "OK", "NONE", "", "NAN")
+                        else str(v).strip().upper())
         # Explore HT carries a separate assay-level flag; a WARN/FAIL assay is
         # dropped for every sample (it is the protein that failed, not the sample)
-        aq_col = next((low[c] for c in ("assayqc", "assay_qc") if c in low and low[c] in df.columns
-                       and low[c] != "Cumulative_QC"), None)
+        aq_col = next((low[c] for c in ("assayqc", "assay_qc") if c in low
+                       and low[c] in df.columns and low[c] != "Cumulative_QC"), None)
         if aq_col is not None:
-            aq = df[aq_col].astype(str).str.strip().str.upper()
-            bad = aq.isin(["WARN", "FAIL", "MANUAL_WARN", "EXCLUDED"])
-            q = q.where(~(bad & q.eq("PASS")), "ASSAY_" + aq)
-        df["Cumulative_QC"] = q.values
+            aq = _upper_unique(df[aq_col])
+            bad = aq.isin(["WARN", "FAIL", "MANUAL_WARN", "EXCLUDED"]).values & (q.astype(object) == "PASS").values
+            if bad.any():
+                q = q.astype(object)
+                q[bad] = "ASSAY_" + aq.astype(object)[bad]
+        df["Cumulative_QC"] = pd.Categorical(q.astype(object))
     if "NPX" in df.columns:
         df["NPX"] = pd.to_numeric(df["NPX"], errors="coerce")
     if "UniProt" in df.columns:
-        df["UniProt"] = df["UniProt"].astype(str).str.strip()
+        df["UniProt"] = _map_unique(df["UniProt"], lambda v: str(v).strip())
     df.attrs["layout"] = "ppmi" if is_ppmi else "amp_pd"
     return df
 
 
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  inspection                                                              ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _sample_rows(path: str, n: int = 200_000) -> pd.DataFrame:
+    ext = Path(path).suffix.lower()
+    if ext in (".parquet", ".pq"):
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(path)
+        return next(pf.iter_batches(batch_size=n)).to_pandas()
+    if ext in (".xlsx", ".xls"):
+        return pd.read_excel(path, nrows=n)
+    sep = "\t" if ext in (".tsv", ".txt") else ","
+    return pd.read_csv(path, sep=sep, nrows=n, low_memory=False)
+
+
 def describe_table(path: str, n: int = 3) -> str:
     """Schema summary used by `python -m pd_strat.inspect_file`."""
-    df = read_table(path)
-    lines = [f"{path}", f"  rows={len(df):,}  cols={df.shape[1]}", "  columns / dtype / n_unique / example:"]
-    for c in df.columns:
-        s = df[c]
+    head = _sample_rows(path)
+    lines = [f"{path}", f"  cols={head.shape[1]}  (column listing from the first {len(head):,} rows)",
+             "  columns / dtype / n_unique(sample) / example:"]
+    for c in head.columns:
+        s = head[c]
         try:
             nu = s.nunique(dropna=True)
         except Exception:
@@ -174,9 +297,10 @@ def describe_table(path: str, n: int = 3) -> str:
         ex = s.dropna().astype(str).head(2).tolist()
         lines.append(f"    {c:<28} {str(s.dtype):<10} {nu:>9,}  {ex}")
     lines.append("  head:")
-    lines.append(df.head(n).to_string(max_cols=20, max_colwidth=24))
+    lines.append(head.head(n).to_string(max_cols=20, max_colwidth=24))
     try:
-        nd = normalize_olink(df, path)
+        nd = normalize_olink(read_olink(path), path)
+        lines.append(f"  rows kept after control filtering: {len(nd):,}")
         lines.append(f"  normalised layout: {nd.attrs.get('layout')}; "
                      f"participants={nd['participant_id'].nunique():,}"
                      + (f"; proteins={nd['UniProt'].nunique():,}" if 'UniProt' in nd else "")
@@ -185,11 +309,12 @@ def describe_table(path: str, n: int = 3) -> str:
         if "visit_name" in nd:
             lines.append(f"  visits: {nd['visit_name'].astype(str).value_counts().head(12).to_dict()}")
         if "participant_id" in nd and "visit_month" in nd:
-            samp = nd.drop_duplicates(["participant_id", "visit_name"] if "visit_name" in nd else ["participant_id"])
+            keys = ["participant_id", "visit_name"] if "visit_name" in nd else ["participant_id"]
+            samp = nd[keys + ["visit_month"]].drop_duplicates(keys)
             n_ok = int(samp["visit_month"].notna().sum())
             lines.append(f"  samples (participant x visit): {len(samp):,}; with a fixed month: {n_ok:,}; "
                          f"participants with >= 2 dated samples: "
-                         f"{int((samp.dropna(subset=['visit_month']).groupby('participant_id').size() >= 2).sum()):,}")
+                         f"{int((samp.dropna(subset=['visit_month']).groupby('participant_id', observed=True).size() >= 2).sum()):,}")
             if "visit_name" in nd:
                 und = samp[samp["visit_month"].isna()]["visit_name"].astype(str).value_counts().head(6)
                 if len(und):

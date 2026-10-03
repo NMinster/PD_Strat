@@ -252,6 +252,20 @@ def _select_train_hc_ids(raw_index: pd.Index, is_train: pd.Series,
     return hc_ids if len(hc_ids) >= min_n else pd.Index([])
 
 
+def panel_signature(panels: Dict[str, Any]) -> str:
+    """Hash of panel file paths + sizes + mtimes (cache validity)."""
+    import hashlib
+    parts = []
+    for name, v in sorted(panels.items()):
+        for p in (v if isinstance(v, (list, tuple)) else [v]):
+            p = str(p)
+            try:
+                st = os.stat(p); parts.append(f"{name}|{p}|{st.st_size}|{int(st.st_mtime)}")
+            except OSError:
+                parts.append(f"{name}|{p}|missing")
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
+
+
 def _load_proteomics_panels(panels_dict: Dict[str, str],
                             qc_filter: str = "PASS"
                             ) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
@@ -260,7 +274,7 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     panel_map: Dict[str, List[str]] = {}
     annot: List[Dict[str, str]] = []
 
-    from .olink_io import read_table, normalize_olink
+    from .olink_io import read_olink, normalize_olink
     for name, path in panels_dict.items():
         # a panel may come from several files (e.g. AMP-PD file for PDBP +
         # PPMI Project 9000 file for PPMI); later files win for the same
@@ -275,12 +289,16 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
             continue
         parts = []
         for p in paths:
-            d = normalize_olink(read_table(p), p, name)
+            d = normalize_olink(read_olink(p), p, name)
             print(f"  {name}: {Path(p).name}: {len(d):,} rows, layout={d.attrs.get('layout')}, "
                   f"{d['participant_id'].nunique():,} participants")
             d["_src"] = len(parts)
             parts.append(d)
         df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        if len(parts) > 1:
+            for c in ("participant_id", "UniProt", "Cumulative_QC", "visit_name", "sample_id", "Assay"):
+                if c in df.columns and df[c].dtype == object:
+                    df[c] = df[c].astype("category")
         if len(parts) > 1 and "visit_month" in df.columns:
             key = ["participant_id", "visit_month", "UniProt"]
             n0 = len(df)
@@ -340,7 +358,8 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     print(f"\n  Total: {df_all.shape[0]:,} rows, "
           f"{df_all['UniProt'].nunique()} proteins, "
           f"{df_all['participant_id'].nunique()} subjects")
-    df_all["pid"] = [map_participant_id(str(i)) for i in df_all["participant_id"]]
+    from .olink_io import _map_unique
+    df_all["pid"] = _map_unique(df_all["participant_id"], lambda i: map_participant_id(str(i)))
 
     # ── visit key for each proteomic sample ─────────────────────────────
     # One proteomic *sample* per (participant, visit).  Without this the old
@@ -349,26 +368,33 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
     vkey = pd.Series(pd.NA, index=df_all.index, dtype="object")
     if PROTEOMICS_VISIT_MATCHING:
         if "visit_month" in df_all.columns:
-            mn = pd.to_numeric(df_all["visit_month"], errors="coerce")
-            vkey = mn.round().map(lambda z: f"M{int(z)}" if pd.notna(z) else pd.NA)
+            mn = pd.to_numeric(df_all["visit_month"], errors="coerce").round()
+            vkey = _map_unique(mn, lambda z: f"M{int(z)}" if pd.notna(z) else pd.NA)
         if "visit_name" in df_all.columns:
-            v = df_all["visit_name"].astype(str).str.upper()
-            tok = v.str.extract(r"\b(M\d{1,3})\b", expand=False)
-            fb = v.str.extract(r"MONTH\s*(\d{1,3})", expand=False).map(
-                lambda x: f"M{int(x)}" if pd.notna(x) else pd.NA)
-            bl = v.where(v.str.contains(r"BASELINE|^BL$|^SC$|SCREEN", regex=True)).map(
-                lambda x: "M0" if pd.notna(x) else pd.NA)
-            vkey = vkey.fillna(tok).fillna(fb).fillna(bl)
+            def _from_name(x):
+                v = str(x).upper()
+                m = re.search(r"\b(M\d{1,3})\b", v)
+                if m:
+                    return m.group(1)
+                m = re.search(r"MONTH\s*(\d{1,3})", v)
+                if m:
+                    return f"M{int(m.group(1))}"
+                return "M0" if re.search(r"BASELINE|^BL$|^SC$|SCREEN", v) else pd.NA
+            vkey = vkey.fillna(_map_unique(df_all["visit_name"], _from_name).astype(object))
         if "sample_id" in df_all.columns:
-            s = df_all["sample_id"].astype(str)
-            m_blm = s.str.extract(r"[-_][A-Z]*M(\d{1,3})T\d*", flags=re.I, expand=False).map(
-                lambda x: f"M{int(x)}" if pd.notna(x) else pd.NA)
-            vkey = vkey.fillna(m_blm)
+            def _from_sample(x):
+                m = re.search(r"[-_][A-Z]*M(\d{1,3})T\d*", str(x), flags=re.I)
+                return f"M{int(m.group(1))}" if m else pd.NA
+            vkey = vkey.fillna(_map_unique(df_all["sample_id"], _from_sample).astype(object))
     n_vk = int(vkey.notna().sum())
     if PROTEOMICS_VISIT_MATCHING and n_vk >= 0.5 * len(df_all):
-        df_all["vkey"] = vkey.fillna("M0").astype(str)
+        df_all["vkey"] = pd.Categorical(vkey.fillna("M0").astype(str))
+        df_all["pid"] = pd.Categorical(df_all["pid"].astype(object))
         wide = df_all.pivot_table(index=["pid", "vkey"], columns="UniProt",
-                                  values="NPX", aggfunc="mean")
+                                  values="NPX", aggfunc="mean", observed=True)
+        wide.index = pd.MultiIndex.from_arrays([wide.index.get_level_values(0).astype(str),
+                                                wide.index.get_level_values(1).astype(str)])
+        wide.columns = wide.columns.astype(str)
         print(f"  Wide (participant x visit): {wide.shape}  "
               f"[visit key resolved on {n_vk:,}/{len(df_all):,} rows; "
               f"{wide.index.get_level_values(0).nunique()} participants, "
@@ -377,8 +403,10 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
         if PROTEOMICS_VISIT_MATCHING:
             print("  [WARN] no visit_month / visit_name / sample_id in the Olink "
                   "files -> falling back to participant-level averaging")
+        df_all["pid"] = pd.Categorical(df_all["pid"].astype(object))
         wide = df_all.pivot_table(index="pid", columns="UniProt",
-                                  values="NPX", aggfunc="mean")
+                                  values="NPX", aggfunc="mean", observed=True)
+        wide.index = wide.index.astype(str); wide.columns = wide.columns.astype(str)
         print(f"  Wide (participant-mean, broadcast to all visits): {wide.shape}")
 
     for pname in list(panel_map.keys()):
@@ -437,9 +465,14 @@ def load_proteomics(clin: pd.DataFrame,
     panel_map_path = TAB / "panel_protein_map.json"
     panel_protein_map: Dict[str, List[str]] = {}
 
-    # Try cached (must have been built with the same visit-matching mode)
+    # Try cached: same anchoring, same visit-matching mode, and the same panel
+    # files (path + size + mtime) -- a changed proteomics_panels block rebuilds
+    sig = panel_signature(PROTEOMICS_PANELS)
+    if csv_path.exists() and meta.get("panels_sig") not in (None, sig):
+        print(f"  [Pin] cached {name_csv} was built from different panel files -> rebuilding")
     if (csv_path.exists() and meta.get("hc_mode") == HC_MODE
-            and bool(meta.get("visit_matched", False)) == bool(PROTEOMICS_VISIT_MATCHING)):
+            and bool(meta.get("visit_matched", False)) == bool(PROTEOMICS_VISIT_MATCHING)
+            and meta.get("panels_sig") in (None, sig)):
         df = pd.read_csv(csv_path, index_col=0)
         if meta.get("visit_matched"):
             keys = df.index.astype(str).str.split("|", n=1, expand=True)
@@ -561,6 +594,8 @@ def load_proteomics(clin: pd.DataFrame,
     meta_all = load_json(META_PATH)
     meta_all[name_csv] = dict(hc_mode=HC_MODE, shape=list(Z.shape), sha12=sha,
                               visit_matched=bool(visit_matched),
+                              panels_sig=panel_signature(PROTEOMICS_PANELS),
+                              panel_files={k: (v if isinstance(v, list) else [v]) for k, v in PROTEOMICS_PANELS.items()},
                               n_samples=int(Zc.notna().any(axis=1).sum()))
     json.dump(meta_all, open(META_PATH, "w"), indent=2)
     print(f"  [Pin] wrote {name_csv}: shape={Z.shape}, sha={sha}")
