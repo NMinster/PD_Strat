@@ -201,7 +201,25 @@ prot_feature_cap: 5000
 ```
 
 Explore HT and Explore 1536 are different assays; do not mix them across
-cohorts inside one panel unless the overlap is what you want to model.
+cohorts inside one panel unless the overlap is what you want to model. The
+loader drops plate controls (`SampleType != SAMPLE`), control assays
+(`AssayType != assay`, EXT/INC/AMP ids), samples without a participant, and
+any assay flagged WARN/FAIL in `AssayQC` (the protein failed, not the sample).
+`Block` is a plate layout, not a panel, so an HT file is one panel and the
+monolithic model is used.
+
+Because PDBP has no Explore HT, an HT run needs a held-out test set inside
+PPMI:
+
+```yaml
+holdout_fraction: 0.30     # deterministic participant-level holdout of the TRAIN cohort -> TEST
+holdout_seed: 2026
+```
+
+The held-out participants never enter feature selection, HC anchoring, or
+model fitting, and the usual TEST-once rule applies. Report it as an internal
+holdout, not an external cohort; PDBP on Explore 1536 remains the external
+replication for whatever overlaps.
 
 Comparator biomarkers from a long Olink table (Target 48 Neurodegeneration,
 NULISA export) are picked by assay:

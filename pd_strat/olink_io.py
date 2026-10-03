@@ -111,6 +111,23 @@ def normalize_olink(df: pd.DataFrame, path: str = "", label: str = "") -> pd.Dat
     if "participant_id" not in df.columns:
         raise KeyError(f"{Path(path).name}: no participant column (looked for "
                        f"{_COL_ALIASES['participant_id']}); columns = {list(df.columns)[:15]}")
+    # Explore HT / Target 48 exports carry plate controls and control assays
+    # as ordinary rows; drop them before anything else.
+    n0 = len(df)
+    low = {str(c).lower(): c for c in df.columns}
+    if "sampletype" in low:
+        st = df[low["sampletype"]].astype(str).str.upper().str.strip()
+        df = df[st.isin(["SAMPLE", "NAN", ""])]
+    if "assaytype" in low:
+        at = df[low["assaytype"]].astype(str).str.lower()
+        df = df[at.isin(["assay", "nan", ""])]
+    if "UniProt" in df.columns:
+        df = df[~df["UniProt"].astype(str).str.match(r"^(EXT|INC|AMP|DET|CTRL)\d*$", case=False)]
+    pid_na = df["participant_id"].isna() | df["participant_id"].astype(str).str.strip().str.lower().isin(["", "nan", "none"])
+    df = df[~pid_na]
+    if len(df) < n0:
+        print(f"    [{label or Path(path).name}] dropped {n0 - len(df):,} control-sample / "
+              f"control-assay / no-participant rows ({len(df):,} kept)")
     if is_ppmi:
         df["participant_id"] = ppmi_pid_to_amp(df["participant_id"])
         if "visit_name" in df.columns:
@@ -126,7 +143,16 @@ def normalize_olink(df: pd.DataFrame, path: str = "", label: str = "") -> pd.Dat
     if "Cumulative_QC" in df.columns:
         q = df["Cumulative_QC"].astype(str).str.strip().str.upper()
         # Olink flags: PASS / WARN / MANUAL_WARN / EXCLUDED ; AMP-PD: PASS / FAIL
-        df["Cumulative_QC"] = np.where(q.isin(["PASS", "OK", "NONE", "", "NAN"]), "PASS", q)
+        q = pd.Series(np.where(q.isin(["PASS", "OK", "NONE", "", "NAN"]), "PASS", q), index=df.index)
+        # Explore HT carries a separate assay-level flag; a WARN/FAIL assay is
+        # dropped for every sample (it is the protein that failed, not the sample)
+        aq_col = next((low[c] for c in ("assayqc", "assay_qc") if c in low and low[c] in df.columns
+                       and low[c] != "Cumulative_QC"), None)
+        if aq_col is not None:
+            aq = df[aq_col].astype(str).str.strip().str.upper()
+            bad = aq.isin(["WARN", "FAIL", "MANUAL_WARN", "EXCLUDED"])
+            q = q.where(~(bad & q.eq("PASS")), "ASSAY_" + aq)
+        df["Cumulative_QC"] = q.values
     if "NPX" in df.columns:
         df["NPX"] = pd.to_numeric(df["NPX"], errors="coerce")
     if "UniProt" in df.columns:
@@ -158,6 +184,16 @@ def describe_table(path: str, n: int = 3) -> str:
                         if 'visit_month' in nd else ""))
         if "visit_name" in nd:
             lines.append(f"  visits: {nd['visit_name'].astype(str).value_counts().head(12).to_dict()}")
+        if "participant_id" in nd and "visit_month" in nd:
+            samp = nd.drop_duplicates(["participant_id", "visit_name"] if "visit_name" in nd else ["participant_id"])
+            n_ok = int(samp["visit_month"].notna().sum())
+            lines.append(f"  samples (participant x visit): {len(samp):,}; with a fixed month: {n_ok:,}; "
+                         f"participants with >= 2 dated samples: "
+                         f"{int((samp.dropna(subset=['visit_month']).groupby('participant_id').size() >= 2).sum()):,}")
+            if "visit_name" in nd:
+                und = samp[samp["visit_month"].isna()]["visit_name"].astype(str).value_counts().head(6)
+                if len(und):
+                    lines.append(f"  undated samples by EVENT_ID: {und.to_dict()}")
         if "panel" in nd:
             lines.append(f"  panels: {nd['panel'].astype(str).value_counts().head(12).to_dict()}")
         if "Cumulative_QC" in nd:

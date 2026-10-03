@@ -118,6 +118,14 @@ proteomics_panel_names: [oncology, neurology, inflammation, cardiometabolic]
 #     cardiometabolic: [releases_2023_v4release_1027_proteomics-CSF-PPEA-D03_olink-explore_protein-expression_CSF-PPEA-D03_cardiometabolic.csv, PPMI_Project_9000_CSF_Cardio_NPX_23Sep2026.csv]
 # extra_biomarkers:
 #   - {name: nfl,  file: PPMI_Project_318_Plasma_23Sep2026.csv, assay: NEFL}
+# Olink Explore HT (PPMI only; one file, ~5,400 proteins) with a held-out test
+# set inside PPMI because PDBP has no HT data:
+# proteomics_panels:
+#   PLA:
+#     explore_ht: ppmi_proj314_plasma_screened_extended_npx_20260522.parquet
+# prot_feature_cap: 5000
+# holdout_fraction: 0.30
+# holdout_seed: 2026
 prot_qc_filter: "PASS"               # Cumulative_QC value to keep
 prot_completeness: 0.50              # min fraction of proteins observed per sample
 prot_target_feature_count: 1463      # deterministic top-N feature freeze

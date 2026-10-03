@@ -125,6 +125,21 @@ def load_clinical() -> Tuple[pd.DataFrame, str, str, str, str]:
     clin["cohort"] = (clin.get("cohort",
                                pd.Series(index=clin.index, dtype=object))
                       .astype(str).str.upper())
+    from .config import HOLDOUT_FRACTION, HOLDOUT_SEED
+    if HOLDOUT_FRACTION > 0:
+        # deterministic participant-level holdout inside the TRAIN cohort
+        import hashlib
+        pids = pd.Index(clin.index.astype(str))
+        tr_p = pids[clin["cohort"].values == "TRAIN"].unique()
+        def _u(p):  # uniform(0,1) from a stable hash of (seed, participant)
+            h = hashlib.sha1(f"{HOLDOUT_SEED}|{p}".encode()).hexdigest()
+            return int(h[:12], 16) / 16 ** 12
+        held = {p for p in tr_p if _u(p) < HOLDOUT_FRACTION}
+        mask = clin.index.astype(str).isin(held)
+        clin.loc[mask, "cohort"] = "TEST"
+        print(f"[Holdout] {len(held)}/{len(tr_p)} TRAIN participants ({HOLDOUT_FRACTION:.0%}) "
+              f"moved to TEST (seed {HOLDOUT_SEED}); TEST-prefix participants: "
+              f"{int((clin['cohort'] == 'TEST').sum() - mask.sum())} rows")
 
     # ── Case / control ──────────────────────────────────────────────────
     if "case_control" not in clin.columns:
@@ -250,8 +265,11 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
         # a panel may come from several files (e.g. AMP-PD file for PDBP +
         # PPMI Project 9000 file for PPMI); later files win for the same
         # (participant, visit, protein)
-        paths = [p for p in (path if isinstance(path, (list, tuple)) else [path])]
-        paths = [str(p) for p in paths if os.path.exists(str(p))]
+        paths_all = [str(p) for p in (path if isinstance(path, (list, tuple)) else [path])]
+        paths = [p for p in paths_all if os.path.exists(p)]
+        for p in paths_all:
+            if p not in paths:
+                print(f"  [WARN] Panel '{name}': file not found and skipped: {p}")
         if not paths:
             print(f"  [WARN] Panel '{name}' not found: {path}")
             continue
@@ -272,11 +290,12 @@ def _load_proteomics_panels(panels_dict: Dict[str, str],
         df = df.drop(columns=["_src"])
         if not panel_dfs:
             print(f"  [Panel columns] {list(df.columns)}  (layout: {df.attrs.get('layout')})")
-        split_col = next((c for c in ["panel", "Block", "block", "BLOCK"]
-                          if c in df.columns and df[c].nunique() > 1), None)
+        # One file carrying several *panels* (e.g. a combined 1536 export with a
+        # panel column) is split so panel-aware modelling still applies.  Explore
+        # HT's "Block" is a plate layout, not a biological panel, so it is left
+        # alone and the file becomes one panel.
+        split_col = "panel" if ("panel" in df.columns and df["panel"].nunique() > 1) else None
         if split_col is not None and len(panels_dict) == 1:
-            # one file carrying several panels / blocks (Explore HT, 3072): keep
-            # them as separate panels so panel-aware modelling still applies
             sub = []
             for pn, g in df.groupby(df[split_col].astype(str)):
                 g = g.copy(); g["panel"] = f"{name}_{re.sub(r'[^A-Za-z0-9]+', '_', pn).strip('_').lower()}"

@@ -197,6 +197,11 @@ N_PERMUTATIONS  = int(_cfg("n_permutations", 100))
 # UniProt accession -> gene symbol via rest.uniprot.org for accessions the
 # Olink files do not annotate (cached in docs/uniprot_gene_map.csv)
 UNIPROT_LOOKUP  = bool(_cfg("uniprot_lookup", True))
+# Within-cohort held-out test set: this fraction of TRAIN-prefix participants
+# is moved to TEST (deterministic hash of participant id + holdout_seed).  For
+# assays that exist in only one cohort (PPMI Explore HT).  0 = off.
+HOLDOUT_FRACTION = float(_cfg("holdout_fraction", 0.0) or 0.0)
+HOLDOUT_SEED     = int(_cfg("holdout_seed", 2026))
 STABILITY_B     = int(_cfg("stability_B", 200))
 PAIRED_BOOT_B   = int(_cfg("paired_boot_B", 1000))
 PLR_BOOT_B      = int(_cfg("participant_boot_B", 2000))
