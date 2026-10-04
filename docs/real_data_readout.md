@@ -154,6 +154,81 @@ the within β survives both, the confound is unlikely.
   The DDC-excluded run (`--exclude_proteins P20711 --out_dir results_noDDC`) is now
   required, not optional, and the within-person coupling should be re-read from it.
 
+---
+
+# Fifth run (2026-10-03): Olink Explore HT, Project 314 plasma, 30 % PPMI holdout
+
+`config_ht.yaml`: 5,416 proteins, 2,267 PPMI participants in the file, **961
+participants / 1,400 samples join the AMP-PD v4 clinical tables** (1,155 baseline
+samples are PPMI-LITE participants with no AMP-PD UPDRS row yet). Modelled: TRAIN
+331 PD / 279 HC, holdout TEST 145 PD / 127 HC. The holdout is *internal* to PPMI.
+
+## Severity (now 5x the PD sample)
+
+| | TRAIN OOF | holdout TEST |
+|---|---|---|
+| ρ all rows | 0.633 [0.59, 0.67] | 0.533 [0.44, 0.62] |
+| ρ within PD, participant | 0.30 (n = 331) | 0.37 (n = 145) |
+| PD-only refit, participant | 0.20 [0.10, 0.31] | 0.27 [0.11, 0.43] |
+| within PD: covariates vs proteomics vs partial | 0.44 / 0.36 / 0.28 | 0.41 / 0.41 / 0.41 |
+
+In the holdout the proteome equals the clinical covariates within PD and keeps a
+partial ρ of 0.41 given them. Caudate DaT ρ = −0.22 [−0.34, −0.09] (n = 215) in
+TRAIN, −0.15 [−0.34, +0.05] (n = 94) in the holdout: weaker than the 1536 run.
+
+## Reduced panel beats the full HT panel on the holdout
+k* = 30 proteins (OOF rule): holdout ρ **0.636 vs 0.533** for all 5,000; the 22
+stability-selected proteins give 0.638. Nested curve peaks at k = 50 (0.649) and
+falls monotonically beyond 200. This is the cleanest claim in the run: a ~30-protein
+plasma panel, chosen on TRAIN only, outperforms the full 5,400-plex on held-out
+participants.
+
+## Progression — now replicates in the holdout, but small
+| | TRAIN (n = 329) | holdout (n = 144) |
+|---|---|---|
+| ρ(baseline score, slope) | 0.11 [0.00, 0.22] | 0.12 [−0.05, 0.27] |
+| mixed β(score × year), adj. baseline UPDRS | 0.72 [0.20, 1.24], p = 0.006 | 0.79 [0.07, 1.50], p = 0.031 |
+| Cox HR/SD, adj. full | 1.33 [1.12, 1.59], p = 0.001 | 1.19 [0.94, 1.52], p = 0.15 |
+
+Discovery benchmark, TEST Δ vs clinical: slope −0.04 [−0.28, +0.22], 24-month
+change −0.04 [−0.16, +0.08], fast-progressor AUROC 0.53 vs 0.57, DaTSCAN change
+−0.28 [−0.52, −0.02] (worse). Enrichment: none. **So: a replicated association of
+the baseline score with subsequent motor decline, conditional on baseline UPDRS
+(0.7–0.8 UPDRS points/year per SD), that does not yet translate into better
+prediction of an individual's slope than clinical variables.** Those two statements
+are compatible: ρ ≈ 0.12 needs ~300 held-out PD participants to show as a Δ.
+
+## Within-person coupling — now solid
+| | TRAIN (178 pts / 360 samples) | holdout (73 / 149) |
+|---|---|---|
+| within β per SD | 2.91 [1.20, 4.62], p = 0.001 | 3.09 [0.85, 5.32], p = 0.007 |
+| medication-state adjusted | 2.19 [0.39, 3.98], p = 0.017 | 3.40 [1.07, 5.73], p = 0.004 |
+| ρ(Δscore, ΔUPDRS) | 0.21 [0.06, 0.34] | 0.36 [0.13, 0.56] |
+| PD-only refit, within β | 2.68 [0.99, 4.38] | 2.64 [0.37, 4.90] |
+
+Protein level: ITGAM and PEPD replicate within-person at p < 0.05 in both halves;
+29/40 same sign. Same-medication-state pairs are too few (45 / 0) to be informative.
+
+## Proteins
+Locked 40: 22/40 replicate same-sign p < 0.05 in the holdout, **12 Bonferroni**;
+protein × time interactions: 20/40 nominal, **12 Bonferroni** in the holdout
+(`robustness/confirmatory_progression.csv`, now in report §7c). Top replicated:
+DDC, NEFL, CD276, BGLAP, NME3, GPC1, THBS4, PI3, AOC3 (−), VGF (−), ITGAM (−),
+POSTN, PTX3, ITGAV (−), CPVL. NEFL (plasma NfL) is a Bonferroni severity
+correlate in both halves and not medication-associated — the reference comparator
+is inside the panel. Medication-associated at Bonferroni in TRAIN: DDC, NME3,
+AOC3, Q8NCC3; in the holdout DDC only. Run the exclusion sensitivity:
+`--exclude_proteins P20711,Q13232,Q16853,Q8NCC3`.
+
+## Caveats to carry into the paper
+* Internal holdout, not an external cohort; PDBP has no Explore HT. External check
+  of the reduced panel on PDBP Explore 1536 is possible via `--include_proteins`.
+* More advanced, more medicated population than the 1536 run (TRAIN PD UPDRS
+  42.7 ± 22 vs 31.4 ± 17); medicated visits 63 % of PD rows.
+* Median 2 samples per participant; slope-vs-slope not estimable.
+* 1,155 baseline samples unmatched: PPMI-LITE participants absent from AMP-PD v4
+  clinical tables. A PPMI-native MDS-UPDRS reader would roughly double n again.
+
 ## What to say in the paper (updated)
 1. Replicated modest plasma-proteomic correlate of motor severity within PD
    (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.

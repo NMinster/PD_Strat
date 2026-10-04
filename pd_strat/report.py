@@ -475,6 +475,23 @@ def build_report(summary: Dict[str, Any]) -> str:
             L += ["**Baseline protein × time (adjusted for baseline UPDRS)**", ""] + _md_table([cf["progression"]])
         L += ["Top 15 proteins (sorted by TEST p):", ""]
         L += _csv_table(ROB / "confirmatory_severity.csv", max_rows=15)
+        if (ROB / "confirmatory_progression.csv").exists():
+            L += ["", "Baseline protein × time: top 15 by TEST interaction p (a replicated "
+                  "interaction means the protein's baseline level predicts the *rate* of "
+                  "UPDRS change, adjusted for baseline UPDRS):", ""]
+            try:
+                prog = pd.read_csv(ROB / "confirmatory_progression.csv")
+                pcol = next((c for c in prog.columns if c.startswith("test_") and c.endswith("_p")), None)
+                if pcol:
+                    prog = prog.sort_values(pcol)
+                want = ["protein", "gene", "train_adj_beta", "train_adj_p", "test_adj_beta",
+                        "test_adj_ci_lo", "test_adj_ci_hi", "test_adj_p", "train_n_participants",
+                        "test_n_participants", "interaction_sign_replicated"]
+                keep = [c for c in want if c in prog.columns]
+                prog = prog[keep].head(15)
+                L += _md_table(prog.to_dict("records"))
+            except Exception as e:  # pragma: no cover
+                L += [f"_(could not render confirmatory_progression.csv: {e})_"]
 
     # ── 7d. Literature overlap ──────────────────────────────────────────
     lo = summary.get("literature_overlap")

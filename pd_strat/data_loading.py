@@ -26,7 +26,7 @@ from .config import (
     META_PATH, MANIFEST_PATH, CASE_CONTROL_PATH,
     RNA_PATH, RNA_LOG1P,
     FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
-    PROT_FEATURE_CAP, PROT_EXCLUDE, PROTEOMICS_VISIT_MATCHING,
+    PROT_FEATURE_CAP, PROT_EXCLUDE, PROT_INCLUDE, PROTEOMICS_VISIT_MATCHING,
     MULTI_TISSUE, PANEL_TISSUE,
     RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
     RNA_EXCLUDE_BATCHES, RNA_PREFILTER_GENES,
@@ -565,6 +565,13 @@ def load_proteomics(clin: pd.DataFrame,
         drop = [c for c in Z.columns if str(c).upper().split(":")[-1] in set(PROT_EXCLUDE)]
         Z = Z.drop(columns=drop)
         print(f"  [Exclude] dropped {len(drop)} protein(s) per prot_exclude: {drop}")
+    if PROT_INCLUDE:
+        want = set(PROT_INCLUDE)
+        keep = [c for c in Z.columns if str(c).upper().split(":")[-1] in want]
+        missing = sorted(want - {str(c).upper().split(":")[-1] for c in keep})
+        Z = Z[keep]
+        print(f"  [Include] restricted to {len(keep)}/{len(want)} listed proteins"
+              + (f"; not on this assay: {missing[:10]}{' ...' if len(missing) > 10 else ''}" if missing else ""))
     if FEATURE_SELECTION == "mad_corr_cap":
         from .feature_selection import select_protein_features
         Z, _ = select_protein_features(

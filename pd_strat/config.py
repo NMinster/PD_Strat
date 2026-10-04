@@ -61,6 +61,8 @@ _ap.add_argument("--tissue", default=None,
 _ap.add_argument("--exclude_proteins", default=None,
                  help="Comma-separated UniProt accessions to drop before modelling "
                       "(e.g. P20711 = DDC); overrides prot_exclude in config.yaml")
+_ap.add_argument("--include_proteins", default=None,
+                 help="Restrict modelling to these UniProt accessions: a comma list or a CSV/TXT file with a protein column (e.g. another run's robustness/stability_selection.csv or confirmatory_protein_list.csv). Use to test a panel derived elsewhere.")
 _ap.add_argument("--reverse_cohorts", action="store_true", default=False,
                  help="Swap TRAIN/TEST prefixes (e.g. PDBP->PPMI) for the "
                       "supplementary reverse-direction run; results go to "
@@ -181,6 +183,31 @@ PROT_FEATURE_CAP   = int(_cfg("prot_feature_cap", 1168))
 PROT_EXCLUDE: List[str] = [str(x).strip().upper() for x in (_cfg("prot_exclude", []) or [])]
 if FLAGS.exclude_proteins:
     PROT_EXCLUDE = [x.strip().upper() for x in FLAGS.exclude_proteins.split(",") if x.strip()]
+
+
+def _protein_list(spec) -> List[str]:
+    """Comma list, YAML list, or a file with a 'protein'/'uniprot' column -> accessions."""
+    if spec is None or spec == "" or spec == []:
+        return []
+    if isinstance(spec, (list, tuple)):
+        return [str(x).strip().upper() for x in spec if str(x).strip()]
+    spec = str(spec).strip()
+    pth = Path(spec) if Path(spec).is_absolute() else Path(spec)
+    if pth.exists() and pth.is_file():
+        import pandas as pd
+        if pth.suffix.lower() in (".csv", ".tsv"):
+            df = pd.read_csv(pth, sep="\t" if pth.suffix.lower() == ".tsv" else ",")
+            col = next((c for c in df.columns if str(c).lower() in ("protein", "uniprot", "accession")), df.columns[0])
+            return [str(x).strip().upper() for x in df[col].dropna()]
+        return [ln.strip().upper() for ln in pth.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    return [x.strip().upper() for x in spec.split(",") if x.strip()]
+
+
+# Restrict modelling to a given protein list (panel transfer / external test of
+# a panel derived in another run or assay).  Applied after prot_exclude.
+PROT_INCLUDE: List[str] = _protein_list(_cfg("prot_include", None))
+if FLAGS.include_proteins:
+    PROT_INCLUDE = _protein_list(FLAGS.include_proteins)
 
 # Match each proteomic sample to its own clinical visit (participant + visit
 # key).  False reproduces the legacy behaviour of averaging all of a
@@ -363,6 +390,8 @@ def print_banner():
     print(f"  Proteomics alignment : {'visit-matched samples' if PROTEOMICS_VISIT_MATCHING else 'participant-mean broadcast (legacy)'}")
     if PROT_EXCLUDE:
         print(f"  Excluded proteins    : {PROT_EXCLUDE}")
+    if PROT_INCLUDE:
+        print(f"  Restricted to        : {len(PROT_INCLUDE)} listed proteins (prot_include / --include_proteins)")
     print(f"  Feature selection    : {FEATURE_SELECTION} "
           f"(obs>={PROT_MIN_OBS_FRAC:.0%}, MAD>={PROT_MIN_MAD}, |r|<={PROT_CORR_THRESH}, "
           f"cap={PROT_FEATURE_CAP})")

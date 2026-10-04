@@ -261,6 +261,23 @@ Participants that are new in Project 222 / PPMI LITE and absent from the AMP-PD
 v4 clinical tables have no UPDRS row to join and are reported as unmatched by
 `[Align]`; bringing them in requires PPMI's own clinical exports.
 
+### Testing a panel from one run on another assay or cohort
+
+`--include_proteins` restricts modelling to a listed set of accessions, given as
+a comma list or as a file with a `protein` column (another run's
+`robustness/stability_selection.csv` or `confirmatory_protein_list.csv`). The
+main use is external replication of a reduced panel derived on Explore HT in
+PPMI against PDBP on Explore 1536:
+
+```bat
+python run.py --config config_ht.yaml --out_dir results_ht
+python run.py --include_proteins results_ht\robustness\confirmatory_protein_list.csv --out_dir results_ht_panel_on_1536
+```
+
+The second run trains the panel on PPMI Explore 1536 and tests it once on PDBP,
+so a replication there is cross-assay and cross-cohort. Proteins absent from the
+second assay are reported and dropped.
+
 ### Plasma vs CSF vs combined
 
 ```bat
