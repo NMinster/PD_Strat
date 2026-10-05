@@ -229,6 +229,24 @@ AOC3, Q8NCC3; in the holdout DDC only. Run the exclusion sensitivity:
 * 1,155 baseline samples unmatched: PPMI-LITE participants absent from AMP-PD v4
   clinical tables. A PPMI-native MDS-UPDRS reader would roughly double n again.
 
+## Medication sensitivity (2026-10-04, `results_ht_noMed`: HT without DDC, NME3, AOC3, Q8NCC3)
+
+| | full HT | without the 4 medication-associated proteins |
+|---|---|---|
+| OOF ρ / holdout ρ | 0.633 / 0.533 | 0.609 / 0.506 |
+| within-PD participant ρ, OOF / holdout | 0.30 / 0.37 | 0.28 / 0.35 |
+| PD-only refit, holdout | 0.27 [0.11, 0.43] | 0.26 [0.09, 0.41] |
+| mixed β score × year, TRAIN / holdout | 0.72 (p = 0.006) / 0.79 (p = 0.031) | 0.71 (p = 0.007) / 0.77 (p = 0.037) |
+| within-person β, TRAIN / holdout | 2.91 / 3.09 | 2.77 / 3.03 |
+| reduced panel on holdout (k = 50 vs all) | 0.649 vs 0.533 | 0.576 vs 0.506 |
+| locked-40 replicated p < 0.05 / Bonferroni | 22 / 12 | 18 / 9 |
+| protein × time replicated Bonferroni | 12 | 10 |
+
+Every claim survives with a small loss of 0.02–0.03 in ρ. DDC carries some
+cross-sectional signal (it is the top weight) but none of the progression,
+within-person or panel-compressibility results depend on it. Report the full run
+as primary and this as the pre-specified sensitivity.
+
 ## What to say in the paper (updated)
 1. Replicated modest plasma-proteomic correlate of motor severity within PD
    (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.

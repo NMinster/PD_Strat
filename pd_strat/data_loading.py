@@ -496,6 +496,13 @@ def load_proteomics(clin: pd.DataFrame,
             drop = [c for c in df.columns if str(c).upper().split(":")[-1] in set(PROT_EXCLUDE)]
             df = df.drop(columns=drop)
             print(f"  [Exclude] dropped {len(drop)} protein(s) per prot_exclude: {drop}")
+        if PROT_INCLUDE:
+            want = set(PROT_INCLUDE)
+            keep = [c for c in df.columns if str(c).upper().split(":")[-1] in want]
+            missing = sorted(want - {str(c).upper().split(":")[-1] for c in keep})
+            df = df[keep]
+            print(f"  [Include] restricted cached matrix to {len(keep)}/{len(want)} listed proteins"
+                  + (f"; not on this assay: {missing[:10]}{' ...' if len(missing) > 10 else ''}" if missing else ""))
         if panel_map_path.exists():
             pmap = json.load(open(panel_map_path))
             for pname in list(pmap.keys()):

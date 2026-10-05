@@ -68,6 +68,13 @@ _ap.add_argument("--reverse_cohorts", action="store_true", default=False,
                       "supplementary reverse-direction run; results go to "
                       "<project>/results_reverse unless --out_dir is given")
 FLAGS, _UNKNOWN_ARGS = _ap.parse_known_args()
+# An unknown --flag outside a notebook is almost always a typo or a flag from a
+# newer version than the one checked out: fail loudly instead of silently
+# running the default analysis (that is how --include_proteins was once ignored).
+_bad = [a for a in _UNKNOWN_ARGS if a.startswith("--")]
+if _bad and "ipykernel" not in sys.modules:
+    _ap.error(f"unrecognised option(s) {_bad}. Run `git pull` if the option is documented "
+              f"in README.md; `python run.py --help` lists what this checkout supports.")
 
 
 # ── Optional YAML config ───────────────────────────────────────────────────
