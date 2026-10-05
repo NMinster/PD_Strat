@@ -570,6 +570,15 @@ def run_test_evaluation(X_prot, M_prot, y_all, train_idx_y,
 
     PRIMARY_LABEL = best_tag or _candidate_label
     print(f"    >> PRIMARY MODEL = {PRIMARY_LABEL}")
+    # Single-panel runs fit the OOF model under the plain name ("RidgeSVD")
+    # while the TEST label is "MonoRidgeSVD"; alias so OOF metrics, OOF
+    # predictions, the permutation p and the incremental-gain line all resolve.
+    if PRIMARY_LABEL not in baseline_oof:
+        alt = PRIMARY_LABEL.replace("Mono", "")
+        if alt in baseline_oof:
+            baseline_oof[PRIMARY_LABEL] = baseline_oof[alt]
+            if alt in _oof_preds:
+                _oof_preds[PRIMARY_LABEL] = _oof_preds[alt]
 
     oof_pred = _oof_preds.get(PRIMARY_LABEL, np.full(0, np.nan))
     rho_oof = baseline_oof.get(PRIMARY_LABEL, {}).get("spearman", np.nan)
