@@ -664,12 +664,25 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
         print(f"  Dropped {n_other} rows from cohorts other than "
               f"{TRAIN_PREFIX}/{TEST_PREFIX} (keep_other_cohorts=false)")
 
+    # ── PPMI-native exports: participant-visits AMP-PD does not cover ────
+    from .config import PPMI_CLINICAL_DIR, PPMI_CLINICAL_MODE
+    if PPMI_CLINICAL_DIR:
+        from .ppmi_clinical import load_ppmi_native, merge_native
+        native = load_ppmi_native(PPMI_CLINICAL_DIR,
+                                  prefer_off=bool(ASSEMBLY["updrs3_prefer_off_state"]),
+                                  part_iv_missing_as_zero=bool(ASSEMBLY["updrs_part_iv_missing_as_zero"]))
+        if native is not None:
+            base = merge_native(base, native, PPMI_CLINICAL_MODE)
+            base["cohort"] = _cohort_from_pid(base["participant_id"])
+            if not ASSEMBLY["keep_other_cohorts"]:
+                base = base[base["cohort"] != "OTHER"]
+
     cols = ["participant_id", "visit_name", "visit_month", "cohort",
             "case_control", "diagnosis", "updrs_total", p1, p2, p3, p4,
             "hoehn_yahr", "updrs3_state", "pd_medicated", "upsit_total", "sex", "age_at_baseline",
             "age", "age_at_diagnosis", "disease_duration_years",
             "on_levodopa", "on_other_dopaminergic", "ledd", "site",
-            "race", "ethnicity"]
+            "race", "ethnicity", "source"]
     cols = [c for c in cols if c in base.columns]
     cols += [c for c in base.columns if c.startswith("datscan_")]
     from .config import EXTRA_BIOMARKERS
@@ -693,6 +706,10 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
               f"{base.loc[m, 'case_control'].value_counts().to_dict()})")
     print(f"    UPSIT available           : "
           f"{int(base['upsit_total'].notna().sum())} rows")
+    if "source" in base.columns:
+        for src, g in base.groupby("source"):
+            print(f"    source={src:<12}: {g['participant_id'].nunique()} participants, "
+                  f"{int(np.isfinite(g['updrs_total']).sum())} rows with UPDRS")
     print(f"  -> {CLINICAL_UNIFIED}")
     return base
 

@@ -100,3 +100,9 @@ extra_biomarkers:
 - name: gfap
   file: PPMI_Project_318_Plasma_23Sep2026.csv
   assay: GFAP
+
+# PPMI-native clinical exports (LONI Study Data) add participant-visits that the AMP-PD
+# v4 tables lack (PPMI LITE, post-2023 follow-up). See README 'PPMI-native clinical exports'.
+# Check first with: python -m pd_strat.ppmi_clinical S:/PPMI_clinical
+ppmi_clinical_dir: S:/PPMI_clinical
+ppmi_clinical_mode: fill      # fill = add missing visits too; participants = new participants only

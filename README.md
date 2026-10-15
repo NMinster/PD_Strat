@@ -261,6 +261,43 @@ Participants that are new in Project 222 / PPMI LITE and absent from the AMP-PD
 v4 clinical tables have no UPDRS row to join and are reported as unmatched by
 `[Align]`; bringing them in requires PPMI's own clinical exports.
 
+### PPMI-native clinical exports (participants the AMP-PD tables lack)
+
+The AMP-PD v4 clinical tables end in 2023. PPMI participants enrolled or
+followed since then (PPMI LITE, Project 222/314 additions) have Olink samples
+but no UPDRS row to join, which is why an Explore HT run reports ~1,150
+unmatched baseline samples. `pd_strat/ppmi_clinical.py` reads PPMI's own
+exports and appends the missing participant-visits in the same schema.
+
+Download from the PPMI LONI portal, **Study Data**, into one folder (e.g.
+`S:/PPMI_clinical`; file names may carry any date suffix):
+
+| LONI section | file | used for |
+|---|---|---|
+| Motor / MDS-UPDRS | `MDS-UPDRS_Part_I.csv`, `MDS-UPDRS_Part_I_Patient_Questionnaire.csv`, `MDS_UPDRS_Part_II__Patient_Questionnaire.csv`, `MDS-UPDRS_Part_III.csv`, `MDS-UPDRS_Part_IV__Motor_Complications.csv` | Part totals (summed from items if the total column is absent), H&Y (`NHY`), exam state (`PDSTATE`), medicated (`PDTRTMNT`) |
+| Subject characteristics | `Participant_Status.csv`, `Demographics.csv`, `Age_at_visit.csv` | case/control (`COHORT_DEFINITION`), enrol age, sex, birth date, age at visit |
+| Medical history | `PD_Diagnosis_History.csv`, `LEDD_Concomitant_Medication_Log.csv` | diagnosis date → disease duration; ever on levodopa / agonist; LEDD |
+| Non-motor | `University_of_Pennsylvania_Smell_Identification_Test*.csv` | UPSIT total |
+| Imaging | `DaTScan_Analysis.csv` | putamen / caudate SBR |
+
+Then:
+
+```bat
+python -m pd_strat.ppmi_clinical S:/PPMI_clinical       :: dry run: which files/columns were recognised, how many rows
+python run.py --config config_ht.yaml --out_dir results_ht --force_assembly
+```
+
+`config_ht.yaml` and `config_9000.yaml` already point at `S:/PPMI_clinical`.
+Assembly prints an **agreement check** on visits present in both sources
+(correlation of UPDRS totals; expect r > 0.98) before appending, then
+`[append]` with the number of new participants and visits, and the summary
+lists participants per `source`. `ppmi_clinical_mode: fill` (default) adds
+every participant-visit absent from AMP-PD; `participants` adds only
+participants absent altogether, leaving existing participants' follow-up
+unchanged. AMP-PD rows are never replaced. Part I needs both the clinician
+file and the patient questionnaire to match the AMP-PD 13-item total; the
+reader says so if the questionnaire is missing.
+
 ### Testing a panel from one run on another assay or cohort
 
 `--include_proteins` restricts modelling to a listed set of accessions, given as

@@ -247,6 +247,39 @@ cross-sectional signal (it is the top weight) but none of the progression,
 within-person or panel-compressibility results depend on it. Report the full run
 as primary and this as the pre-specified sensitivity.
 
+## Panel transfer (2026-10-15, `results_ht_panel_on_1536`): HT-derived panel re-fit on PPMI Explore 1536, tested once on PDBP
+
+26 of the 40 HT-locked proteins exist on Explore 1536 (missing: VGF, BGLAP, PEPD,
+POSTN, AMY1/2, TNR, PTPRN, …). Panel selection never saw PDBP, so PDBP is a clean
+external, cross-assay test.
+
+| | full 1536 panel (1,168) | 26-protein HT panel |
+|---|---|---|
+| PPMI OOF ρ, rows / participants | 0.530 / 0.587 | 0.427 / 0.451 |
+| **PDBP ρ, rows / participants** | 0.490 / 0.533 | **0.654 / 0.700** [0.60, 0.78] |
+| PDBP within-PD participant ρ | 0.363 | 0.387 |
+| PDBP PD-only refit, participant | 0.445 [0.25, 0.64] | 0.385 [0.18, 0.57] |
+| PDBP AUROC PD vs HC | 0.749 | 0.884 |
+| PDBP partial ρ given covariates (PD) | 0.222 | 0.209 |
+| PDBP within-person β | 1.72 [0.69, 2.76] | 1.96 [0.90, 3.02] |
+| 26-protein nested curve, PDBP at k = 20 | – | 0.665 |
+| locked proteins replicated in PDBP (p < 0.05 / Bonferroni) | 9 / 2 of 40 | 9 / 2 of 26, 24/26 same sign |
+
+Reading: the HT-derived panel *transfers across assay generation and cohort*
+and does better in PDBP than the full 1536 panel, mostly through sharper PD-vs-HC
+separation (0.75 → 0.88) and a modestly better within-PD rank (0.36 → 0.39); the
+PD-only refit is slightly lower. This is the external-replication paragraph the
+HT holdout could not supply. Progression still does not replicate in PDBP
+(mixed β −0.64 [−1.57, +0.28]; Cox 0.89) — PDBP is older, more advanced and more
+medicated, and n = 84.
+
+Discovery benchmark, **first TEST Δ with a CI excluding zero**: baseline severity,
+proteomics + clinical (MLP) 0.498 vs clinical 0.223, Δ = +0.28 [+0.03, +0.51],
+p = 0.028. Caveats before using it: it is cross-sectional (current UPDRS, comparator
+without UPDRS), the OOF Δ for the same configuration was −0.09 (selection did not
+favour it), it is one of four targets, and the MLP was chosen among 27 configs. Report
+it as supportive of the within-PD partial ρ, not as a prognostic result.
+
 ## What to say in the paper (updated)
 1. Replicated modest plasma-proteomic correlate of motor severity within PD
    (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.

@@ -236,6 +236,15 @@ UNIPROT_LOOKUP  = bool(_cfg("uniprot_lookup", True))
 # assays that exist in only one cohort (PPMI Explore HT).  0 = off.
 HOLDOUT_FRACTION = float(_cfg("holdout_fraction", 0.0) or 0.0)
 HOLDOUT_SEED     = int(_cfg("holdout_seed", 2026))
+
+# PPMI-native clinical exports (LONI "Study Data") used to add participant-visits
+# the AMP-PD v4 tables lack (PPMI LITE / post-2023 follow-up).  Empty = off.
+#   ppmi_clinical_mode: "fill" adds every (participant, visit) absent from AMP-PD;
+#   "participants" adds only participants absent from AMP-PD altogether.
+_ppmi_dir = _cfg("ppmi_clinical_dir", None)
+PPMI_CLINICAL_DIR: Optional[str] = (str(Path(_ppmi_dir) if Path(str(_ppmi_dir)).is_absolute()
+                                        else DATA_DIR / str(_ppmi_dir)) if _ppmi_dir else None)
+PPMI_CLINICAL_MODE = str(_cfg("ppmi_clinical_mode", "fill")).lower()
 STABILITY_B     = int(_cfg("stability_B", 200))
 PAIRED_BOOT_B   = int(_cfg("paired_boot_B", 1000))
 PLR_BOOT_B      = int(_cfg("participant_boot_B", 2000))
@@ -399,6 +408,8 @@ def print_banner():
         print(f"  Excluded proteins    : {PROT_EXCLUDE}")
     if PROT_INCLUDE:
         print(f"  Restricted to        : {len(PROT_INCLUDE)} listed proteins (prot_include / --include_proteins)")
+    if PPMI_CLINICAL_DIR:
+        print(f"  PPMI-native clinical : {PPMI_CLINICAL_DIR}  (mode={PPMI_CLINICAL_MODE})")
     print(f"  Feature selection    : {FEATURE_SELECTION} "
           f"(obs>={PROT_MIN_OBS_FRAC:.0%}, MAD>={PROT_MIN_MAD}, |r|<={PROT_CORR_THRESH}, "
           f"cap={PROT_FEATURE_CAP})")
