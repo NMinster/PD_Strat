@@ -54,19 +54,29 @@ _FILES: Dict[str, Tuple[str, bool]] = {
     "age":     (r"Age[-_ ]?at[-_ ]?visit", False),
     "dx":      (r"PD[-_ ]?Diagnosis[-_ ]?History", False),
     "upsit":   (r"Smell[-_ ]?Identification|UPSIT", False),
-    "datscan": (r"DaTScan[-_ ]?Analysis|DATSCAN[-_ ]?Analysis|SBR", False),
+    "datscan": (r"DaTScan[-_ ]?Analysis|DATSCAN[-_ ]?Analysis|Quant[-_ ]?SBR|SBR", False),
     "ledd":    (r"LEDD", False),
     # recognised now, used by the prodromal-conversion endpoint (next stage)
-    "primary_dx": (r"Primary[-_ ]?Clinical[-_ ]?Diagnosis", False),
-    "prodromal":  (r"Prodromal[-_ ]?(Diagnostic|History)", False),
-    "curated":    (r"Curated[-_ ]?Data[-_ ]?Cut", False),
+    "primary_dx":     (r"Primary[-_ ]?(Clinical|Research)[-_ ]?Diagnosis", False),
+    "clinical_dx":    (r"^Clinical[-_ ]?Diagnosis", False),
+    "prodromal":      (r"Prodromal[-_ ]?(Diagnostic|History)", False),
+    "eligibility":    (r"Prodromal[-_ ]?Cohort[-_ ]?Eligibility", False),
+    "datscan_visual": (r"Visual[-_ ]?Read|Visual[-_ ]?Interpretation", False),
+    "curated":        (r"Curated[-_ ]?Data[-_ ]?Cut", False),
 }
+_TABULAR = (".csv", ".txt", ".tsv", ".xlsx", ".xls")
 _LEVODOPA = re.compile(r"levodopa|sinemet|carbidopa|madopar|rytary|duopa|stalevo|benserazide|inbrija", re.I)
 _AGONIST = re.compile(r"pramipexole|mirapex|ropinirole|requip|rotigotine|neupro|apomorphine|apokyn|piribedil", re.I)
 
 
-def _read(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str)
+def _read(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
+    if Path(path).suffix.lower() in (".xlsx", ".xls"):
+        sheets = pd.ExcelFile(path).sheet_names
+        # the Curated Data Cut workbook: notes / <date> data / dictionary
+        sheet = sheets[1] if len(sheets) >= 2 else sheets[0]
+        df = pd.read_excel(path, sheet_name=sheet, dtype=str, nrows=nrows)
+    else:
+        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str, nrows=nrows)
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -99,7 +109,7 @@ def find_files(root: str) -> Dict[str, Optional[str]]:
     found: Dict[str, Optional[str]] = {k: None for k in _FILES}
     if not rootp.is_dir():
         return found
-    cands = sorted(p for p in rootp.rglob("*") if p.is_file() and p.suffix.lower() in (".csv", ".txt", ".tsv"))
+    cands = sorted(p for p in rootp.rglob("*") if p.is_file() and p.suffix.lower() in _TABULAR)
     for key, (rx, _) in _FILES.items():
         r = re.compile(rx, re.I)
         hits = [p for p in cands if r.search(p.stem)]
@@ -196,11 +206,17 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
         hy = _col(df, [r"^NHY$", r"hoehn"])
         fr["hoehn_yahr"] = _num(df[hy]) if hy else np.nan
         st = _col(df, [r"^PDSTATE$", r"^ON_OFF", r"state"])
+        state = pd.Series("UNK", index=df.index, dtype="object")
         if st:
             s = df[st].astype(str).str.upper()
-            fr["updrs3_state"] = np.where(s.str.contains("OFF"), "OFF", np.where(s.str.contains("ON"), "ON", "UNK"))
-        else:
-            fr["updrs3_state"] = "UNK"
+            state = pd.Series(np.where(s.str.contains("OFF"), "OFF", np.where(s.str.contains(r"\bON\b"), "ON", "UNK")),
+                              index=df.index, dtype="object")
+        pag = _col(df, [r"^PAG_NAME$"])
+        if pag:   # user guide: blank PDSTATE -> PAG_NAME NUPDR3OF (off) / NUPDR3ON (on)
+            pg = df[pag].astype(str).str.upper()
+            state = state.where(state != "UNK", np.where(pg.str.contains("3OF"), "OFF",
+                                                         np.where(pg.str.contains("3ON"), "ON", "UNK")))
+        fr["updrs3_state"] = state.values
         med = _col(df, [r"^PDTRTMNT$", r"^PDMEDYN$", r"^PDMEDUSE$"])
         if med:
             m = _num(df[med])
@@ -265,6 +281,8 @@ def _status(path: Optional[str], log) -> Optional[pd.DataFrame]:
     out["diagnosis"] = diag.values
     ea = _col(df, [r"^ENROLL_AGE$", r"enroll.*age"])
     out["enroll_age"] = _num(df[ea]) if ea else np.nan
+    es = _col(df, [r"^ENROLL_STATUS$", r"enroll.*status"])
+    out["enroll_status"] = df[es].astype(str).str.strip().str.lower().values if es else "enrolled"
     out = out.drop_duplicates("participant_id")
     log(f"    [Participant status] {Path(path).name}: {len(out)} participants "
         f"{out['case_control'].value_counts().to_dict()} (cohort col: {cdef or ccode})")
@@ -437,6 +455,13 @@ def load_ppmi_native(root: str, prefer_off: bool = True, part_iv_missing_as_zero
 
     if st is not None:
         base = base.merge(st, on="participant_id", how="left")
+        # user guide: analyses should use Enrolled / Withdrew / Complete only
+        keep_status = {"enrolled", "withdrew", "complete", "completed", "nan", ""}
+        bad = ~base["enroll_status"].astype(str).isin(keep_status) & base["enroll_status"].notna()
+        if bad.any():
+            log(f"    [enroll status] dropping {base.loc[bad, 'participant_id'].nunique()} participants with status "
+                f"{sorted(base.loc[bad, 'enroll_status'].astype(str).unique())[:6]}")
+            base = base[~bad]
     else:
         base["case_control"] = "UNKNOWN"; base["diagnosis"] = pd.NA; base["enroll_age"] = np.nan
     base["case_control"] = base["case_control"].fillna("UNKNOWN")
@@ -553,8 +578,22 @@ def merge_native(base: pd.DataFrame, native: pd.DataFrame, mode: str, log=print)
 def describe(root: str) -> None:
     files = find_files(root)
     print(f"PPMI-native clinical directory: {root}")
+    used = set()
     for k, (rx, req) in _FILES.items():
-        print(f"  {k:<8} {'required' if req else 'optional':<8} -> {Path(files[k]).name if files[k] else '(not found)'}")
+        print(f"  {k:<14} {'required' if req else 'optional':<8} -> {Path(files[k]).name if files[k] else '(not found)'}")
+        if files[k]:
+            used.add(files[k])
+            try:
+                head = _read(files[k], nrows=3)
+                n = sum(1 for _ in open(files[k], "rb")) - 1 if Path(files[k]).suffix.lower() == ".csv" else "?"
+                print(f"      rows={n}  columns({len(head.columns)}): {list(head.columns)[:45]}")
+                ex = head.iloc[0].to_dict() if len(head) else {}
+                print(f"      first row: {dict(list(ex.items())[:14])}")
+            except Exception as e:
+                print(f"      (could not read: {type(e).__name__}: {e})")
+    others = [p for p in Path(root).rglob("*") if p.is_file() and p.suffix.lower() in _TABULAR and str(p) not in used]
+    if others:
+        print("  not used:", ", ".join(p.name for p in others))
     print()
     df = load_ppmi_native(root)
     if df is not None:

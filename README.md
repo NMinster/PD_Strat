@@ -269,25 +269,28 @@ but no UPDRS row to join, which is why an Explore HT run reports ~1,150
 unmatched baseline samples. `pd_strat/ppmi_clinical.py` reads PPMI's own
 exports and appends the missing participant-visits in the same schema.
 
-Download from the PPMI LONI portal, **Study Data**, into one folder (e.g.
-`S:/PPMI_clinical`; file names may carry any date suffix):
+Download from the PPMI LONI portal, **Study Data**, into one folder (any
+download-date suffix is fine; names as served on 15 Oct 2026):
 
-| LONI section | file | used for |
+| LONI group | file | used for |
 |---|---|---|
-| Motor / MDS-UPDRS | `MDS-UPDRS_Part_I.csv`, `MDS-UPDRS_Part_I_Patient_Questionnaire.csv`, `MDS_UPDRS_Part_II__Patient_Questionnaire.csv`, `MDS-UPDRS_Part_III.csv`, `MDS-UPDRS_Part_IV__Motor_Complications.csv` | Part totals (summed from items if the total column is absent), H&Y (`NHY`), exam state (`PDSTATE`), medicated (`PDTRTMNT`) |
-| Subject characteristics | `Participant_Status.csv`, `Demographics.csv`, `Age_at_visit.csv` | case/control (`COHORT_DEFINITION`), enrol age, sex, birth date, age at visit |
-| Medical history | `PD_Diagnosis_History.csv`, `LEDD_Concomitant_Medication_Log.csv` | diagnosis date → disease duration; ever on levodopa / agonist; LEDD |
-| Non-motor | `University_of_Pennsylvania_Smell_Identification_Test*.csv` | UPSIT total |
-| Imaging | `DaTScan_Analysis.csv` | putamen / caudate SBR |
+| Motor Assessments | `MDS-UPDRS_Part_I`, `MDS-UPDRS_Part_I_Patient_Questionnaire`, `MDS_UPDRS_Part_II__Patient_Questionnaire`, `MDS-UPDRS_Part_III`, `MDS-UPDRS_Part_IV__Motor_Complications` | Part totals (summed from items if the total column is absent), H&Y (`NHY`), exam state (`PDSTATE`, else `PAG_NAME` NUPDR3OF/ON), medicated (`PDTRTMNT`). The ON/OFF Determination & Dosing file is ignored. |
+| Subject Characteristics | `Participant_Status`, `Demographics`, `Age_at_visit` | case/control (`COHORT_DEFINITION`), `ENROLL_STATUS` (only Enrolled / Withdrew / Complete are used), enrol age, sex, birth date, age at visit |
+| Medical History | `PD_Diagnosis_History`, `LEDD_Concomitant_Medication_Log` | diagnosis date → disease duration; ever on levodopa / agonist; LEDD |
+| Medical History (prodromal endpoint) | `Primary_Research_Diagnosis`, `Clinical_Diagnosis`, `Prodromal_Diagnostic_Questionnaire` | recognised and listed by the dry run; used by the phenoconversion endpoint |
+| Non-motor Assessments | `University_of_Pennsylvania_Smell_Identification_Test_UPSIT` | UPSIT total (`TOTAL_CORRECT`) |
+| Imaging | `Xing_Core_Lab_-_Quant_SBR` (formerly DaTscan Analysis), `Xing_Core_Lab_-_Visual_Read` | putamen / caudate SBR; visual read |
+| Curated Data | `PPMI_Curated_Data_Cut_Public_<date>.xlsx` | cross-check / fallback (second sheet is the data) |
 
 Then:
 
 ```bat
-python -m pd_strat.ppmi_clinical S:/PPMI_clinical       :: dry run: which files/columns were recognised, how many rows
-python run.py --config config_ht.yaml --out_dir results_ht --force_assembly
+python -m pd_strat.ppmi_clinical "C:/Users/NM/Desktop/New_PPMI_Data"     :: dry run: files, columns, row counts
+python run.py --config config_ht.yaml --out_dir results_ht --force_assembly --ppmi_clinical_dir "C:/Users/NM/Desktop/New_PPMI_Data"
 ```
 
-`config_ht.yaml` and `config_9000.yaml` already point at `S:/PPMI_clinical`.
+`--ppmi_clinical_dir` overrides `ppmi_clinical_dir` in the config (`config_ht.yaml`
+and `config_9000.yaml` default to `S:/PPMI_clinical`).
 Assembly prints an **agreement check** on visits present in both sources
 (correlation of UPDRS totals; expect r > 0.98) before appending, then
 `[append]` with the number of new participants and visits, and the summary

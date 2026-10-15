@@ -61,6 +61,8 @@ _ap.add_argument("--tissue", default=None,
 _ap.add_argument("--exclude_proteins", default=None,
                  help="Comma-separated UniProt accessions to drop before modelling "
                       "(e.g. P20711 = DDC); overrides prot_exclude in config.yaml")
+_ap.add_argument("--ppmi_clinical_dir", default=None,
+                 help="Folder of PPMI LONI Study Data exports to append (overrides ppmi_clinical_dir in the config).")
 _ap.add_argument("--include_proteins", default=None,
                  help="Restrict modelling to these UniProt accessions: a comma list or a CSV/TXT file with a protein column (e.g. another run's robustness/stability_selection.csv or confirmatory_protein_list.csv). Use to test a panel derived elsewhere.")
 _ap.add_argument("--reverse_cohorts", action="store_true", default=False,
@@ -241,7 +243,7 @@ HOLDOUT_SEED     = int(_cfg("holdout_seed", 2026))
 # the AMP-PD v4 tables lack (PPMI LITE / post-2023 follow-up).  Empty = off.
 #   ppmi_clinical_mode: "fill" adds every (participant, visit) absent from AMP-PD;
 #   "participants" adds only participants absent from AMP-PD altogether.
-_ppmi_dir = _cfg("ppmi_clinical_dir", None)
+_ppmi_dir = FLAGS.ppmi_clinical_dir or _cfg("ppmi_clinical_dir", None)
 PPMI_CLINICAL_DIR: Optional[str] = (str(Path(_ppmi_dir) if Path(str(_ppmi_dir)).is_absolute()
                                         else DATA_DIR / str(_ppmi_dir)) if _ppmi_dir else None)
 PPMI_CLINICAL_MODE = str(_cfg("ppmi_clinical_mode", "fill")).lower()
