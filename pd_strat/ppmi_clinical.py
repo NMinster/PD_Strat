@@ -47,7 +47,7 @@ _FILES: Dict[str, Tuple[str, bool]] = {
     "part1":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?I(?![IV])(?!.*Patient)", True),
     "part1pq": (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?I[-_ ]?(Patient|Pt)", False),
     "part2":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?II(?!I)", True),
-    "part3":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?III", True),
+    "part3":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?III(?!.*(ON_OFF|Dosing|Determination))", True),
     "part4":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?IV", False),
     "status":  (r"Participant[-_ ]?Status", True),
     "demo":    (r"^Demographics", False),
@@ -56,6 +56,10 @@ _FILES: Dict[str, Tuple[str, bool]] = {
     "upsit":   (r"Smell[-_ ]?Identification|UPSIT", False),
     "datscan": (r"DaTScan[-_ ]?Analysis|DATSCAN[-_ ]?Analysis|SBR", False),
     "ledd":    (r"LEDD", False),
+    # recognised now, used by the prodromal-conversion endpoint (next stage)
+    "primary_dx": (r"Primary[-_ ]?Clinical[-_ ]?Diagnosis", False),
+    "prodromal":  (r"Prodromal[-_ ]?(Diagnostic|History)", False),
+    "curated":    (r"Curated[-_ ]?Data[-_ ]?Cut", False),
 }
 _LEVODOPA = re.compile(r"levodopa|sinemet|carbidopa|madopar|rytary|duopa|stalevo|benserazide|inbrija", re.I)
 _AGONIST = re.compile(r"pramipexole|mirapex|ropinirole|requip|rotigotine|neupro|apomorphine|apokyn|piribedil", re.I)
