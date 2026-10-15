@@ -275,11 +275,11 @@ download-date suffix is fine; names as served on 15 Oct 2026):
 | LONI group | file | used for |
 |---|---|---|
 | Motor Assessments | `MDS-UPDRS_Part_I`, `MDS-UPDRS_Part_I_Patient_Questionnaire`, `MDS_UPDRS_Part_II__Patient_Questionnaire`, `MDS-UPDRS_Part_III`, `MDS-UPDRS_Part_IV__Motor_Complications` | Part totals (summed from items if the total column is absent), H&Y (`NHY`), exam state (`PDSTATE`, else `PAG_NAME` NUPDR3OF/ON), medicated (`PDTRTMNT`). The ON/OFF Determination & Dosing file is ignored. |
-| Subject Characteristics | `Participant_Status`, `Demographics`, `Age_at_visit` | case/control (`COHORT_DEFINITION`), `ENROLL_STATUS` (only Enrolled / Withdrew / Complete are used), enrol age, sex, birth date, age at visit |
-| Medical History | `PD_Diagnosis_History`, `LEDD_Concomitant_Medication_Log` | diagnosis date → disease duration; ever on levodopa / agonist; LEDD |
+| Subject Characteristics | `Participant_Status`, `Demographics`, `Age_at_visit` | case/control (`COHORT_DEFINITION`), `ENROLL_STATUS` (only Enrolled / Withdrew / Complete are used; Early Imaging counts as PD), enrol age, sex, birth date, age at visit |
+| Medical History | `PD_Diagnosis_History`, `LEDD_Concomitant_Medication_Log` | diagnosis date → disease duration; ever on levodopa / agonist; LEDD at each visit = sum of numeric LEDD spans active on the visit date (non-numeric entries such as `LD x 0.33` are skipped and counted) |
 | Medical History (prodromal endpoint) | `Primary_Research_Diagnosis`, `Clinical_Diagnosis`, `Prodromal_Diagnostic_Questionnaire` | recognised and listed by the dry run; used by the phenoconversion endpoint |
 | Non-motor Assessments | `University_of_Pennsylvania_Smell_Identification_Test_UPSIT` | UPSIT total (`TOTAL_CORRECT`) |
-| Imaging | `Xing_Core_Lab_-_Quant_SBR` (formerly DaTscan Analysis), `Xing_Core_Lab_-_Visual_Read` | putamen / caudate SBR; visual read |
+| Imaging | `Xing_Core_Lab_-_Quant_SBR` (formerly DaTscan Analysis), `Xing_Core_Lab_-_Visual_Read` | whole-region `PUTAMEN_L/R_REF_CWM`, `CAUDATE_L/R_REF_CWM` (sub-regions ignored). These are cerebellar-white-matter-referenced and not on the AMP-PD occipital-referenced scale, so with `ppmi_datscan_override: true` (default) they replace the AMP-PD SBR on every PPMI row; the visual read is recognised for the prodromal endpoint |
 | Curated Data | `PPMI_Curated_Data_Cut_Public_<date>.xlsx` | cross-check / fallback (second sheet is the data) |
 
 Then:

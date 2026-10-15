@@ -673,6 +673,27 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
                                   part_iv_missing_as_zero=bool(ASSEMBLY["updrs_part_iv_missing_as_zero"]))
         if native is not None:
             base = merge_native(base, native, PPMI_CLINICAL_MODE)
+            from .config import PPMI_DATSCAN_OVERRIDE
+            dcols = [c for c in native.columns if c.startswith("datscan_") and not c.endswith("_baseline")]
+            if PPMI_DATSCAN_OVERRIDE and dcols and bool(native.attrs.get("datscan_cwm", False)):
+                # one SBR scale for every PPMI participant (Xing core-lab re-analysis)
+                key = ["participant_id", "visit_name"]
+                nat = native[key + dcols].dropna(subset=dcols, how="all").drop_duplicates(key).set_index(key)
+                idx = pd.MultiIndex.from_frame(base[key].astype(str))
+                is_pp = base["participant_id"].astype(str).str.upper().str.startswith(TRAIN_PREFIX)
+                n_rep = 0
+                for c in dcols:
+                    vals = nat[c].reindex(idx).values
+                    hit = is_pp.values & ~pd.isna(vals)
+                    base.loc[hit, c] = vals[hit]
+                    base.loc[is_pp.values & ~hit, c] = np.nan
+                    n_rep = max(n_rep, int(hit.sum()))
+                    bl = (nat.reset_index().assign(m=_month_from_key(nat.reset_index()["visit_name"]))
+                             .sort_values(["participant_id", "m"]).drop_duplicates("participant_id")
+                             .set_index("participant_id")[c])
+                    base.loc[is_pp, f"{c}_baseline"] = base.loc[is_pp, "participant_id"].map(bl)
+                print(f"    [DaTSCAN override] Xing core-lab SBR applied to {n_rep} PPMI rows "
+                      f"(AMP-PD occipital-referenced values replaced for scale consistency)")
             base["cohort"] = _cohort_from_pid(base["participant_id"])
             if not ASSEMBLY["keep_other_cohorts"]:
                 base = base[base["cohort"] != "OTHER"]

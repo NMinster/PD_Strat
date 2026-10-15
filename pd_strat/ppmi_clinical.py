@@ -71,10 +71,14 @@ _AGONIST = re.compile(r"pramipexole|mirapex|ropinirole|requip|rotigotine|neupro|
 
 def _read(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
     if Path(path).suffix.lower() in (".xlsx", ".xls"):
-        sheets = pd.ExcelFile(path).sheet_names
-        # the Curated Data Cut workbook: notes / <date> data / dictionary
-        sheet = sheets[1] if len(sheets) >= 2 else sheets[0]
-        df = pd.read_excel(path, sheet_name=sheet, dtype=str, nrows=nrows)
+        xl = pd.ExcelFile(path)
+        sheet = xl.sheet_names[0]
+        for sh in xl.sheet_names:   # the Curated Data Cut: the data sheet is the one with PATNO
+            cols = [str(c).strip().upper() for c in pd.read_excel(xl, sheet_name=sh, nrows=0).columns]
+            if "PATNO" in cols:
+                sheet = sh
+                break
+        df = pd.read_excel(xl, sheet_name=sheet, dtype=str, nrows=nrows)
     else:
         df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str, nrows=nrows)
     df.columns = [str(c).strip() for c in df.columns]
@@ -225,6 +229,11 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
                                  np.where(s.isin(["y", "yes", "1"]), 1.0, np.where(s.isin(["n", "no", "0"]), 0.0, np.nan)))
         else:
             fr["pd_medicated"] = np.nan
+        evc = _col(df, [r"^EVENT_ID$"])
+        if evc is not None:
+            unm = df.loc[fr["visit_key"].isna(), evc].astype(str).value_counts().head(10)
+            if len(unm):
+                log(f"    [Part III]         EVENT_IDs without a fixed month, rows dropped: {unm.to_dict()}")
         fr = fr.dropna(subset=["visit_key"])
         if prefer_off:
             fr["_off"] = (fr["updrs3_state"] == "OFF").astype(int)
@@ -270,7 +279,7 @@ def _status(path: Optional[str], log) -> Optional[pd.DataFrame]:
         s = df[cdef].astype(str)
         diag = s
         up = s.str.upper()
-        label = np.where(up.str.contains("PARKINSON|^PD$|\\bPD\\b"), "CASE",
+        label = np.where(up.str.contains("PARKINSON|^PD$|\\bPD\\b|EARLY IMAGING"), "CASE",
                 np.where(up.str.contains("HEALTHY|CONTROL|^HC$"), "CONTROL", "OTHER"))
         label = pd.Series(label, index=df.index)
     elif ccode:
@@ -286,6 +295,10 @@ def _status(path: Optional[str], log) -> Optional[pd.DataFrame]:
     out = out.drop_duplicates("participant_id")
     log(f"    [Participant status] {Path(path).name}: {len(out)} participants "
         f"{out['case_control'].value_counts().to_dict()} (cohort col: {cdef or ccode})")
+    if cdef:
+        log(f"      cohort definitions: {df[cdef].astype(str).value_counts().head(8).to_dict()}")
+    if es:
+        log(f"      enrol status: {df[es].astype(str).str.lower().value_counts().head(10).to_dict()}")
     return out
 
 
@@ -352,10 +365,23 @@ def _datscan(path: Optional[str], log) -> Optional[pd.DataFrame]:
     if not path:
         return None
     df = _read(path)
-    put = [c for c in df.columns if re.search(r"putamen", str(c), re.I) and not re.search(r"_ANT|ANTERIOR", str(c), re.I)]
-    cau = [c for c in df.columns if re.search(r"caudate", str(c), re.I)]
+    # whole-region left/right columns only: AMP-PD style DATSCAN_PUTAMEN_R/L or the Xing
+    # core-lab re-analysis PUTAMEN_L_REF_CWM / PUTAMEN_R_REF_CWM (sub-regions such as
+    # PRECOMMISSURAL_PUTAMEN or PRECAUDATE are excluded)
+    def _lr(region):
+        rx = re.compile(rf"^(DATSCAN_)?{region}_(R|L|RIGHT|LEFT)(_REF_CWM)?$", re.I)
+        return [c for c in df.columns if rx.match(str(c))]
+    put, cau = _lr("PUTAMEN"), _lr("CAUDATE")
     if not put and not cau:
         return None
+    cwm = any("CWM" in str(c).upper() for c in put + cau)
+    if cwm:
+        log("    [DaTSCAN] Xing core-lab SBR (cerebellar-white-matter reference): not on the same scale as "
+            "the AMP-PD occipital-referenced SBR -> applied to ALL PPMI rows when ppmi_datscan_override is on")
+    an = _col(df, [r"^DATSCAN_ANALYZED$"])
+    if an:
+        ok = df[an].astype(str).str.strip().str.lower().isin(["yes", "1", "true"])
+        df = df[ok]
     out = pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df)})
     if put:
         out["datscan_putamen"] = df[put].apply(_num).mean(axis=1)
@@ -366,6 +392,7 @@ def _datscan(path: Optional[str], log) -> Optional[pd.DataFrame]:
     out["visit_key"] = out["visit_key"].fillna("M0")
     vals = [c for c in out.columns if c.startswith("datscan_")]
     out = out.dropna(subset=vals, how="all").groupby(["participant_id", "visit_key"], as_index=False)[vals].mean()
+    out.attrs["cwm"] = cwm
     log(f"    [DaTSCAN]          {Path(path).name}: {len(out)} scans (putamen {put}, caudate {cau})")
     return out
 
@@ -384,18 +411,34 @@ def _ledd(path: Optional[str], log) -> Optional[pd.DataFrame]:
                         "on_other_dopaminergic": d.str.contains(_AGONIST).astype(float)})
     out = out.groupby("participant_id", as_index=False).max()
     led = _col(df, [r"^LEDD$"])
-    ledd_v = None
-    if led:
+    sd, ed = _col(df, [r"^STARTDT$"]), _col(df, [r"^STOPDT$"])
+    spans = None
+    n_nonnum = 0
+    if led and sd:
         lv = _num(df[led])
-        ev = _visit(df)
-        ledd_v = (pd.DataFrame({"participant_id": pid, "visit_key": ev, "ledd": lv})
-                  .dropna(subset=["visit_key", "ledd"])
-                  .groupby(["participant_id", "visit_key"], as_index=False)["ledd"].sum())
+        n_nonnum = int(df[led].notna().sum() - lv.notna().sum())   # e.g. "LD x 0.33" (COMT inhibitors)
+        spans = pd.DataFrame({"participant_id": pid, "ledd": lv, "start": _date(df[sd]),
+                              "stop": _date(df[ed]) if ed else pd.NaT}).dropna(subset=["ledd", "start"])
     log(f"    [LEDD log]         {Path(path).name}: {int(out['on_levodopa'].sum())} ever on levodopa, "
         f"{int(out['on_other_dopaminergic'].sum())} on an agonist"
-        + (f"; numeric LEDD on {len(ledd_v)} visits" if ledd_v is not None else ""))
-    out.attrs["ledd_visits"] = ledd_v
+        + (f"; {len(spans)} dated medication spans with numeric LEDD"
+           f"{f' ({n_nonnum} non-numeric LEDD entries skipped)' if n_nonnum else ''}" if spans is not None else ""))
+    out.attrs["ledd_spans"] = spans
     return out
+
+
+def _ledd_at_visits(spans: pd.DataFrame, vdates: pd.DataFrame) -> pd.DataFrame:
+    """Total LEDD active at each dated visit (a span is active from STARTDT through the
+    month of STOPDT, open-ended if STOPDT is blank) -> participant_id, visit_key, ledd."""
+    if spans is None or vdates is None or not len(spans) or not len(vdates):
+        return pd.DataFrame(columns=["participant_id", "visit_key", "ledd"])
+    m = vdates.merge(spans, on="participant_id", how="inner")
+    stop = m["stop"].fillna(pd.Timestamp("2100-01-01")) + pd.offsets.MonthEnd(0)
+    act = (m["visit_date"] >= m["start"]) & (m["visit_date"] <= stop)
+    tot = m[act].groupby(["participant_id", "visit_key"], as_index=False)["ledd"].sum()
+    # dated visits with no active span are untreated (LEDD 0), not missing
+    base = vdates[["participant_id", "visit_key"]].drop_duplicates()
+    return base.merge(tot, on=["participant_id", "visit_key"], how="left").fillna({"ledd": 0.0})
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -515,9 +558,11 @@ def load_ppmi_native(root: str, prefer_off: bool = True, part_iv_missing_as_zero
             base[f"{c}_baseline"] = base["participant_id"].map(bl[c])
     if led is not None:
         base = base.merge(led, on="participant_id", how="left")
-        lv = led.attrs.get("ledd_visits")
-        if lv is not None and len(lv):
+        lv = _ledd_at_visits(led.attrs.get("ledd_spans"), vdates)
+        if len(lv):
             base = base.merge(lv, on=["participant_id", "visit_key"], how="left")
+            log(f"    [LEDD at visit]    {int(base['ledd'].notna().sum())} rows, "
+                f"{int((base['ledd'] > 0).sum())} with LEDD > 0")
     for c in ("on_levodopa", "on_other_dopaminergic", "ledd", "race", "ethnicity"):
         if c not in base.columns:
             base[c] = np.nan
@@ -527,6 +572,7 @@ def load_ppmi_native(root: str, prefer_off: bool = True, part_iv_missing_as_zero
     base["site"] = "PP"
     base["source"] = "ppmi_native"
     base = base.dropna(subset=["visit_name"])
+    base.attrs["datscan_cwm"] = bool(dat.attrs.get("cwm", False)) if dat is not None else False
     log(f"    -> {len(base)} participant-visits, {base['participant_id'].nunique()} participants, "
         f"updrs_total on {int(np.isfinite(base['updrs_total']).sum())} rows; "
         f"{base['case_control'].value_counts().to_dict()}")
@@ -594,6 +640,34 @@ def describe(root: str) -> None:
     others = [p for p in Path(root).rglob("*") if p.is_file() and p.suffix.lower() in _TABULAR and str(p) not in used]
     if others:
         print("  not used:", ", ".join(p.name for p in others))
+    print()
+    # value distributions the phenoconversion endpoint will rely on
+    for key, cols in (("primary_dx", ["PRIMDIAG", "DXLVL"]), ("clinical_dx", ["NEWDIAG", "DIAGSINLV"]),
+                      ("prodromal", ["PRIMDIAG", "PSLVL2"]), ("datscan_visual", ["DATSCAN_VISINTRP"])):
+        if files[key]:
+            try:
+                d = _read(files[key])
+                for c in cols:
+                    if c in d.columns:
+                        print(f"  {key}.{c}: {d[c].astype(str).value_counts().head(25).to_dict()}")
+                if key == "primary_dx" and "PRIMDIAG" in d.columns and "PATNO" in d.columns:
+                    ev = d["EVENT_ID"].astype(str).value_counts().head(15).to_dict() if "EVENT_ID" in d.columns else {}
+                    print(f"  primary_dx visits: {ev}")
+            except Exception as e:
+                print(f"  ({key}: {type(e).__name__}: {e})")
+    if files["curated"]:
+        try:
+            xl = pd.ExcelFile(files["curated"])
+            print(f"  curated workbook sheets: {xl.sheet_names}")
+            for sh in xl.sheet_names:
+                dd = pd.read_excel(xl, sheet_name=sh, dtype=str)
+                if "Variable" in dd.columns and "Code" in dd.columns:
+                    sub = dd[dd["Variable"].astype(str).str.upper().isin(["PRIMDIAG", "NEWDIAG", "COHORT", "COHORT_DEFINITION", "SUBGROUP", "CONPD", "PHENOCNV", "PHENOCONV", "DIAGSINLV"])]
+                    for _, r in sub.iterrows():
+                        print(f"  dict {r['Variable']}: {str(r.get('Code'))[:120]} = {str(r.get('Decode'))[:160]}")
+                    break
+        except Exception as e:
+            print(f"  (curated: {type(e).__name__}: {e})")
     print()
     df = load_ppmi_native(root)
     if df is not None:
