@@ -301,6 +301,34 @@ unchanged. AMP-PD rows are never replaced. Part I needs both the clinician
 file and the patient questionnaire to match the AMP-PD 13-item total; the
 reader says so if the questionnaire is missing.
 
+### Prodromal phenoconversion (§16, report 5e)
+
+When `ppmi_clinical_dir` is set, assembly also writes
+`tables/ppmi_prodromal_conversion.csv`: one row per *Prodromal* enrollee with
+the date of the first research or clinical diagnosis in `ppmi_conversion_codes`
+(default `[1]` = idiopathic PD, from `Primary_Research_Diagnosis` PRIMDIAG and
+`Clinical_Diagnosis` NEWDIAG), the last dated visit for censoring, the
+enrolment subgroup flags (RBD, hyposmia, LRRK2, GBA, …) and the baseline
+DaTscan visual read. `pd_strat/prodromal.py` then asks whether the baseline
+plasma proteome predicts conversion beyond what a neurologist can assess at that
+point, on prodromal participants with a baseline Olink sample and no PD
+diagnosis at sampling (time starts at the sample):
+
+1. the PD-severity score (trained on PD + HC, never on prodromal participants)
+   in Cox models unadjusted and adjusted for age, sex, UPSIT, DaTscan putamen
+   SBR and Part III, against a clinical-only Cox model (C-index);
+2. AUROC for conversion within `prodromal_horizons_months` (default 36, 60)
+   versus a clinical logistic model, paired bootstrap Δ;
+3. a conversion-specific nested-CV classifier (proteomics / clinical / both,
+   same zoo as the discovery benchmark), evaluated once on the held-out
+   prodromal participants (`holdout_fraction`).
+
+Outputs: `prodromal_scores.csv`, `prodromal_conversion_cox.csv`,
+`prodromal_conversion_auroc.csv`, `prodromal_conversion_benchmark*.csv`,
+`figures/fig_prodromal_conversion_km.png`. A held-out Δ over the clinical model
+whose CI excludes 0 is the result that supports "predicts conversion beyond
+clinical assessment".
+
 ### Testing a panel from one run on another assay or cohort
 
 `--include_proteins` restricts modelling to a listed set of accessions, given as

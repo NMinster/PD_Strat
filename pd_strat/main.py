@@ -251,6 +251,11 @@ def main():
         _stage("discovery", run_discovery, clin, z_prot, M_prot, y_all, cohort, tv,
                optional=True)
 
+    # ── §16 Prodromal phenoconversion (needs ppmi_clinical_dir) ───────
+    from .prodromal import run_prodromal
+    _stage("prodromal", run_prodromal, clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
+           PANEL_COL_INDICES, USE_PANEL_AWARE, PRIMARY_LABEL, optional=True)
+
     # ── §10 Robustness ────────────────────────────────────────────────
     if FLAGS.skip_robustness:
         print("\n[Robustness SKIPPED per --skip_robustness]")

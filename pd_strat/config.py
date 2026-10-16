@@ -250,6 +250,10 @@ PPMI_CLINICAL_MODE = str(_cfg("ppmi_clinical_mode", "fill")).lower()
 # Xing core-lab SBR (CWM reference) replaces AMP-PD SBR on every PPMI row so all
 # PPMI DaTSCAN values share one scale (PDBP has no DaTSCAN either way)
 PPMI_DATSCAN_OVERRIDE = bool(_cfg("ppmi_datscan_override", True))
+# Phenoconversion endpoint (prodromal enrollees): PRIMDIAG / NEWDIAG codes that
+# count as conversion (1 = idiopathic PD) and the horizons for AUROC
+PPMI_CONVERSION_CODES: List[int] = [int(x) for x in (_cfg("ppmi_conversion_codes", [1]) or [1])]
+PRODROMAL_HORIZONS: List[int] = [int(x) for x in (_cfg("prodromal_horizons_months", [36, 60]) or [36, 60])]
 STABILITY_B     = int(_cfg("stability_B", 200))
 PAIRED_BOOT_B   = int(_cfg("paired_boot_B", 1000))
 PLR_BOOT_B      = int(_cfg("participant_boot_B", 2000))

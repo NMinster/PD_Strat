@@ -132,13 +132,49 @@ def _pid(df: pd.DataFrame) -> pd.Series:
     return "PP-" + v
 
 
+_BL_DATES: Dict[str, pd.Timestamp] = {}     # participant -> baseline (BL/SC) visit date, set by load_ppmi_native
+
+
 def _visit(df: pd.DataFrame) -> pd.Series:
+    """Visit key 'M<months>': scheduled EVENT_IDs from the PPMI schedule; any other code
+    (remote R01.., unscheduled U01..) from the row's INFODT relative to the participant's
+    baseline date when that is known."""
     c = _col(df, [r"^EVENT_ID$", r"^visit_name$", r"^event"])
     if c is None:
         return pd.Series("M0", index=df.index)
     ev = df[c].astype(str).str.strip().str.upper()
-    m = ev.map(PPMI_EVENT_MONTHS)
+    m = pd.to_numeric(ev.map(PPMI_EVENT_MONTHS), errors="coerce")
+    dcol = _col(df, [r"^INFODT$"])
+    if dcol is not None and _BL_DATES and m.isna().any():
+        pid = _pid(df)
+        bl = pid.map(_BL_DATES)
+        d = _date(df[dcol])
+        derived = ((d - bl).dt.days / 30.4375).round()
+        fill = m.isna() & derived.notna() & (derived >= 0)
+        m = m.where(~fill, derived)
     return m.map(lambda x: f"M{int(x)}" if pd.notna(x) else pd.NA)
+
+
+def _baseline_dates(paths: List[Optional[str]]) -> Dict[str, pd.Timestamp]:
+    """Participant -> date of the BL visit (else SC, else earliest dated visit)."""
+    rows = []
+    for pth in paths:
+        if not pth:
+            continue
+        try:
+            df = _read(pth)
+        except Exception:
+            continue
+        ev = _col(df, [r"^EVENT_ID$"]); dc = _col(df, [r"^INFODT$"])
+        if ev is None or dc is None:
+            continue
+        rows.append(pd.DataFrame({"participant_id": _pid(df), "ev": df[ev].astype(str).str.upper(), "d": _date(df[dc])}))
+    if not rows:
+        return {}
+    r = pd.concat(rows).dropna(subset=["d"])
+    r["rank"] = r["ev"].map({"BL": 0, "SC": 1}).fillna(2)
+    r = r.sort_values(["participant_id", "rank", "d"]).drop_duplicates("participant_id")
+    return dict(zip(r["participant_id"], r["d"]))
 
 
 def _total(df: pd.DataFrame, total_pats: List[str], item_prefix: str, exclude: List[str]) -> pd.Series:
@@ -463,6 +499,10 @@ def load_ppmi_native(root: str, prefer_off: bool = True, part_iv_missing_as_zero
         log("    -> Parts I, II and III are all needed for updrs_total; nothing appended")
         return None
 
+    global _BL_DATES
+    _BL_DATES = _baseline_dates([files["part3"], files["part1"], files["part2"]])
+    log(f"    baseline visit dates for {len(_BL_DATES):,} participants (unscheduled EVENT_IDs such as "
+        f"R01.. are keyed by months since that date)")
     upd, vdates = _updrs_tables(files, prefer_off, log)
     for p in ("i", "ii", "iii", "iv"):
         c = f"mds_updrs_part_{p}_total"
@@ -499,8 +539,9 @@ def load_ppmi_native(root: str, prefer_off: bool = True, part_iv_missing_as_zero
     if st is not None:
         base = base.merge(st, on="participant_id", how="left")
         # user guide: analyses should use Enrolled / Withdrew / Complete only
-        keep_status = {"enrolled", "withdrew", "complete", "completed", "nan", ""}
-        bad = ~base["enroll_status"].astype(str).isin(keep_status) & base["enroll_status"].notna()
+        es_ = base["enroll_status"].astype(str).str.lower()
+        keep = es_.str.startswith(("enrolled", "withdr", "complete")) | es_.str.contains("withdraw") | es_.isin(["nan", ""])
+        bad = ~keep & base["enroll_status"].notna()
         if bad.any():
             log(f"    [enroll status] dropping {base.loc[bad, 'participant_id'].nunique()} participants with status "
                 f"{sorted(base.loc[bad, 'enroll_status'].astype(str).unique())[:6]}")
@@ -573,10 +614,83 @@ def load_ppmi_native(root: str, prefer_off: bool = True, part_iv_missing_as_zero
     base["source"] = "ppmi_native"
     base = base.dropna(subset=["visit_name"])
     base.attrs["datscan_cwm"] = bool(dat.attrs.get("cwm", False)) if dat is not None else False
+    try:
+        from .config import PPMI_CONVERSION_CODES
+    except Exception:
+        PPMI_CONVERSION_CODES = [1]
+    base.attrs["conversion"] = build_conversion_table(files, st, list(PPMI_CONVERSION_CODES), log)
     log(f"    -> {len(base)} participant-visits, {base['participant_id'].nunique()} participants, "
         f"updrs_total on {int(np.isfinite(base['updrs_total']).sum())} rows; "
         f"{base['case_control'].value_counts().to_dict()}")
     return base
+
+
+def build_conversion_table(files: Dict[str, Optional[str]], status: Optional[pd.DataFrame],
+                           codes: List[int], log=print) -> Optional[pd.DataFrame]:
+    """Phenoconversion of prodromal enrollees.
+
+    event = first visit after baseline at which the research or clinical diagnosis
+    is one of `codes` (default 1 = idiopathic PD); censor = last dated visit in any
+    diagnosis / UPDRS file.  Returns one row per prodromal participant.
+    """
+    if status is None or not files.get("primary_dx") and not files.get("clinical_dx"):
+        return None
+    pro = status[status["diagnosis"].astype(str).str.upper().str.contains("PRODROMAL")]
+    if pro.empty:
+        return None
+    # subgroup flags from Participant_Status (hyposmia, RBD, genetic)
+    st = _read(files["status"])
+    flags = pd.DataFrame({"participant_id": _pid(st)})
+    for c in ("ENRLHPSM", "ENRLRBD", "ENRLLRRK2", "ENRLGBA", "ENRLSNCA", "ENRLPRKN", "ENRLPINK1"):
+        if c in st.columns:
+            flags[c.lower()] = _num(st[c])
+    flags = flags.drop_duplicates("participant_id")
+    dx_rows, last_rows = [], []
+    for key, col in (("primary_dx", "PRIMDIAG"), ("clinical_dx", "NEWDIAG")):
+        if not files.get(key):
+            continue
+        d = _read(files[key])
+        if col not in d.columns:
+            continue
+        dc = _col(d, [r"^INFODT$"]); dd = _col(d, [r"^DIAGDT$"])
+        when = _date(d[dc]) if dc else pd.NaT
+        if dd:
+            when = _date(d[dd]).fillna(when)
+        fr = pd.DataFrame({"participant_id": _pid(d), "code": _num(d[col]), "when": when, "source": key})
+        last_rows.append(fr[["participant_id", "when"]])
+        dx_rows.append(fr[fr["code"].isin(codes)])
+    for key in ("part3", "part1", "part2"):
+        if files.get(key):
+            d = _read(files[key]); dc = _col(d, [r"^INFODT$"])
+            if dc:
+                last_rows.append(pd.DataFrame({"participant_id": _pid(d), "when": _date(d[dc])}))
+    dx = pd.concat(dx_rows) if dx_rows else pd.DataFrame(columns=["participant_id", "code", "when", "source"])
+    last = pd.concat(last_rows).dropna().groupby("participant_id")["when"].max()
+    out = pro[["participant_id", "diagnosis"]].merge(flags, on="participant_id", how="left")
+    out["baseline_date"] = out["participant_id"].map(_BL_DATES)
+    first = dx.dropna(subset=["when"]).sort_values("when").drop_duplicates("participant_id").set_index("participant_id")
+    out["event_date"] = out["participant_id"].map(first["when"])
+    out["converted_code"] = out["participant_id"].map(first["code"])
+    out["converted_source"] = out["participant_id"].map(first["source"])
+    out["last_visit_date"] = out["participant_id"].map(last)
+    months = lambda a, b: (a - b).dt.days / 30.4375
+    out["event"] = out["event_date"].notna().astype(int)
+    out["months"] = np.where(out["event"] == 1, months(out["event_date"], out["baseline_date"]),
+                             months(out["last_visit_date"], out["baseline_date"]))
+    out["prevalent_at_baseline"] = (out["event"] == 1) & (out["months"] <= 0)
+    vis = files.get("datscan_visual")
+    if vis:
+        v = _read(vis); vc = _col(v, [r"VISINTRP"]); dc = _col(v, [r"DATSCAN_DATE", r"^INFODT$"])
+        if vc:
+            vv = pd.DataFrame({"participant_id": _pid(v), "read": v[vc].astype(str).str.lower(),
+                               "when": _date(v[dc]) if dc else pd.NaT}).sort_values("when").drop_duplicates("participant_id")
+            out["datscan_visual_baseline"] = out["participant_id"].map(
+                vv.set_index("participant_id")["read"].map({"positive": 1.0, "negative": 0.0}))
+    n_ev = int(((out["event"] == 1) & ~out["prevalent_at_baseline"]).sum())
+    log(f"    [conversion]       {len(out)} prodromal enrollees; {n_ev} converted to codes {codes} after baseline "
+        f"({int(out['prevalent_at_baseline'].sum())} already diagnosed at baseline, excluded); "
+        f"median follow-up {np.nanmedian(out.loc[out['event'] == 0, 'months']):.0f} months among non-converters")
+    return out
 
 
 def merge_native(base: pd.DataFrame, native: pd.DataFrame, mode: str, log=print) -> pd.DataFrame:
@@ -664,7 +778,9 @@ def describe(root: str) -> None:
                 if "Variable" in dd.columns and "Code" in dd.columns:
                     sub = dd[dd["Variable"].astype(str).str.upper().isin(["PRIMDIAG", "NEWDIAG", "COHORT", "COHORT_DEFINITION", "SUBGROUP", "CONPD", "PHENOCNV", "PHENOCONV", "DIAGSINLV"])]
                     for _, r in sub.iterrows():
-                        print(f"  dict {r['Variable']}: {str(r.get('Code'))[:120]} = {str(r.get('Decode'))[:160]}")
+                        code = str(r.get("Code")).replace("\n", " | "); dec = str(r.get("Decode")).replace("\n", " | ")
+                        print(f"  dict {r['Variable']}: codes = {code[:600]}")
+                        print(f"       decode = {dec[:1200]}")
                     break
         except Exception as e:
             print(f"  (curated: {type(e).__name__}: {e})")

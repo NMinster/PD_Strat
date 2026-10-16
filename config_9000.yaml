@@ -106,3 +106,6 @@ extra_biomarkers:
 # Check first with: python -m pd_strat.ppmi_clinical S:/PPMI_clinical
 ppmi_clinical_dir: S:/PPMI_clinical
 ppmi_clinical_mode: fill      # fill = add missing visits too; participants = new participants only
+ppmi_datscan_override: true   # Xing core-lab SBR replaces AMP-PD SBR on all PPMI rows (one scale)
+ppmi_conversion_codes: [1]    # PRIMDIAG / NEWDIAG codes counted as phenoconversion (1 = idiopathic PD)
+prodromal_horizons_months: [36, 60]

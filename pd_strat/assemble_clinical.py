@@ -672,6 +672,9 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
                                   prefer_off=bool(ASSEMBLY["updrs3_prefer_off_state"]),
                                   part_iv_missing_as_zero=bool(ASSEMBLY["updrs_part_iv_missing_as_zero"]))
         if native is not None:
+            conv = native.attrs.get("conversion")
+            if conv is not None:
+                conv.to_csv(TAB / "ppmi_prodromal_conversion.csv", index=False)
             base = merge_native(base, native, PPMI_CLINICAL_MODE)
             from .config import PPMI_DATSCAN_OVERRIDE
             dcols = [c for c in native.columns if c.startswith("datscan_") and not c.endswith("_baseline")]

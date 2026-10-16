@@ -463,6 +463,27 @@ def build_report(summary: Dict[str, Any]) -> str:
         L += ["Top 20 by stability-weighted importance:", ""]
         L += _csv_table(ROB / "stability_selection.csv", max_rows=20)
 
+    # ── 5e. Prodromal phenoconversion ───────────────────────────────────
+    pr = summary.get("prodromal")
+    if pr and pr.get("n"):
+        L += ["## 5e. Prodromal phenoconversion: does the baseline proteome predict conversion to PD?", ""]
+        L += [f"Prodromal enrollees with a baseline Olink sample and no PD diagnosis at sampling: "
+              f"**{pr['n']}** ({pr['n_events']} converted). The PD-severity score is transported from the "
+              f"PD + HC model (never fitted on prodromal participants); clinical covariates: "
+              f"{', '.join(pr.get('clinical_covariates', [])) or 'none'}. TEST = held-out prodromal participants.", ""]
+        if pr.get("cox"):
+            L += ["**Cox (HR per SD of the first term; clinical_only reports the HR of its first covariate "
+                  "and the C-index of the clinical model)**", ""] + _md_table(pr["cox"])
+        if pr.get("auroc"):
+            L += ["**Conversion within a horizon: AUROC of the score vs a clinical logistic model "
+                  "(paired bootstrap Δ)**", ""] + _md_table(pr["auroc"])
+        if pr.get("benchmark"):
+            L += ["**Conversion-specific classifier (nested CV on TRAIN prodromal, TEST once). "
+                  "A TEST Δ vs clinical whose CI excludes 0 supports 'predicts conversion beyond clinical "
+                  "assessment'.**", ""] + _md_table(pr["benchmark"])
+        if (FIG / "fig_prodromal_conversion_km.png").exists():
+            L += ["", "![KM](figures/fig_prodromal_conversion_km.png)", ""]
+
     # ── 7c. Confirmatory ────────────────────────────────────────────────
     cf = summary.get("confirmatory")
     if cf:
