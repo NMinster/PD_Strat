@@ -207,19 +207,49 @@ def _baseline_dates(paths: List[Optional[str]]) -> Dict[str, pd.Timestamp]:
     return dict(zip(r["participant_id"], r["d"]))
 
 
-def _total(df: pd.DataFrame, total_pats: List[str], item_prefix: str, exclude: List[str]) -> pd.Series:
-    """Section total: the total column where present, else the sum of the item
-    columns (archived legacy files carry items only; a merged archived + current
-    table has both layouts side by side)."""
-    c = _col(df, total_pats)
-    tot = _num(df[c]) if c is not None else pd.Series(np.nan, index=df.index)
+# MDS-UPDRS items are scored 0-4; PPMI codes "unable to rate" as 101.  A section
+# total is prorated from the available items when at most `allow_missing` items
+# are missing (Goetz et al. 2015: Part I/II/IV one item, Part III seven items),
+# otherwise it is missing.  Provided totals are only trusted within the section
+# range and when no item carries a code.
+_SECTION = {  # prefix regex -> (n_items, allow_missing, max_total)
+    "p1r": (6, 1, 24), "p1p": (7, 1, 28), "p2": (13, 1, 52), "p3": (33, 7, 132), "p4": (6, 1, 24),
+}
+
+
+def _total(df: pd.DataFrame, total_pats: List[str], item_prefix: str, exclude: List[str],
+           section: Optional[str] = None, log=None) -> pd.Series:
+    """Section total from the items (0-4 each; codes > 4 = missing), prorated per
+    the MDS-UPDRS rules; the provided total column is used only where the items
+    are unavailable and it lies within the section range."""
+    n_items, allow, max_total = _SECTION.get(section, (None, 0, 260))
     items = [k for k in df.columns if re.match(item_prefix, str(k), re.I)
              and not any(re.search(e, str(k), re.I) for e in exclude)]
+    tot = pd.Series(np.nan, index=df.index)
+    n_coded = 0
     if items:
         vals = df[items].apply(_num)
-        s = vals.sum(axis=1, min_count=1)
-        s[vals.isna().any(axis=1)] = np.nan     # incomplete questionnaires are not totals
-        tot = tot.fillna(s)
+        coded = (vals > 4) | (vals < 0)
+        n_coded = int(coded.any(axis=1).sum())
+        vals = vals.mask(coded)
+        n_avail = vals.notna().sum(axis=1)
+        k = n_items or len(items)
+        ok = (n_avail >= k - allow) & (n_avail > 0)
+        tot = (vals.mean(axis=1) * k).where(ok)
+    c = _col(df, total_pats)
+    if c is not None:
+        given = _num(df[c])
+        given = given.where((given >= 0) & (given <= max_total))
+        if items:
+            # use the given total where the row carries no items at all (a file version
+            # with totals only) or where every item was clean and complete
+            k = n_items or len(items)
+            tot = tot.where(tot.notna(), given.where((n_avail == 0) | (n_avail == k)))
+        else:
+            tot = given
+    if log and n_coded:
+        log(f"      {n_coded:,} rows had item codes outside 0-4 (e.g. 101 = unable to rate) -> treated as missing, "
+            f"total prorated when <= {allow} item(s) missing")
     return tot
 
 
@@ -246,13 +276,13 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
     # Part I = clinician-rated (NP1R) + patient questionnaire (NP1P)
     if files["part1"]:
         df = _read(files["part1"]); _dates_from(df)
-        t = _total(df, [r"^NP1RTOT$", r"^NP1TOT$"], r"^NP1(COG|HALL|DPRS|ANXS|APAT|DDS)$", [])
+        t = _total(df, [r"^NP1RTOT$", r"^NP1TOT$"], r"^NP1(COG|HALL|DPRS|ANXS|APAT|DDS)$", [], "p1r", log)
         p1 = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df), "p1r": t}), "p1r")
         log(f"    [Part I clinician] {_name(files['part1'])}: {len(p1)} visits "
             f"(total col: {_col(df, [r'^NP1RTOT$', r'^NP1TOT$']) or 'summed items'})")
         if files["part1pq"]:
             dq = _read(files["part1pq"]); _dates_from(dq)
-            tq = _total(dq, [r"^NP1PTOT$"], r"^NP1(SLPN|SLPD|PAIN|URIN|CNST|LTHD|FATG)$", [])
+            tq = _total(dq, [r"^NP1PTOT$"], r"^NP1(SLPN|SLPD|PAIN|URIN|CNST|LTHD|FATG)$", [], "p1p", log)
             pq = _agg_visit(pd.DataFrame({"participant_id": _pid(dq), "visit_key": _visit(dq), "p1p": tq}), "p1p")
             log(f"    [Part I patient]   {_name(files['part1pq'])}: {len(pq)} visits")
             p1 = p1.merge(pq, on=["participant_id", "visit_key"], how="outer")
@@ -265,7 +295,7 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
 
     if files["part2"]:
         df = _read(files["part2"]); _dates_from(df)
-        t = _total(df, [r"^NP2PTOT$", r"^NP2TOT$"], r"^NP2[A-Z]+$", [r"TOT"])
+        t = _total(df, [r"^NP2PTOT$", r"^NP2TOT$"], r"^NP2[A-Z]+$", [r"TOT"], "p2", log)
         p2 = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df),
                                       "mds_updrs_part_ii_total": t}), "mds_updrs_part_ii_total")
         log(f"    [Part II]          {_name(files['part2'])}: {len(p2)} visits")
@@ -273,10 +303,10 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
 
     if files["part3"]:
         df = _read(files["part3"]); _dates_from(df)
-        t = _total(df, [r"^NP3TOT$"], r"^NP3[A-Z]+$", [r"TOT"])
+        t = _total(df, [r"^NP3TOT$"], r"^NP3[A-Z]+$", [r"TOT"], "p3", log)
         fr = pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df), "mds_updrs_part_iii_total": t})
         hy = _col(df, [r"^NHY$", r"hoehn"])
-        fr["hoehn_yahr"] = _num(df[hy]) if hy else np.nan
+        fr["hoehn_yahr"] = _num(df[hy]).where(lambda v: (v >= 0) & (v <= 5)) if hy else np.nan
         st = _col(df, [r"^PDSTATE$", r"^ON_OFF", r"state"])
         state = pd.Series("UNK", index=df.index, dtype="object")
         if st:
@@ -318,7 +348,7 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
 
     if files["part4"]:
         df = _read(files["part4"]); _dates_from(df)
-        t = _total(df, [r"^NP4TOT$"], r"^NP4[A-Z]+$", [r"TOT"])
+        t = _total(df, [r"^NP4TOT$"], r"^NP4[A-Z]+$", [r"TOT", r"DEN$", r"NUM$", r"PCT$"], "p4", log)
         p4 = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df),
                                       "mds_updrs_part_iv_total": t}), "mds_updrs_part_iv_total")
         log(f"    [Part IV]          {_name(files['part4'])}: {len(p4)} visits")
@@ -424,6 +454,7 @@ def _upsit(path: Optional[str], log) -> Optional[pd.DataFrame]:
         tot = df[bk].apply(_num).sum(axis=1, min_count=len(bk))
     else:
         tot = _num(df[c])
+    tot = tot.where((tot >= 0) & (tot <= 40))
     out = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df), "upsit_total": tot}), "upsit_total")
     log(f"    [UPSIT]            {_name(path)}: {len(out)} visits (col: {c or 'booklets'})")
     return out

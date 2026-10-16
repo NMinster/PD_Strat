@@ -280,6 +280,40 @@ without UPDRS), the OOF Δ for the same configuration was −0.09 (selection did
 favour it), it is one of four targets, and the MLP was chosen among 27 configs. Report
 it as supportive of the within-PD partial ρ, not as a prognostic result.
 
+---
+
+# Sixth run (2026-10-16): Explore HT + PPMI-native clinical exports — INVALID, re-run required
+
+The PPMI-native reader did its job on the join: 83/3,435 HT samples unmatched (was
+2,035); **2,243 participants / 3,352 samples** aligned; modelled PD 724 TRAIN + 341
+holdout, HC 359 + 165; 11,740 overlapping visits agree with AMP-PD at r = 0.999;
++3,765 new participants and +8,346 new visits for existing ones.
+
+**But the appended rows carried PPMI's "unable to rate" code (101) inside item and
+total columns**: UPDRS max 689 (scale max 260), HC rows 9.3 ± 30. Every analysis in
+this run was trained on a corrupted target (slopes averaging 14 points/year, mixed
+β −2.3 [−6.0, +1.3]). Do not use any number from it. Fixed in the reader (items > 4
+→ missing, MDS-UPDRS prorating rules: ≤ 1 missing item in Parts I/II/IV, ≤ 7 in Part
+III; given totals trusted only within range) and by a hard scale guard in assembly.
+
+What the run did show, to be re-checked after the fix:
+* Prodromal conversion cohort exists at useful size: **958 prodromal enrollees with a
+  baseline HT sample, 103 converters, median follow-up 42 months**; TRAIN 668 / 64,
+  holdout 290 / 39.
+* The transported severity score predicted conversion with HR 1.71 [1.46, 2.00] per
+  SD unadjusted and **1.63 [1.11, 2.39] (p = 0.013) in the holdout after adjusting for
+  age, sex, UPSIT, DaT putamen SBR and Part III**. Clinical-only C = 0.75 vs 0.79 with
+  the score.
+* As a classifier the score alone trails the clinical + imaging model (36-month AUROC
+  0.68 vs 0.72 holdout; 60-month 0.72 vs 0.85), and adding 5,000 proteins to the
+  clinical model degrades it (TEST 0.66 vs 0.78) — hyposmia + DaT deficit are already
+  strong conversion predictors. The decisive comparison, score + clinical vs clinical,
+  is now computed (AUROC Δ with paired CI and a "score+clinical" feature set in the
+  benchmark).
+
+The score itself was trained on the corrupted target, so the prodromal numbers may
+move either way on the re-run.
+
 ## What to say in the paper (updated)
 1. Replicated modest plasma-proteomic correlate of motor severity within PD
    (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.

@@ -220,9 +220,23 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
                     q = clone(clf_pipe).fit(tr[clin_cols].values.astype(float)[oktr], ytr[oktr]).predict_proba(Xc[ok])[:, 1]
                 if q is not None and np.isfinite(q).all():
                     row["auroc_clinical"] = _metric("clf", y[ok], q)
-                    # score + clinical: logistic on [clinical, score], same fitting rule
                     row["delta_score_vs_clinical"] = row["auroc_score"] - row["auroc_clinical"]
                     row.update({f"score_{k}": v for k, v in _boot_ci("clf", y[ok], s, q).items()})
+                    # score + clinical logistic (the "adds to clinical assessment" test), same rule
+                    Xsc = np.column_stack([Xc, sub["score"].values.astype(float)])
+                    Xsc_tr = np.column_stack([tr[clin_cols].values.astype(float), tr["score"].values.astype(float)])
+                    qs = np.full(ok.sum(), np.nan)
+                    if split == "TRAIN":
+                        Xk, yk = Xsc[ok], y[ok]
+                        if min((yk == 1).sum(), (yk == 0).sum()) >= 5:
+                            for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(Xk, yk):
+                                qs[b] = clone(clf_pipe).fit(Xk[a], yk[a]).predict_proba(Xk[b])[:, 1]
+                    elif oktr.sum() >= 20:
+                        qs = clone(clf_pipe).fit(Xsc_tr[oktr], ytr[oktr]).predict_proba(Xsc[ok])[:, 1]
+                    if np.isfinite(qs).all():
+                        row["auroc_score_plus_clinical"] = _metric("clf", y[ok], qs)
+                        row["delta_score_plus_clinical_vs_clinical"] = row["auroc_score_plus_clinical"] - row["auroc_clinical"]
+                        row.update({f"combined_{k}": v for k, v in _boot_ci("clf", y[ok], qs, q).items()})
                 else:
                     q = None
             if q is None:
@@ -233,7 +247,11 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
                   f"{row.get('score_ci_hi', np.nan):.2f}]"
                   + (f"  clinical={row['auroc_clinical']:.3f}  delta={row['delta_score_vs_clinical']:+.3f} "
                      f"[{row['score_delta_ci_lo']:+.3f}, {row['score_delta_ci_hi']:+.3f}]"
-                     if "auroc_clinical" in row else ""))
+                     if "auroc_clinical" in row else "")
+                  + (f"\n           score+clinical={row['auroc_score_plus_clinical']:.3f}  delta vs clinical="
+                     f"{row['delta_score_plus_clinical_vs_clinical']:+.3f} "
+                     f"[{row['combined_delta_ci_lo']:+.3f}, {row['combined_delta_ci_hi']:+.3f}] p={row['combined_delta_p']:.3f}"
+                     if "auroc_score_plus_clinical" in row else ""))
     pd.DataFrame(auc_rows).to_csv(TAB / "prodromal_conversion_auroc.csv", index=False)
     out["auroc"] = auc_rows
 
@@ -247,18 +265,24 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
             continue
         Xp = z_prot.iloc[tr["pos"].values].values.astype(float)
         Xc = tr[clin_cols].values.astype(float) if clin_cols else np.zeros((len(tr), 0))
+        Xc = np.column_stack([Xc, tr["score"].values.astype(float)])     # last clinical column = severity score
         n_prot = Xp.shape[1]
         Xall = np.hstack([Xp, Xc])[oktr]; yv = ytr[oktr]
-        prot_idx = np.arange(n_prot); clin_idx = np.arange(n_prot, n_prot + Xc.shape[1])
+        prot_idx = np.arange(n_prot); clin_idx = np.arange(n_prot, n_prot + Xc.shape[1] - 1)
+        score_idx = np.array([n_prot + Xc.shape[1] - 1])
         print(f"\n  --- benchmark: conversion within {h} months (TRAIN n={len(yv)}, converted={int(yv.sum())}) ---")
         oof: Dict[Tuple[str, str], np.ndarray] = {}
-        for fs, (use_p, use_c) in {"clinical": (False, True), "proteomics": (True, False),
-                                   "proteomics+clinical": (True, True)}.items():
-            pi = prot_idx if use_p else np.array([], int); ci = clin_idx if use_c else np.array([], int)
-            if use_c and len(ci) == 0:
+        fsets = {"clinical": (False, clin_idx), "score": (False, score_idx),
+                 "score+clinical": (False, np.concatenate([clin_idx, score_idx])),
+                 "proteomics": (True, np.array([], int)), "proteomics+clinical": (True, clin_idx)}
+        for fs, (use_p, ci) in fsets.items():
+            pi = prot_idx if use_p else np.array([], int)
+            if not use_p and len(ci) == 0:
                 continue
             for mname, (pipe, grid) in _zoo("clf", pi, ci, n_prot).items():
                 if not use_p and mname == "LogisticL1" and len(ci) < 3:
+                    continue
+                if fs == "score" and mname != "LogisticSVD":
                     continue
                 pooled, per_rep = _nested_oof(pipe, grid, Xall, yv, "clf", DISCOVERY_REPEATS)
                 m = _metric("clf", yv, pooled); oof[(fs, mname)] = pooled
@@ -278,12 +302,13 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
         yte = _horizon_label(te, h); okte = np.isfinite(yte)
         if okte.sum() >= 20 and min((yte[okte] == 1).sum(), (yte[okte] == 0).sum()) >= 6:
             fs, mname = best
-            pi = prot_idx if fs != "clinical" else np.array([], int)
-            ci = clin_idx if fs != "proteomics" else np.array([], int)
+            use_p, ci = fsets[fs]
+            pi = prot_idx if use_p else np.array([], int)
             pipe, grid = _zoo("clf", pi, ci, n_prot)[mname]
             est, params = _fit_full(pipe, grid, Xall, yv, "clf")
             Xt = np.hstack([z_prot.iloc[te["pos"].values].values.astype(float),
-                            te[clin_cols].values.astype(float) if clin_cols else np.zeros((len(te), 0))])[okte]
+                            te[clin_cols].values.astype(float) if clin_cols else np.zeros((len(te), 0)),
+                            te["score"].values.astype(float)[:, None]])[okte]
             pt = _predict(est, Xt, "clf")
             summ["n_test"] = int(okte.sum()); summ["test_converted"] = int(yte[okte].sum())
             summ["test_best"] = _metric("clf", yte[okte], pt)

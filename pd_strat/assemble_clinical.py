@@ -701,6 +701,19 @@ def assemble_clinical(force: bool = False) -> pd.DataFrame:
             if not ASSEMBLY["keep_other_cohorts"]:
                 base = base[base["cohort"] != "OTHER"]
 
+    # scale guard: MDS-UPDRS totals cannot exceed 260 (I 52, II 52, III 132, IV 24)
+    lim = {p1: 52, p2: 52, p3: 132, p4: 24, "updrs_total": 260, "hoehn_yahr": 5, "upsit_total": 40}
+    for c, mx in lim.items():
+        if c in base.columns:
+            v = pd.to_numeric(base[c], errors="coerce")
+            bad = v.notna() & ((v > mx) | (v < 0))
+            if bad.any():
+                src = base.loc[bad, "source"].value_counts().to_dict() if "source" in base.columns else {}
+                print(f"  [scale guard] {c}: {int(bad.sum())} values outside 0-{mx} set to missing {src}")
+                base.loc[bad, c] = np.nan
+    if all(c in base.columns for c in (p1, p2, p3)):
+        base.loc[base[[p1, p2, p3]].isna().any(axis=1), "updrs_total"] = np.nan
+
     cols = ["participant_id", "visit_name", "visit_month", "cohort",
             "case_control", "diagnosis", "updrs_total", p1, p2, p3, p4,
             "hoehn_yahr", "updrs3_state", "pd_medicated", "upsit_total", "sex", "age_at_baseline",
