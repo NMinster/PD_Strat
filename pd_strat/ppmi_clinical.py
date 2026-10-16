@@ -42,13 +42,20 @@ import pandas as pd
 
 from .olink_io import PPMI_EVENT_MONTHS
 
+
+def _name(p) -> str:
+    """Display name for a path or a list of paths."""
+    if isinstance(p, (list, tuple)):
+        return " + ".join(Path(x).name for x in p)
+    return Path(p).name
+
 # logical name -> (filename regex, required)
 _FILES: Dict[str, Tuple[str, bool]] = {
-    "part1":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?I(?![IV])(?!.*Patient)", True),
-    "part1pq": (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?I[-_ ]?(Patient|Pt)", False),
-    "part2":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?II(?!I)", True),
-    "part3":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?III(?!.*(ON_OFF|Dosing|Determination))", True),
-    "part4":   (r"MDS[-_ ]?UPDRS[-_ ]?Part[-_ ]?IV", False),
+    "part1":   (r"MDS[-_ ]*UPDRS[-_ ]*Part[-_ ]*I(?![IV])(?!.*Patient)", True),
+    "part1pq": (r"MDS[-_ ]*UPDRS[-_ ]*Part[-_ ]*I[-_ ]*(Patient|Pt)", False),
+    "part2":   (r"MDS[-_ ]*UPDRS[-_ ]*Part[-_ ]*II(?!I)", True),
+    "part3":   (r"MDS[-_ ]*UPDRS[-_ ]*Part[-_ ]*III(?!.*(ON_OFF|Dosing|Determination))", True),
+    "part4":   (r"MDS[-_ ]*UPDRS[-_ ]*Part[-_ ]*IV", False),
     "status":  (r"Participant[-_ ]?Status", True),
     "demo":    (r"^Demographics", False),
     "age":     (r"Age[-_ ]?at[-_ ]?visit", False),
@@ -69,7 +76,28 @@ _LEVODOPA = re.compile(r"levodopa|sinemet|carbidopa|madopar|rytary|duopa|stalevo
 _AGONIST = re.compile(r"pramipexole|mirapex|ropinirole|requip|rotigotine|neupro|apomorphine|apokyn|piribedil", re.I)
 
 
-def _read(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
+def _read(path, nrows: Optional[int] = None) -> pd.DataFrame:
+    if isinstance(path, (list, tuple)):
+        parts = []
+        for pth in path:
+            d = _read_one(pth, nrows)
+            d["_archived"] = int("archiv" in Path(pth).name.lower())
+            parts.append(d)
+        if len(parts) == 1:
+            return parts[0].drop(columns="_archived")
+        df = pd.concat(parts, ignore_index=True, sort=False)
+        keys = [c for c in ("PATNO", "EVENT_ID") if c in df.columns]
+        if keys:
+            cur = df[df["_archived"] == 0]
+            seen = set(map(tuple, cur[keys].astype(str).values))
+            arch = df[df["_archived"] == 1]
+            dup = arch[keys].astype(str).apply(tuple, axis=1).isin(seen) if len(arch) else pd.Series([], dtype=bool)
+            df = pd.concat([cur, arch[~dup.values]] if len(arch) else [cur], ignore_index=True, sort=False)
+        return df.drop(columns="_archived")
+    return _read_one(path, nrows)
+
+
+def _read_one(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
     if Path(path).suffix.lower() in (".xlsx", ".xls"):
         xl = pd.ExcelFile(path)
         sheet = xl.sheet_names[0]
@@ -118,8 +146,10 @@ def find_files(root: str) -> Dict[str, Optional[str]]:
         r = re.compile(rx, re.I)
         hits = [p for p in cands if r.search(p.stem)]
         if hits:
-            # newest download date suffix wins when several match
-            found[key] = str(sorted(hits, key=lambda p: (p.stat().st_mtime, p.name))[-1])
+            # archived (legacy CRF) versions first, current versions last: when the
+            # same participant-visit appears in both, the current file wins
+            hits = sorted(hits, key=lambda p: (0 if "archiv" in p.name.lower() else 1, p.stat().st_mtime, p.name))
+            found[key] = [str(p) for p in hits]
     return found
 
 
@@ -178,16 +208,18 @@ def _baseline_dates(paths: List[Optional[str]]) -> Dict[str, pd.Timestamp]:
 
 
 def _total(df: pd.DataFrame, total_pats: List[str], item_prefix: str, exclude: List[str]) -> pd.Series:
+    """Section total: the total column where present, else the sum of the item
+    columns (archived legacy files carry items only; a merged archived + current
+    table has both layouts side by side)."""
     c = _col(df, total_pats)
-    if c is not None:
-        return _num(df[c])
+    tot = _num(df[c]) if c is not None else pd.Series(np.nan, index=df.index)
     items = [k for k in df.columns if re.match(item_prefix, str(k), re.I)
              and not any(re.search(e, str(k), re.I) for e in exclude)]
-    if not items:
-        return pd.Series(np.nan, index=df.index)
-    vals = df[items].apply(_num)
-    tot = vals.sum(axis=1, min_count=1)
-    tot[vals.isna().any(axis=1)] = np.nan     # incomplete questionnaires are not totals
+    if items:
+        vals = df[items].apply(_num)
+        s = vals.sum(axis=1, min_count=1)
+        s[vals.isna().any(axis=1)] = np.nan     # incomplete questionnaires are not totals
+        tot = tot.fillna(s)
     return tot
 
 
@@ -216,13 +248,13 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
         df = _read(files["part1"]); _dates_from(df)
         t = _total(df, [r"^NP1RTOT$", r"^NP1TOT$"], r"^NP1(COG|HALL|DPRS|ANXS|APAT|DDS)$", [])
         p1 = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df), "p1r": t}), "p1r")
-        log(f"    [Part I clinician] {Path(files['part1']).name}: {len(p1)} visits "
+        log(f"    [Part I clinician] {_name(files['part1'])}: {len(p1)} visits "
             f"(total col: {_col(df, [r'^NP1RTOT$', r'^NP1TOT$']) or 'summed items'})")
         if files["part1pq"]:
             dq = _read(files["part1pq"]); _dates_from(dq)
             tq = _total(dq, [r"^NP1PTOT$"], r"^NP1(SLPN|SLPD|PAIN|URIN|CNST|LTHD|FATG)$", [])
             pq = _agg_visit(pd.DataFrame({"participant_id": _pid(dq), "visit_key": _visit(dq), "p1p": tq}), "p1p")
-            log(f"    [Part I patient]   {Path(files['part1pq']).name}: {len(pq)} visits")
+            log(f"    [Part I patient]   {_name(files['part1pq'])}: {len(pq)} visits")
             p1 = p1.merge(pq, on=["participant_id", "visit_key"], how="outer")
             p1["mds_updrs_part_i_total"] = p1["p1r"] + p1["p1p"]
         else:
@@ -236,7 +268,7 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
         t = _total(df, [r"^NP2PTOT$", r"^NP2TOT$"], r"^NP2[A-Z]+$", [r"TOT"])
         p2 = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df),
                                       "mds_updrs_part_ii_total": t}), "mds_updrs_part_ii_total")
-        log(f"    [Part II]          {Path(files['part2']).name}: {len(p2)} visits")
+        log(f"    [Part II]          {_name(files['part2'])}: {len(p2)} visits")
         pieces.append(p2)
 
     if files["part3"]:
@@ -279,7 +311,7 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
                 .agg(mds_updrs_part_iii_total=("mds_updrs_part_iii_total", "mean"),
                      hoehn_yahr=("hoehn_yahr", "mean"), updrs3_state=("updrs3_state", "first"),
                      pd_medicated=("pd_medicated", "max")))
-        log(f"    [Part III]         {Path(files['part3']).name}: {len(p3)} visits "
+        log(f"    [Part III]         {_name(files['part3'])}: {len(p3)} visits "
             f"(H&Y col: {hy}, state col: {st}, medicated col: {med}; "
             f"{int((p3['updrs3_state'] == 'OFF').sum())} OFF visits kept preferentially)")
         pieces.append(p3)
@@ -289,7 +321,7 @@ def _updrs_tables(files: Dict[str, Optional[str]], prefer_off: bool, log) -> Tup
         t = _total(df, [r"^NP4TOT$"], r"^NP4[A-Z]+$", [r"TOT"])
         p4 = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df),
                                       "mds_updrs_part_iv_total": t}), "mds_updrs_part_iv_total")
-        log(f"    [Part IV]          {Path(files['part4']).name}: {len(p4)} visits")
+        log(f"    [Part IV]          {_name(files['part4'])}: {len(p4)} visits")
         pieces.append(p4)
 
     if not pieces:
@@ -329,7 +361,7 @@ def _status(path: Optional[str], log) -> Optional[pd.DataFrame]:
     es = _col(df, [r"^ENROLL_STATUS$", r"enroll.*status"])
     out["enroll_status"] = df[es].astype(str).str.strip().str.lower().values if es else "enrolled"
     out = out.drop_duplicates("participant_id")
-    log(f"    [Participant status] {Path(path).name}: {len(out)} participants "
+    log(f"    [Participant status] {_name(path)}: {len(out)} participants "
         f"{out['case_control'].value_counts().to_dict()} (cohort col: {cdef or ccode})")
     if cdef:
         log(f"      cohort definitions: {df[cdef].astype(str).value_counts().head(8).to_dict()}")
@@ -350,7 +382,7 @@ def _demographics(path: Optional[str], log) -> Optional[pd.DataFrame]:
     bd = _col(df, [r"^BIRTHDT$", r"birth"])
     out["birth_date"] = _date(df[bd]) if bd else pd.NaT
     out = out.drop_duplicates("participant_id")
-    log(f"    [Demographics]     {Path(path).name}: {len(out)} participants (sex col: {sx}, birth col: {bd})")
+    log(f"    [Demographics]     {_name(path)}: {len(out)} participants (sex col: {sx}, birth col: {bd})")
     return out
 
 
@@ -362,7 +394,7 @@ def _age_at_visit(path: Optional[str], log) -> Optional[pd.DataFrame]:
     if c is None:
         return None
     out = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df), "age": _num(df[c])}), "age")
-    log(f"    [Age at visit]     {Path(path).name}: {len(out)} visits")
+    log(f"    [Age at visit]     {_name(path)}: {len(out)} visits")
     return out
 
 
@@ -375,7 +407,7 @@ def _diagnosis_date(path: Optional[str], log) -> Optional[pd.DataFrame]:
         return None
     out = pd.DataFrame({"participant_id": _pid(df), "dx_date": _date(df[c])}).dropna()
     out = out.sort_values("dx_date").drop_duplicates("participant_id")
-    log(f"    [PD diagnosis]     {Path(path).name}: {len(out)} participants with a diagnosis date")
+    log(f"    [PD diagnosis]     {_name(path)}: {len(out)} participants with a diagnosis date")
     return out
 
 
@@ -387,13 +419,13 @@ def _upsit(path: Optional[str], log) -> Optional[pd.DataFrame]:
     if c is None:
         bk = [k for k in df.columns if re.match(r"^UPSITBK\d$", str(k), re.I)]
         if not bk:
-            log(f"    [UPSIT]            {Path(path).name}: no total / booklet columns -> skipped")
+            log(f"    [UPSIT]            {_name(path)}: no total / booklet columns -> skipped")
             return None
         tot = df[bk].apply(_num).sum(axis=1, min_count=len(bk))
     else:
         tot = _num(df[c])
     out = _agg_visit(pd.DataFrame({"participant_id": _pid(df), "visit_key": _visit(df), "upsit_total": tot}), "upsit_total")
-    log(f"    [UPSIT]            {Path(path).name}: {len(out)} visits (col: {c or 'booklets'})")
+    log(f"    [UPSIT]            {_name(path)}: {len(out)} visits (col: {c or 'booklets'})")
     return out
 
 
@@ -429,7 +461,7 @@ def _datscan(path: Optional[str], log) -> Optional[pd.DataFrame]:
     vals = [c for c in out.columns if c.startswith("datscan_")]
     out = out.dropna(subset=vals, how="all").groupby(["participant_id", "visit_key"], as_index=False)[vals].mean()
     out.attrs["cwm"] = cwm
-    log(f"    [DaTSCAN]          {Path(path).name}: {len(out)} scans (putamen {put}, caudate {cau})")
+    log(f"    [DaTSCAN]          {_name(path)}: {len(out)} scans (putamen {put}, caudate {cau})")
     return out
 
 
@@ -455,7 +487,7 @@ def _ledd(path: Optional[str], log) -> Optional[pd.DataFrame]:
         n_nonnum = int(df[led].notna().sum() - lv.notna().sum())   # e.g. "LD x 0.33" (COMT inhibitors)
         spans = pd.DataFrame({"participant_id": pid, "ledd": lv, "start": _date(df[sd]),
                               "stop": _date(df[ed]) if ed else pd.NaT}).dropna(subset=["ledd", "start"])
-    log(f"    [LEDD log]         {Path(path).name}: {int(out['on_levodopa'].sum())} ever on levodopa, "
+    log(f"    [LEDD log]         {_name(path)}: {int(out['on_levodopa'].sum())} ever on levodopa, "
         f"{int(out['on_other_dopaminergic'].sum())} on an agonist"
         + (f"; {len(spans)} dated medication spans with numeric LEDD"
            f"{f' ({n_nonnum} non-numeric LEDD entries skipped)' if n_nonnum else ''}" if spans is not None else ""))
@@ -740,12 +772,12 @@ def describe(root: str) -> None:
     print(f"PPMI-native clinical directory: {root}")
     used = set()
     for k, (rx, req) in _FILES.items():
-        print(f"  {k:<14} {'required' if req else 'optional':<8} -> {Path(files[k]).name if files[k] else '(not found)'}")
+        print(f"  {k:<14} {'required' if req else 'optional':<8} -> {_name(files[k]) if files[k] else '(not found)'}")
         if files[k]:
-            used.add(files[k])
+            used.update(files[k])
             try:
-                head = _read(files[k], nrows=3)
-                n = sum(1 for _ in open(files[k], "rb")) - 1 if Path(files[k]).suffix.lower() == ".csv" else "?"
+                head = _read(files[k][-1], nrows=3)
+                n = sum(sum(1 for _ in open(f, "rb")) - 1 for f in files[k] if Path(f).suffix.lower() == ".csv") or "?"
                 print(f"      rows={n}  columns({len(head.columns)}): {list(head.columns)[:45]}")
                 ex = head.iloc[0].to_dict() if len(head) else {}
                 print(f"      first row: {dict(list(ex.items())[:14])}")
