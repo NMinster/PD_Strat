@@ -366,8 +366,11 @@ participants per cohort); a GPU is not needed and deep networks would only
 overfit. If you scale to the newer PPMI Olink Explore 3072 release (thousands
 of samples) or add CSF, revisit that.
 
-See `docs/manuscript_review.md` for how these map onto the manuscript and
-`docs/TRIPOD_AI_checklist.md` for the reporting checklist.
+See `docs/manuscript_review.md` for how these map onto the manuscript,
+`docs/TRIPOD_AI_checklist.md` for the reporting checklist,
+`docs/literature_review.md` for the September 2026 positioning review, and
+`docs/literature_review_2026_gaps.md` for the October 2026 gap analysis (which
+open questions the data on disk can answer, ranked, and what each needs).
 
 ---
 
