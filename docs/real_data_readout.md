@@ -314,6 +314,69 @@ What the run did show, to be re-checked after the fix:
 The score itself was trained on the corrupted target, so the prodromal numbers may
 move either way on the re-run.
 
+---
+
+# Seventh run (2026-10-17): Explore HT + PPMI-native clinical, clean — the definitive numbers so far
+
+Data quality: UPDRS max 160, HC 7.6 ± 7.2, no scale-guard events, 4,756 Part III
+rows prorated after removing "unable to rate" codes. Join: 2,243 participants /
+3,352 HT samples; modelled **PD 724 TRAIN + 341 holdout, HC 359 + 165**; prodromal
+958 (668 + 290) with 103 converters. Xing core-lab SBR on all PPMI rows.
+
+## Severity
+
+| | TRAIN OOF | holdout |
+|---|---|---|
+| ρ rows / participants | 0.593 [0.55, 0.63] / 0.585 | 0.539 [0.47, 0.60] / 0.522 |
+| ρ within PD, participant | 0.36 (n = 724) | 0.44 (n = 334) |
+| PD-only refit, participant | 0.38 [0.32, 0.44] | 0.39 [0.29, 0.48] |
+| within PD: covariates / proteome / partial | 0.45 / 0.37 / 0.23 | 0.36 / 0.45 / 0.38 |
+| caudate DaT ρ (Xing SBR) | −0.34 [−0.41, −0.25] (n = 456) | **−0.43 [−0.53, −0.32]** (n = 233) |
+| reduced panel on holdout, k = 30 / 26 stable proteins | | 0.599 / 0.625 vs 0.539 full |
+| locked 40 replicated p < 0.05 / Bonferroni | | **27 / 21** |
+| protein × time replicated p < 0.05 / Bonferroni | | **26 / 19** |
+
+In the holdout the proteome now exceeds the clinical covariates within PD (0.45 vs
+0.36) and the caudate DaT correlation replicates at n = 233. These are the paper's
+severity numbers.
+
+## Progression — honest downgrade
+With the clean, 2x larger cohort: ρ(score, slope) 0.04 [−0.04, +0.12] TRAIN, 0.09
+[−0.01, +0.19] holdout; mixed β 0.22 [−0.13, +0.57] / 0.53 [−0.03, +1.10]. The earlier
+0.72 / 0.79 (run 5, n = 331 / 145) does not hold up. The milestone Cox does: HR/SD
+1.33 [1.13, 1.56] (p = 6e-4, 170 events) TRAIN, 1.17 [0.94, 1.46] holdout. Benchmark
+Δ over clinical: nothing excludes zero (slope +0.01, 24-month −0.02, fast-progressor
+−0.03, DaT change +0.02); enrichment none. Report: "baseline score associated with
+time to milestone (HR 1.3), not with the rate of UPDRS change; no incremental
+prediction over clinical scoring".
+
+## Within-person coupling — strongest yet
+TRAIN within β 2.61 [1.21, 4.01] (264 participants), holdout 2.94 [1.09, 4.80];
+medication-adjusted 2.49 / 3.10; Δ-ρ 0.22 / 0.24; PD-only refit 1.81 / 2.53; slope-vs-
+slope 0.35 (n = 29) / 0.65 (n = 15).
+
+## Prodromal phenoconversion (958 enrollees, 103 converters, median follow-up 42 m)
+
+| Cox, HR per SD of the score | ALL | TRAIN | holdout |
+|---|---|---|---|
+| unadjusted | 1.95 [1.61, 2.37] | 1.86 [1.46, 2.39] | 1.99 [1.46, 2.71] |
+| + age, sex | 1.75 [1.42, 2.17] | 1.65 [1.26, 2.17] | 1.80 [1.26, 2.56] |
+| + UPSIT, DaT SBR, Part III | 1.45 [1.15, 1.83], p = 0.002 | 1.26 [0.93, 1.71] | **1.69 [1.13, 2.53], p = 0.011** |
+| C-index clinical-only → with score | 0.765 → 0.780 | 0.788 → 0.794 | 0.767 → 0.790 |
+
+AUROC: the score alone (0.69 at 36 m, 0.75 at 60 m in the holdout) trails the clinical
++ imaging model (0.74 / 0.85), and adding the score to it changes AUROC by +0.01 to
++0.03 with CIs including zero (holdout 36 m +0.012 [−0.020, +0.041]; benchmark 60 m
++0.029 [−0.036, +0.098]). Adding 5,000 proteins to the clinical model is worse than
+the clinical model alone.
+
+Reading: the plasma score carries conversion hazard that the full prodromal work-up
+(including DaTscan) does not capture — HR 1.7 per SD in held-out participants — but
+it does not improve discrimination over that work-up at 103 events. The comparator
+is a neurologist *with a scan*; the comparison that matters for a blood test, against
+the office assessment without imaging, is computed from the next run (tiers:
+demographics / office / imaging).
+
 ## What to say in the paper (updated)
 1. Replicated modest plasma-proteomic correlate of motor severity within PD
    (participant-level ρ 0.29 → 0.45), distinct from the case-control signal.

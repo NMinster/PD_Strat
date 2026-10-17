@@ -176,28 +176,56 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
           f"clinical covariates: {clin_cols}")
     out.update({"n": int(len(df)), "n_events": n_ev, "clinical_covariates": clin_cols})
 
+    # comparator tiers: what a neurologist has at each stage of a prodromal work-up
+    _demo = [c for c in ("age", "male") if c in clin_cols]
+    _office = _demo + [c for c in ("upsit", "updrs_iii", "rbd", "hyposmia", "lrrk2", "gba") if c in clin_cols]
+    _imaging = _office + [c for c in ("datscan_putamen", "datscan_visual_positive") if c in clin_cols]
+    tiers: Dict[str, List[str]] = {}
+    for name, cols in (("demographics", _demo), ("office", _office), ("imaging", _imaging)):
+        if cols and (not tiers or cols != list(tiers.values())[-1]):
+            tiers[name] = cols
+    out["comparator_tiers"] = tiers
+    print(f"  comparator tiers: " + "; ".join(f"{k} = {v}" for k, v in tiers.items()))
+
     # 1. Cox ---------------------------------------------------------------
     cox_rows = []
-    adj_full = ["score"] + [c for c in ("age", "male", "upsit", "datscan_putamen", "updrs_iii") if c in clin_cols]
     for split, sub in (("ALL", df), ("TRAIN", df[df["split"] == "TRAIN"]), ("TEST", df[df["split"] == "TEST"])):
-        for lab, cols in (("unadjusted", ["score"]),
-                          ("adj_age_sex", ["score"] + [c for c in ("age", "male") if c in clin_cols]),
-                          ("adj_full", adj_full),
-                          ("clinical_only", adj_full[1:] if len(adj_full) > 1 else [])):
-            if not cols:
-                continue
+        specs = [("unadjusted", ["score"])]
+        for tname, cols in tiers.items():
+            specs.append((f"adj_{tname}", ["score"] + cols))
+            specs.append((f"{tname}_only", cols))
+        for lab, cols in specs:
             r = _cox(sub, cols, lab, split)
             if r:
                 cox_rows.append(r)
     pd.DataFrame(cox_rows).to_csv(TAB / "prodromal_conversion_cox.csv", index=False)
     out["cox"] = cox_rows
 
-    # 2. horizon AUROC: score vs clinical logistic (fit on TRAIN labels) ---
+    # 2. horizon AUROC: score vs each comparator tier, and tier + score vs tier ---
     auc_rows = []
     tr, te = df[df["split"] == "TRAIN"], df[df["split"] == "TEST"]
     clf_pipe = Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler()),
                          ("lr", LogisticRegression(max_iter=2000, C=1.0))])
+
+    def _logit_preds(cols: List[str], split: str, sub: pd.DataFrame, y: np.ndarray, ok: np.ndarray,
+                     ytr: np.ndarray, oktr: np.ndarray) -> Optional[np.ndarray]:
+        """Logistic predictions on `sub[ok]`: out-of-fold within the split for TRAIN / ALL,
+        fitted on TRAIN for TEST."""
+        X = sub[cols].values.astype(float)
+        if split == "TEST":
+            if oktr.sum() < 20 or min((ytr[oktr] == 1).sum(), (ytr[oktr] == 0).sum()) < 5:
+                return None
+            return clone(clf_pipe).fit(tr[cols].values.astype(float)[oktr], ytr[oktr]).predict_proba(X[ok])[:, 1]
+        Xk, yk = X[ok], y[ok]
+        if min((yk == 1).sum(), (yk == 0).sum()) < 5:
+            return None
+        q = np.full(ok.sum(), np.nan)
+        for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(Xk, yk):
+            q[b] = clone(clf_pipe).fit(Xk[a], yk[a]).predict_proba(Xk[b])[:, 1]
+        return q if np.isfinite(q).all() else None
+
     for h in PRODROMAL_HORIZONS:
+        ytr = _horizon_label(tr, h); oktr = np.isfinite(ytr)
         for split, sub in (("TRAIN", tr), ("TEST", te), ("ALL", df)):
             y = _horizon_label(sub, h); ok = np.isfinite(y)
             if ok.sum() < 30 or min((y[ok] == 1).sum(), (y[ok] == 0).sum()) < 8:
@@ -205,53 +233,37 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
                                  "n_converted": int(np.nansum(y)), "note": "insufficient"})
                 continue
             s = sub["score"].values[ok]
-            row = {"horizon_months": h, "split": split, "n": int(ok.sum()), "n_converted": int(y[ok].sum()),
-                   "auroc_score": _metric("clf", y[ok], s)}
-            q = None
-            if clin_cols:
-                Xc = sub[clin_cols].values.astype(float)
-                ytr = _horizon_label(tr, h); oktr = np.isfinite(ytr)
-                if split == "TRAIN":      # out-of-fold on TRAIN
-                    q = np.full(ok.sum(), np.nan); Xk, yk = Xc[ok], y[ok]
-                    if min((yk == 1).sum(), (yk == 0).sum()) >= 5:
-                        for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(Xk, yk):
-                            q[b] = clone(clf_pipe).fit(Xk[a], yk[a]).predict_proba(Xk[b])[:, 1]
-                elif oktr.sum() >= 20 and min((ytr[oktr] == 1).sum(), (ytr[oktr] == 0).sum()) >= 5:
-                    q = clone(clf_pipe).fit(tr[clin_cols].values.astype(float)[oktr], ytr[oktr]).predict_proba(Xc[ok])[:, 1]
-                if q is not None and np.isfinite(q).all():
-                    row["auroc_clinical"] = _metric("clf", y[ok], q)
-                    row["delta_score_vs_clinical"] = row["auroc_score"] - row["auroc_clinical"]
-                    row.update({f"score_{k}": v for k, v in _boot_ci("clf", y[ok], s, q).items()})
-                    # score + clinical logistic (the "adds to clinical assessment" test), same rule
-                    Xsc = np.column_stack([Xc, sub["score"].values.astype(float)])
-                    Xsc_tr = np.column_stack([tr[clin_cols].values.astype(float), tr["score"].values.astype(float)])
-                    qs = np.full(ok.sum(), np.nan)
-                    if split == "TRAIN":
-                        Xk, yk = Xsc[ok], y[ok]
-                        if min((yk == 1).sum(), (yk == 0).sum()) >= 5:
-                            for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(Xk, yk):
-                                qs[b] = clone(clf_pipe).fit(Xk[a], yk[a]).predict_proba(Xk[b])[:, 1]
-                    elif oktr.sum() >= 20:
-                        qs = clone(clf_pipe).fit(Xsc_tr[oktr], ytr[oktr]).predict_proba(Xsc[ok])[:, 1]
-                    if np.isfinite(qs).all():
-                        row["auroc_score_plus_clinical"] = _metric("clf", y[ok], qs)
-                        row["delta_score_plus_clinical_vs_clinical"] = row["auroc_score_plus_clinical"] - row["auroc_clinical"]
-                        row.update({f"combined_{k}": v for k, v in _boot_ci("clf", y[ok], qs, q).items()})
-                else:
-                    q = None
-            if q is None:
-                row.update({f"score_{k}": v for k, v in _boot_ci("clf", y[ok], s).items()})
-            auc_rows.append(row)
-            print(f"    {split:<6} {h:>3}-month conversion (n={row['n']}, converted={row['n_converted']}): "
-                  f"AUROC score={row['auroc_score']:.3f} [{row.get('score_ci_lo', np.nan):.2f}, "
-                  f"{row.get('score_ci_hi', np.nan):.2f}]"
-                  + (f"  clinical={row['auroc_clinical']:.3f}  delta={row['delta_score_vs_clinical']:+.3f} "
-                     f"[{row['score_delta_ci_lo']:+.3f}, {row['score_delta_ci_hi']:+.3f}]"
-                     if "auroc_clinical" in row else "")
-                  + (f"\n           score+clinical={row['auroc_score_plus_clinical']:.3f}  delta vs clinical="
-                     f"{row['delta_score_plus_clinical_vs_clinical']:+.3f} "
-                     f"[{row['combined_delta_ci_lo']:+.3f}, {row['combined_delta_ci_hi']:+.3f}] p={row['combined_delta_p']:.3f}"
-                     if "auroc_score_plus_clinical" in row else ""))
+            base_row = {"horizon_months": h, "split": split, "n": int(ok.sum()), "n_converted": int(y[ok].sum()),
+                        "auroc_score": _metric("clf", y[ok], s)}
+            base_row.update({f"score_{k}": v for k, v in _boot_ci("clf", y[ok], s).items()})
+            line = (f"    {split:<6} {h:>3}-month conversion (n={base_row['n']}, converted={base_row['n_converted']}): "
+                    f"score AUROC={base_row['auroc_score']:.3f} [{base_row['score_ci_lo']:.2f}, {base_row['score_ci_hi']:.2f}]")
+            if not tiers:
+                auc_rows.append(base_row); print(line); continue
+            for tname, cols in tiers.items():
+                row = dict(base_row); row["comparator"] = tname
+                q = _logit_preds(cols, split, sub, y, ok, ytr, oktr)
+                qs = _logit_preds(cols + ["score"], split, sub, y, ok, ytr, oktr)
+                if q is None:
+                    auc_rows.append(row); continue
+                row["auroc_comparator"] = _metric("clf", y[ok], q)
+                row["delta_score_vs_comparator"] = row["auroc_score"] - row["auroc_comparator"]
+                row.update({f"score_vs_comparator_{k}": v for k, v in _boot_ci("clf", y[ok], s, q).items()
+                            if k.startswith("delta")})
+                if qs is not None:
+                    row["auroc_comparator_plus_score"] = _metric("clf", y[ok], qs)
+                    row["delta_plus_score_vs_comparator"] = row["auroc_comparator_plus_score"] - row["auroc_comparator"]
+                    row.update({f"plus_score_{k}": v for k, v in _boot_ci("clf", y[ok], qs, q).items()
+                                if k.startswith("delta")})
+                auc_rows.append(row)
+                line += (f"\n           vs {tname:<12} comparator={row['auroc_comparator']:.3f}  "
+                         f"score delta={row['delta_score_vs_comparator']:+.3f} "
+                         f"[{row.get('score_vs_comparator_delta_ci_lo', np.nan):+.3f}, {row.get('score_vs_comparator_delta_ci_hi', np.nan):+.3f}]"
+                         + (f"  | comparator+score={row['auroc_comparator_plus_score']:.3f} "
+                            f"delta={row['delta_plus_score_vs_comparator']:+.3f} "
+                            f"[{row.get('plus_score_delta_ci_lo', np.nan):+.3f}, {row.get('plus_score_delta_ci_hi', np.nan):+.3f}] "
+                            f"p={row.get('plus_score_delta_p', np.nan):.3f}" if "auroc_comparator_plus_score" in row else ""))
+            print(line)
     pd.DataFrame(auc_rows).to_csv(TAB / "prodromal_conversion_auroc.csv", index=False)
     out["auroc"] = auc_rows
 
@@ -272,9 +284,13 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
         score_idx = np.array([n_prot + Xc.shape[1] - 1])
         print(f"\n  --- benchmark: conversion within {h} months (TRAIN n={len(yv)}, converted={int(yv.sum())}) ---")
         oof: Dict[Tuple[str, str], np.ndarray] = {}
+        office_idx = np.array([n_prot + clin_cols.index(c) for c in tiers.get("office", []) if c in clin_cols], int)
         fsets = {"clinical": (False, clin_idx), "score": (False, score_idx),
                  "score+clinical": (False, np.concatenate([clin_idx, score_idx])),
                  "proteomics": (True, np.array([], int)), "proteomics+clinical": (True, clin_idx)}
+        if len(office_idx) and len(office_idx) < len(clin_idx):
+            fsets["office"] = (False, office_idx)
+            fsets["score+office"] = (False, np.concatenate([office_idx, score_idx]))
         for fs, (use_p, ci) in fsets.items():
             pi = prot_idx if use_p else np.array([], int)
             if not use_p and len(ci) == 0:
@@ -290,15 +306,25 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
                                    "oof_auroc": m, "oof_auroc_sd_over_repeats": float(np.nanstd(per_rep))})
                 print(f"    {fs:<21} {mname:<13} OOF AUROC={m:.3f} (+-{np.nanstd(per_rep):.3f})")
         clin_keys = [k for k in oof if k[0] == "clinical"]
-        prot_keys = [k for k in oof if k[0] != "clinical"]
+        office_keys = [k for k in oof if k[0] == "office"]
+        prot_keys = [k for k in oof if k[0] not in ("clinical", "office")]
         if not prot_keys:
             continue
         ref = max(clin_keys, key=lambda k: np.nan_to_num(_metric("clf", yv, oof[k]), nan=-9)) if clin_keys else None
+        ref_off = max(office_keys, key=lambda k: np.nan_to_num(_metric("clf", yv, oof[k]), nan=-9)) if office_keys else None
         best = max(prot_keys, key=lambda k: np.nan_to_num(_metric("clf", yv, oof[k]), nan=-9))
+        # best configuration *without imaging* (score+office / proteomics / proteomics+office)
+        no_img = [k for k in prot_keys if k[0] in ("score", "score+office", "proteomics")]
+        best_no_img = max(no_img, key=lambda k: np.nan_to_num(_metric("clf", yv, oof[k]), nan=-9)) if no_img else None
         summ: Dict[str, Any] = {"horizon_months": h, "best_feature_set": best[0], "best_model": best[1],
                                 "oof_best": _metric("clf", yv, oof[best]),
                                 "oof_clinical": _metric("clf", yv, oof[ref]) if ref else np.nan}
         summ.update({f"oof_{k}": v for k, v in _boot_ci("clf", yv, oof[best], oof[ref] if ref else None).items()})
+        if ref_off and best_no_img:
+            summ["office_ref_model"] = ref_off[1]; summ["oof_office"] = _metric("clf", yv, oof[ref_off])
+            summ["best_no_imaging"] = "/".join(best_no_img); summ["oof_best_no_imaging"] = _metric("clf", yv, oof[best_no_img])
+            summ.update({f"oof_no_imaging_{k}": v for k, v in _boot_ci("clf", yv, oof[best_no_img], oof[ref_off]).items()
+                         if k.startswith("delta")})
         yte = _horizon_label(te, h); okte = np.isfinite(yte)
         if okte.sum() >= 20 and min((yte[okte] == 1).sum(), (yte[okte] == 0).sum()) >= 6:
             fs, mname = best
@@ -319,6 +345,20 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
                 qt = _predict(rest, Xt, "clf"); summ["test_clinical"] = _metric("clf", yte[okte], qt)
                 summ["test_delta_vs_clinical"] = summ["test_best"] - summ["test_clinical"]
             summ.update({f"test_{k}": v for k, v in _boot_ci("clf", yte[okte], pt, qt).items()})
+            if ref_off and best_no_img:
+                opipe, ogrid = _zoo("clf", np.array([], int), office_idx, n_prot)[ref_off[1]]
+                oest, _ = _fit_full(opipe, ogrid, Xall, yv, "clf"); qo = _predict(oest, Xt, "clf")
+                use_p2, ci2 = fsets[best_no_img[0]]
+                npipe, ngrid = _zoo("clf", prot_idx if use_p2 else np.array([], int), ci2, n_prot)[best_no_img[1]]
+                nest, _ = _fit_full(npipe, ngrid, Xall, yv, "clf"); pn = _predict(nest, Xt, "clf")
+                summ["test_office"] = _metric("clf", yte[okte], qo)
+                summ["test_best_no_imaging"] = _metric("clf", yte[okte], pn)
+                summ["test_delta_no_imaging_vs_office"] = summ["test_best_no_imaging"] - summ["test_office"]
+                summ.update({f"test_no_imaging_{k}": v for k, v in _boot_ci("clf", yte[okte], pn, qo).items()
+                             if k.startswith("delta")})
+                print(f"       without imaging: {summ['best_no_imaging']} AUROC={summ['test_best_no_imaging']:.3f} vs office "
+                      f"{summ['test_office']:.3f}  delta={summ['test_delta_no_imaging_vs_office']:+.3f} "
+                      f"[{summ['test_no_imaging_delta_ci_lo']:+.3f}, {summ['test_no_imaging_delta_ci_hi']:+.3f}]")
             print(f"    >> TEST ({h} m): {fs}/{mname} AUROC={summ['test_best']:.3f} vs clinical "
                   f"{summ.get('test_clinical', np.nan):.3f}  delta={summ.get('test_delta_vs_clinical', np.nan):+.3f} "
                   f"[{summ.get('test_delta_ci_lo', np.nan):+.3f}, {summ.get('test_delta_ci_hi', np.nan):+.3f}] "
