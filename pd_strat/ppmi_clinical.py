@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -69,6 +69,11 @@ _FILES: Dict[str, Tuple[str, bool]] = {
     "eligibility":    (r"Prodromal[-_ ]?Cohort[-_ ]?Eligibility", False),
     "datscan_visual": (r"Visual[-_ ]?Read|Visual[-_ ]?Interpretation", False),
     "curated":        (r"Curated[-_ ]?Data[-_ ]?Cut", False),
+    # recognised by the path explorer (§17) and the SAA / cognition endpoints
+    "saa":            (r"SAA[-_ ]?Biospecimen|Biospecimen[-_ ]?Analysis[-_ ]?Results.*SAA|^SAA_", False),
+    "moca":           (r"Montreal[-_ ]?Cognitive", False),
+    "cogcat":         (r"Cognitive[-_ ]?Categori", False),
+    "genetics":       (r"genetic[-_ ]?consensus|Consensus[-_ ]?APOE|Genetic[-_ ]?Status", False),
 }
 _TABULAR = (".csv", ".txt", ".tsv", ".xlsx", ".xls")
 _LEVODOPA = re.compile(r"levodopa|sinemet|carbidopa|madopar|rytary|duopa|stalevo|benserazide|inbrija", re.I)
@@ -794,6 +799,227 @@ def merge_native(base: pd.DataFrame, native: pd.DataFrame, mode: str, log=print)
     if "source" not in base.columns:
         base = base.assign(source="amp_pd")
     out = pd.concat([base, add], ignore_index=True, sort=False)
+    return out
+
+
+# ── extras: SAA, NSD, cognition, genetics (path explorer §17) ──────────────
+
+_NSD_ORDER = ["0", "1A", "1B", "2A", "2B", "3", "4", "5", "6"]
+_UNTESTED = {"", "NAN", "NA", "N/A", "<NA>", "NONE", "NOT TESTED", "UNKNOWN", "UNK", "PENDING"}
+_NEGATIVE = {"NEGATIVE", "NEG", "0", "0.0", "WT", "NO", "NON-CARRIER", "NONCARRIER", "NOT CARRIER", "WILD TYPE", "WILDTYPE"}
+
+
+def _visit_months(df: pd.DataFrame) -> pd.Series:
+    """Numeric months for each row (scheduled EVENT_IDs, else INFODT since baseline)."""
+    v = _visit(df).astype(object).map(lambda x: x if isinstance(x, str) else "")
+    return pd.to_numeric(v.str.extract(r"M(-?\d+)", expand=False), errors="coerce")
+
+
+def _nsd_ordinal(v) -> float:
+    m = re.search(r"(\d[AB]?)", str(v).upper())
+    return float(_NSD_ORDER.index(m.group(1))) if m and m.group(1) in _NSD_ORDER else np.nan
+
+
+def _nsd_status(v) -> float:
+    s = str(v).strip().lower()
+    if s in ("", "nan", "none", "<na>"):
+        return np.nan
+    if s.startswith("non") or s in ("0", "0.0"):
+        return 0.0
+    if s.startswith("nsd") or s in ("1", "1.0"):
+        return 1.0
+    return np.nan            # "unable to be evaluated"
+
+
+def _saa(path, log) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """SAA Biospecimen Analysis Results -> (one row per participant, all results).
+
+    Status Positive / Negative / Inconclusive -> 1 / 0 / NaN; SAA_Type (Type 1 LBD-like,
+    Type 2 MSA-like); replicate kinetics (Fmax, TTT, T50) averaged over Rep1-3.  Where a
+    participant has several results the project-237 result with the most recent RUNDATE
+    is kept (user guide §8.5).  LONI serves PD participants only; HC and prodromal
+    results are sequestered and must be requested from ppmi@michaeljfox.org.
+    """
+    df = _read(path)
+    sc = _col(df, [r"^SAA_Status$", r"saa.*status", r"^Status$"])
+    if sc is None:
+        log(f"    [SAA] {_name(path)}: no SAA_Status column -> skipped")
+        return None
+    s = df[sc].astype(str).str.strip().str.lower()
+    out = pd.DataFrame({"participant_id": _pid(df)})
+    out["saa_status"] = np.where(s.str.startswith("pos"), 1.0, np.where(s.str.startswith("neg"), 0.0, np.nan))
+    out["saa_inconclusive"] = s.str.startswith("inc").astype(float).values
+    tc = _col(df, [r"^SAA_Type$", r"saa.*type"])
+    out["saa_type"] = df[tc].astype(str).str.strip().values if tc else pd.NA
+    for name, rx in (("saa_fmax", r"fmax"), ("saa_ttt", r"(^|_)ttt|time.*threshold"), ("saa_t50", r"(^|_)t50")):
+        cols = [c for c in df.columns if re.search(rx, str(c), re.I)]
+        out[name] = df[cols].apply(pd.to_numeric, errors="coerce").mean(axis=1).values if cols else np.nan
+    pc = _col(df, [r"^PROJECT"]); rc = _col(df, [r"^RUNDATE$", r"run.*date"])
+    ec = _col(df, [r"^CLINICAL_EVENT$", r"^EVENT_ID$"]); cc = _col(df, [r"^COHORT$", r"cohort"])
+    out["saa_project"] = _num(df[pc]).values if pc else np.nan
+    out["saa_rundate"] = _date(df[rc]).values if rc else pd.NaT
+    out["saa_event"] = df[ec].astype(str).str.strip().str.upper().values if ec else "BL"
+    out["saa_cohort"] = df[cc].astype(str).str.strip().values if cc else pd.NA
+    visits = out.copy()
+    per = (out.assign(_s=out["saa_status"].notna().astype(int), _p=(out["saa_project"] == 237).astype(int))
+              .sort_values(["participant_id", "_s", "_p", "saa_rundate"], ascending=[True, False, False, False])
+              .drop_duplicates("participant_id").drop(columns=["_s", "_p"]))
+    log(f"    [SAA] {_name(path)}: {len(visits)} results, {len(per)} participants; status "
+        f"{per['saa_status'].value_counts(dropna=False).to_dict()}; cohorts "
+        f"{per['saa_cohort'].value_counts().head(5).to_dict()}")
+    return per, visits
+
+
+def _curated_extras(path, log) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Curated Data Cut -> (participant-level constants, visit-level rows).
+
+    Participant level: NSD status / stage (ordinal 0..8 over Stage 0, 1A, 1B, 2A, 2B,
+    3, 4, 5, 6), adjudication, clinical stage, education, death, RBD screen, subgroup,
+    APOE.  Visit level: moca, cogstate when the cut carries them.
+    """
+    df = _read(path)
+    out = pd.DataFrame({"participant_id": _pid(df), "visit_month": _visit_months(df).values})
+    spec = {"nsd_status": [r"^NSD_Status$", r"^NSD$"], "nsd_stage_label": [r"^NSD_STAGE$", r"NSD[-_ ]?ISS"],
+            "nsd_adjudicated": [r"^NSD_Adjudicated$"], "clinical_stage": [r"^Clinical_Stage$"],
+            "educyrs": [r"^EDUCYRS$", r"^educ"], "death_status": [r"^Death_Status$"],
+            "death_date": [r"^Death_Date$"], "age_death": [r"^age_death$"], "hiq_rbd": [r"^HIQ_RBD$"],
+            "subgroup": [r"^subgroup$"], "moca": [r"^moca$", r"^MCATOT$"], "cogstate": [r"^cogstate$"],
+            "apoe": [r"^APOE$"]}
+    found = {}
+    for k, pats in spec.items():
+        c = _col(df, pats)
+        if c is None:
+            continue
+        found[k] = c
+        if k == "death_date":
+            out[k] = _date(df[c]).values
+        elif k in ("nsd_stage_label", "subgroup", "nsd_adjudicated", "clinical_stage", "apoe"):
+            out[k] = df[c].astype(str).str.strip().replace({"nan": pd.NA, "": pd.NA}).values
+        elif k == "nsd_status":
+            out[k] = df[c].map(_nsd_status).values
+        else:
+            out[k] = _num(df[c]).values
+    if "nsd_stage_label" in out.columns:
+        out["nsd_stage"] = out["nsd_stage_label"].map(_nsd_ordinal)
+    dc = _col(df, [r"^visit_date$", r"^INFODT$"])
+    out["visit_date"] = _date(df[dc]).values if dc else pd.NaT
+    const = [c for c in ("nsd_status", "nsd_stage", "nsd_stage_label", "nsd_adjudicated", "clinical_stage",
+                         "educyrs", "death_status", "death_date", "age_death", "hiq_rbd", "subgroup", "apoe")
+             if c in out.columns]
+    per = (out.groupby("participant_id")[const].first().reset_index() if const
+           else out[["participant_id"]].drop_duplicates())
+    log(f"    [curated extras] {_name(path)}: {len(per)} participants; columns {sorted(found)}"
+        + (f"; NSD status {per['nsd_status'].value_counts(dropna=False).to_dict()}" if "nsd_status" in per else "")
+        + (f"; NSD stage {per['nsd_stage_label'].value_counts().to_dict()}" if "nsd_stage_label" in per else ""))
+    return per, out
+
+
+def _moca(path, log) -> Optional[pd.DataFrame]:
+    df = _read(path)
+    c = _col(df, [r"^MCATOT$", r"^moca_?tot", r"^MOCA$", r"total"])
+    if c is None:
+        log(f"    [MoCA] {_name(path)}: no MCATOT column -> skipped")
+        return None
+    dc = _col(df, [r"^INFODT$"])
+    out = pd.DataFrame({"participant_id": _pid(df), "visit_month": _visit_months(df).values,
+                        "moca": _num(df[c]).values, "visit_date": _date(df[dc]).values if dc else pd.NaT})
+    out = out[(out["moca"] >= 0) & (out["moca"] <= 30)].dropna(subset=["visit_month"])
+    log(f"    [MoCA] {_name(path)}: {len(out)} scored visits, {out['participant_id'].nunique()} participants")
+    return out
+
+
+def _cogcat(path, log) -> Optional[pd.DataFrame]:
+    df = _read(path)
+    c = _col(df, [r"^COGSTATE$"])
+    if c is None:
+        log(f"    [cognitive categorization] {_name(path)}: no COGSTATE column -> skipped")
+        return None
+    dc = _col(df, [r"^INFODT$"])
+    out = pd.DataFrame({"participant_id": _pid(df), "visit_month": _visit_months(df).values,
+                        "cogstate": _num(df[c]).values, "visit_date": _date(df[dc]).values if dc else pd.NaT})
+    for k, rx in (("cogdecln", r"^COGDECLN$"), ("fncdtcog", r"^FNCDTCOG$"), ("cogdxcl", r"^COGDXCL$")):
+        cc = _col(df, [rx])
+        out[k] = _num(df[cc]).values if cc else np.nan
+    out = out[out["cogstate"].isin([1, 2, 3])].dropna(subset=["visit_month"])
+    log(f"    [cognitive categorization] {_name(path)}: {len(out)} visits, "
+        f"{out['participant_id'].nunique()} participants; COGSTATE {out['cogstate'].value_counts().to_dict()}")
+    return out
+
+
+def _genetics(path, log) -> Optional[pd.DataFrame]:
+    """Consensus APOE genotype and LRRK2 / GBA variant status -> one row per participant."""
+    df = _read(path)
+    out = pd.DataFrame({"participant_id": _pid(df)})
+    a = _col(df, [r"^APOE$", r"apoe"])
+    if a:
+        s = df[a].astype(str).str.upper().str.strip()
+        out["apoe"] = s.values
+        out["apoe_e4_count"] = np.where(s.str.contains(r"\d"), s.str.count("4"), np.nan)
+    for g in ("LRRK2", "GBA"):
+        c = _col(df, [rf"^{g}[-_ ]?POS", rf"^{g}[-_ ]?(STATUS|CARRIER|MUT)", rf"^{g}$", rf"^{g}[-_ ]"])
+        if c is None:
+            continue
+        num = _num(df[c])
+        if num.notna().mean() > 0.5:
+            out[f"{g.lower()}_carrier"] = (num > 0).astype(float).where(num.notna(), np.nan).values
+        else:
+            t = df[c].astype(str).str.strip().str.upper()
+            out[f"{g.lower()}_carrier"] = np.where(t.isin(_UNTESTED), np.nan,
+                                                   np.where(t.isin(_NEGATIVE) | t.str.contains(r"NEG|NOT |WILD|NO VARIANT"), 0.0, 1.0))
+    per = out.drop_duplicates("participant_id")
+    log(f"    [genetics] {_name(path)}: {len(per)} participants; "
+        + "; ".join(f"{c} carriers {int(np.nansum(per[c]))}" for c in ("lrrk2_carrier", "gba_carrier") if c in per)
+        + (f"; APOE e4 count {per['apoe_e4_count'].value_counts(dropna=False).to_dict()}" if "apoe_e4_count" in per else ""))
+    return per
+
+
+def load_ppmi_extras(root: Optional[str], log=print) -> Dict[str, Any]:
+    """SAA, curated NSD / education / death, MoCA, cognitive categorization and genetics
+    from the PPMI-native export folder.  Missing files are reported, never fatal."""
+    out: Dict[str, Any] = {"root": root, "files": {}, "saa": None, "saa_visits": None, "curated": None,
+                           "curated_visits": None, "moca": None, "cogcat": None, "genetics": None}
+    if not root or not Path(root).is_dir():
+        return out
+    files = find_files(root)
+    global _BL_DATES
+    if not _BL_DATES:
+        _BL_DATES = _baseline_dates([files.get("part3"), files.get("part1"), files.get("part2")])
+    log(f"  PPMI extras ({root}):")
+    for k in ("saa", "curated", "moca", "cogcat", "genetics"):
+        out["files"][k] = files.get(k)
+        log(f"    {k:<9}: {', '.join(_name(p) for p in files[k]) if files.get(k) else 'not found'}")
+
+    def _try(key, fn):
+        if not files.get(key):
+            return None
+        try:
+            return fn(files[key], log)
+        except Exception as e:                      # noqa: BLE001 - exploratory reader
+            log(f"    [{key}] {type(e).__name__}: {e}")
+            return None
+
+    r = _try("saa", _saa)
+    if r is not None:
+        out["saa"], out["saa_visits"] = r
+    r = _try("curated", _curated_extras)
+    if r is not None:
+        out["curated"], out["curated_visits"] = r
+    out["moca"] = _try("moca", _moca)
+    cv = out["curated_visits"]
+    if out["moca"] is None and cv is not None and "moca" in cv.columns and cv["moca"].notna().any():
+        out["moca"] = cv.loc[cv["moca"].notna(), ["participant_id", "visit_month", "moca", "visit_date"]].copy()
+        log(f"    [MoCA] from the curated data cut: {len(out['moca'])} scored visits")
+    out["cogcat"] = _try("cogcat", _cogcat)
+    if out["cogcat"] is None and cv is not None and "cogstate" in cv.columns and cv["cogstate"].notna().any():
+        out["cogcat"] = cv.loc[cv["cogstate"].isin([1, 2, 3]), ["participant_id", "visit_month", "cogstate", "visit_date"]].copy()
+        log(f"    [cognitive categorization] from the curated data cut: {len(out['cogcat'])} visits")
+    out["genetics"] = _try("genetics", _genetics)
+    cur = out["curated"]
+    if out["genetics"] is None and cur is not None and "apoe" in cur.columns:
+        s = cur["apoe"].astype(str).str.upper()
+        out["genetics"] = pd.DataFrame({"participant_id": cur["participant_id"], "apoe": s,
+                                        "apoe_e4_count": np.where(s.str.contains(r"\d"), s.str.count("4"), np.nan)})
+        log("    [genetics] APOE from the curated data cut")
     return out
 
 

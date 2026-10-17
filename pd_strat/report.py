@@ -484,6 +484,23 @@ def build_report(summary: Dict[str, Any]) -> str:
         if (FIG / "fig_prodromal_conversion_km.png").exists():
             L += ["", "![KM](figures/fig_prodromal_conversion_km.png)", ""]
 
+    # ── 5f. Path exploration ────────────────────────────────────────────
+    px = TAB / "path_exploration_summary.csv"
+    if px.exists():
+        L += ["## 5f. Path exploration: which extensions can the data on disk support?", ""]
+        L += ["Coverage, minimum detectable effect at 80 % power, and an exploratory signal computed on TRAIN "
+              "rows only (out-of-fold severity score for PD / HC, transported score for prodromal); holdout rows "
+              "are counted, never scored. Exploratory, not confirmatory. Per-path detail: `PATH_EXPLORATION.md`.", ""]
+        try:
+            d = pd.read_csv(px)
+            keep = [c for c in ("path", "data_on_disk", "n_all", "events_all", "mde_80pct", "exploratory_signal",
+                                "signal_lo", "signal_hi", "verdict") if c in d.columns]
+            L += _md_table(d[keep].to_dict("records"))
+        except Exception as e:                      # noqa: BLE001
+            L += [f"_could not read {px.name}: {e}_", ""]
+        if (FIG / "fig_path_exploration.png").exists():
+            L += ["", "![paths](figures/fig_path_exploration.png)", ""]
+
     # ── 7c. Confirmatory ────────────────────────────────────────────────
     cf = summary.get("confirmatory")
     if cf:

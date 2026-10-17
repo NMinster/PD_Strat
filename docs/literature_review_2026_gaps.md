@@ -62,6 +62,11 @@ exports (`S:/PPMI_clinical`), and the Curated Data Cut (columns include `NSD_Sta
   Clinical_Diagnosis; the SAA Biospecimen Analysis Results file (Projects 155/237,
   `SAA_Status`, `SAA_Type`, kinetic columns Fmax/TTT/T50 per replicate) from LONI
   Biospecimen → Biospecimen Analysis. Not yet downloaded: SAA results file.
+  **Access caveat (PPMI user guide §8.5):** LONI serves SAA results for PD participants
+  only; the HC and prodromal results are sequestered and released on written request to
+  ppmi@michaeljfox.org. Since PD cases are ≈ 90 % SAA+, the prodromal results are where
+  the discrimination lives, so file that request first. `pd_strat/explore_paths.py` (§17)
+  reports the coverage by cohort once the file is on disk.
 * **Analyses.** (a) SAA+ vs SAA− in prodromal + HC + PD pooled and within prodromal
   (where status is ≈ 50/50); (b) NSD-ISS stage as ordinal target (2B/3/4/5/6) with the
   severity score as candidate continuous anchor; (c) SAA kinetic parameters (Fmax, TTT)

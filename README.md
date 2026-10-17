@@ -329,6 +329,43 @@ Outputs: `prodromal_scores.csv`, `prodromal_conversion_cox.csv`,
 whose CI excludes 0 is the result that supports "predicts conversion beyond
 clinical assessment".
 
+### Path exploration (§17, report 5f): which extension can the data support?
+
+`pd_strat/explore_paths.py` audits the candidate extensions from
+`docs/literature_review_2026_gaps.md` against what is actually on disk. For
+each path it reports coverage (participants and events, by split and
+subgroup), the minimum effect detectable at 80 % power with that coverage, and
+an exploratory signal computed on TRAIN rows only: the out-of-fold severity
+score for PD / HC rows (GroupKFold refit of the primary model) and the
+transported score for prodromal rows. Holdout rows are counted, never scored,
+so running it does not spend the holdout.
+
+| path | needs | reads |
+|---|---|---|
+| P1 plasma → CSF α-synuclein SAA status / NSD-ISS stage | `SAA_Biospecimen_Analysis_Results` (Biospecimen Analysis; LONI serves PD only, HC + prodromal by request to ppmi@michaeljfox.org), Curated Data Cut (`NSD_Status`, `NSD_STAGE`) | AUROC score for SAA+ by cohort; Spearman vs stage and vs Fmax / time-to-threshold |
+| P2 prodromal conversion: arms, endpoint codes, DaT-negative, deaths | conversion table (§16), curated `Death_Status` | events per arm, AUROC within `prodromal_horizons_months[0]` per arm |
+| P3 dynamic prodromal proteomics | serial HT samples | participants / converters with ≥ 2 pre-conversion samples; AUROC of the score slope |
+| P4 cognition | `Montreal_Cognitive_Assessment`, `Cognitive_Categorization` (Non-motor Assessments), `iu_genetic_consensus` (APOE), curated `EDUCYRS` | baseline MoCA, MoCA slope, time to PD-MCI / dementia / MoCA < 21: Spearman, Cox HR per SD, AUROC |
+| P5 comparators | nothing new | NEFL, GFAP, TPK1, … and the UKB direction-weighted panel vs the score (UPDRS ρ, caudate DaT ρ, conversion AUROC) |
+| P6 plasma vs CSF | a second tissue under `proteomics_panels` | participants and same-visit pairs with both tissues |
+| P7 subgroups | genetics file (else curated `subgroup`) | PD by sex and carrier status; non-manifest carriers |
+
+It runs automatically after §16 and can be re-run on a finished results
+directory without recomputing the proteomic matrix:
+
+```
+python -m pd_strat.explore_paths --config config_ht.yaml --out_dir results_ht --ppmi_clinical_dir S:/PPMI_clinical
+```
+
+Outputs: `PATH_EXPLORATION.md` (summary table with verdicts and next steps,
+then every number per path), `tables/path_feasibility.csv`,
+`tables/path_exploration_summary.csv`, `figures/fig_path_exploration.png`.
+Verdicts: *needs data* (file not on disk), *underpowered on disk* (< 30 events
+or < 60 participants for the main contrast), *feasible; exploratory signal* /
+*feasible; no exploratory signal* (TRAIN-only CI excludes / includes the null).
+Nothing here is confirmatory; a feasible path still gets its own pre-specified
+analysis with the holdout evaluated once.
+
 ### Testing a panel from one run on another assay or cohort
 
 `--include_proteins` restricts modelling to a listed set of accessions, given as

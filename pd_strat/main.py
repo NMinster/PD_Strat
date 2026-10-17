@@ -255,6 +255,11 @@ def main():
     _stage("prodromal", run_prodromal, clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
            PANEL_COL_INDICES, USE_PANEL_AWARE, PRIMARY_LABEL, optional=True)
 
+    # ── §17 Path exploration (feasibility of the candidate extensions) ──
+    from .explore_paths import run_explore_paths
+    _stage("explore_paths", run_explore_paths, clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
+           PANEL_COL_INDICES, USE_PANEL_AWARE, PRIMARY_LABEL, prot_cols, optional=True)
+
     # ── §10 Robustness ────────────────────────────────────────────────
     if FLAGS.skip_robustness:
         print("\n[Robustness SKIPPED per --skip_robustness]")
