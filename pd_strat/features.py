@@ -166,6 +166,26 @@ def build_panel_aware_features(X: np.ndarray, M: np.ndarray,
     return Z_panel, fit_objs
 
 
+def primary_feature_builder(PANEL_COL_INDICES, USE_PANEL_AWARE, PRIMARY_LABEL,
+                            n_svd_panel: int = PANEL_SVD_NC, n_svd_mono: int = N_SVD):
+    """Return f(X, M, train_positions) -> Z for the *selected primary* model.
+
+    Monolithic representation for MonoRidgeSVD / HistGBT primaries, panel-aware
+    otherwise.  Used by every downstream module that needs to refit the primary
+    model on a different row subset (validity, robustness, progression).
+    """
+    mono = PRIMARY_LABEL.startswith("Mono") or PRIMARY_LABEL == "HistGBT"
+
+    def _build(X, M, train_positions, seed: int = SEED):
+        if USE_PANEL_AWARE and PANEL_COL_INDICES and not mono:
+            Z, _ = build_panel_aware_features(X, M, train_positions, PANEL_COL_INDICES,
+                                              n_svd_panel, seed=seed)
+        else:
+            Z, _ = build_monolithic_features(X, train_positions, n_svd_mono)
+        return Z
+    return _build
+
+
 def build_monolithic_features(X: np.ndarray, train_positions: np.ndarray,
                               n_svd: int = N_SVD,
                               fit_objects: Optional[Dict] = None,
