@@ -23,7 +23,6 @@ works on unique values and never expands a categorical to object.
 """
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -109,7 +108,6 @@ def read_olink(path: str) -> pd.DataFrame:
     cols = _wanted_columns(table_columns(path))
     low = {str(c).lower(): c for c in cols}
     if ext in (".parquet", ".pq"):
-        import pyarrow.parquet as pq
         import pyarrow.compute as pc
         import pyarrow.dataset as ds
         filt = None

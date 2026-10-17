@@ -59,14 +59,14 @@ from sklearn.ensemble import (RandomForestRegressor, ExtraTreesRegressor,
                               HistGradientBoostingClassifier)
 from sklearn.neural_network import MLPRegressor, MLPClassifier
 from sklearn.model_selection import RepeatedKFold, GridSearchCV, KFold, StratifiedKFold
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score
 
 from .config import (
     TAB, SEED, DISCOVERY_REPEATS, DISCOVERY_MIN_SPAN_MONTHS, DISCOVERY_PERMUTATIONS,
     DISCOVERY_MODELS, DISCOVERY_INNER_CV,
 )
 from .utils import map_participant_id, spearman_np, summary_update
-from .progression import _months, participant_slopes, _harrell_c
+from .progression import _months
 
 warnings.filterwarnings("ignore")
 

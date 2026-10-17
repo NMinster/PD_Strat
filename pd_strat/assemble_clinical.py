@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -343,7 +343,6 @@ def _load_med_history(path: str) -> Optional[pd.DataFrame]:
         out["on_other_dopaminergic"] = _yes(dopa_any)
     if ledd:
         out["ledd"] = pd.to_numeric(df[ledd], errors="coerce")
-    g = out.groupby("participant_id", as_index=False)
     aggs = {}
     for c in out.columns:
         if c == "participant_id":

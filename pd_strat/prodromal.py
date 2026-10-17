@@ -38,7 +38,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
-from .config import TAB, FIG, SEED, DISCOVERY_REPEATS, PRODROMAL_HORIZONS
+from .config import TAB, SEED, DISCOVERY_REPEATS, PRODROMAL_HORIZONS
 from .utils import map_participant_id, summary_update
 from .features import primary_feature_builder
 from .validity import _fit_predict
@@ -185,7 +185,7 @@ def run_prodromal(clin, z_prot, X, M, y_all, tv, cohort,
         if cols and (not tiers or cols != list(tiers.values())[-1]):
             tiers[name] = cols
     out["comparator_tiers"] = tiers
-    print(f"  comparator tiers: " + "; ".join(f"{k} = {v}" for k, v in tiers.items()))
+    print("  comparator tiers: " + "; ".join(f"{k} = {v}" for k, v in tiers.items()))
 
     # 1. Cox ---------------------------------------------------------------
     cox_rows = []

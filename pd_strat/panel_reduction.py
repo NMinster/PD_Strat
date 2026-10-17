@@ -18,7 +18,7 @@ RidgeCV representation so that weights back-project to individual proteins.
 
 from __future__ import annotations
 
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -27,8 +27,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD
 
 from .config import (
-    TAB, ROB, RIDGE_ALPHAS, Y_LO, Y_HI, N_SVD, SEED, STABILITY_B,
-    CUMULATIVE_K_GRID, LOCKED,
+    ROB, RIDGE_ALPHAS, Y_LO, Y_HI, N_SVD, SEED, STABILITY_B, CUMULATIVE_K_GRID,
+    LOCKED,
 )
 from .utils import (map_participant_id, spearman_np, full_metrics, summary_update,
                     load_protein_annotation)

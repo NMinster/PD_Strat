@@ -10,8 +10,8 @@ from typing import Dict, Any
 import numpy as np
 import pandas as pd
 
-from .config import TAB, Y_LO, Y_HI
-from .utils import map_participant_id, full_metrics, summary_update
+from .config import TAB
+from .utils import map_participant_id, summary_update
 
 SEVERITY_BANDS = {
     "mild_moderate": 32,
@@ -159,7 +159,7 @@ def run_severity_band_analysis(clin, y_all, train_idx_y, oof_pred,
                 df_dec_t.to_csv(TAB / "decile_analysis_test.csv", index=False)
 
         # Participant-level
-        print(f"\n  --- Participant-level severity bands ---")
+        print("\n  --- Participant-level severity bands ---")
         for p_tag, p_pos, p_preds, p_y in [
             ("OOF", train_idx_y, oof_pred, y_all[train_idx_y]),
             ("TEST", test_idx_omics,

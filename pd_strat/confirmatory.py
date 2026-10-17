@@ -21,7 +21,7 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 import pandas as pd
 
-from .config import TAB, ROB, LOCKED, PROGRESSION_MIN_VISITS, PROGRESSION_MIN_SPAN_MONTHS
+from .config import ROB, LOCKED, PROGRESSION_MIN_VISITS, PROGRESSION_MIN_SPAN_MONTHS
 from .utils import map_participant_id, summary_update, load_protein_annotation
 from .progression import _months
 

@@ -13,13 +13,13 @@ proteins and always paired with a distinct marker + label).
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
 
 from .config import FIG, TAB, ROB
-from .utils import spearman_np, summary
+from .utils import spearman_np
 
 # ── palette ─────────────────────────────────────────────────────────────────
 C_TRAIN, C_TEST, C_THIRD = "#2a78d6", "#eb6834", "#1baf7a"     # categorical 1-3

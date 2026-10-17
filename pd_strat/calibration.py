@@ -5,7 +5,7 @@ and participant-level evaluation (primary estimand).
 
 from __future__ import annotations
 
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -13,8 +13,7 @@ from scipy.stats import spearmanr, pearsonr
 
 from .config import TAB, Y_LO, Y_HI, SEED
 from .utils import (
-    map_participant_id, full_metrics, spearman_np, bootstrap_ci,
-    summary_update,
+    map_participant_id, full_metrics, bootstrap_ci, summary_update,
 )
 
 
@@ -273,7 +272,7 @@ def run_participant_level_eval(clin, y_all, train_idx_y, oof_pred,
             clin, train_idx_y, oof_pred, y_all[train_idx_y])
         plr_ci["OOF_participant_mean"] = ci
         if ci:
-            print(f"  OOF participant-mean 95% CI:")
+            print("  OOF participant-mean 95% CI:")
             for m in ("spearman", "mae"):
                 d = ci.get(m, {})
                 print(f"    {m}: {d.get('point',0):.3f} "
@@ -288,7 +287,7 @@ def run_participant_level_eval(clin, y_all, train_idx_y, oof_pred,
             clin, test_idx_omics, te_pred, y_te_full)
         plr_ci["TEST_participant_mean"] = ci_te
         if ci_te:
-            print(f"  TEST participant-mean 95% CI:")
+            print("  TEST participant-mean 95% CI:")
             for m in ("spearman", "mae"):
                 d = ci_te.get(m, {})
                 print(f"    {m}: {d.get('point',0):.3f} "

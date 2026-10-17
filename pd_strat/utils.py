@@ -10,15 +10,14 @@ import json
 import hashlib
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr, pearsonr
 
 from .config import (
-    CFG, TAB, MANIFEST_PATH, META_PATH, SEED, Y_LO, Y_HI,
-    PROT_COMPLETENESS_THRESHOLD, PROJECT_ROOT,
+    CFG, TAB, MANIFEST_PATH, SEED, PROJECT_ROOT,
 )
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗

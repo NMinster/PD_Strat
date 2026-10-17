@@ -22,7 +22,6 @@ Runs every pipeline stage in order:
 
 from __future__ import annotations
 
-import sys
 import time
 import traceback
 
@@ -130,13 +129,13 @@ def main():
 
     # ── §4  Targets, masks, CV ────────────────────────────────────────
     if SEVERITY_POPULATION == "pd_only":
-        print(f"\n[Population] severity model restricted to PD cases "
-              f"(severity_population=pd_only)")
+        print("\n[Population] severity model restricted to PD cases "
+              "(severity_population=pd_only)")
         is_train_sev = is_train & cohort["is_pd_flag"]
         is_test_sev = is_test & cohort["is_pd_flag"]
     elif SEVERITY_POPULATION == "pd_hc":
-        print(f"\n[Population] severity model restricted to PD cases + healthy "
-              f"controls; 'OTHER' case/control status excluded (severity_population=pd_hc)")
+        print("\n[Population] severity model restricted to PD cases + healthy "
+              "controls; 'OTHER' case/control status excluded (severity_population=pd_hc)")
         keep = cohort["is_pd_flag"] | cohort["is_control"]
         is_train_sev = is_train & keep
         is_test_sev = is_test & keep

@@ -19,7 +19,6 @@ cohort that also contains healthy controls:
 
 from __future__ import annotations
 
-import json
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
@@ -34,7 +33,7 @@ from .config import (
     PAIRED_BOOT_B, PLR_BOOT_B,
 )
 from .utils import (
-    map_participant_id, full_metrics, spearman_np, summary_update, flow_record,
+    map_participant_id, full_metrics, spearman_np, summary_update,
 )
 from .features import primary_feature_builder
 from .calibration import participant_level_metrics, participant_level_bootstrap_ci
@@ -608,7 +607,6 @@ def run_validity(clin, z_prot, X_prot, M_prot, y_all, tv, cohort,
     print(f"{'=' * 60}")
     train_idx_y, test_idx_omics = tv["train_idx_y"], tv["test_idx_omics"]
     prot_ok_test, groups_all = tv["prot_ok_test"], tv["groups_all"]
-    groups_train, gkf = tv["groups_train"], tv["gkf"]
     test_pred_omics = test_pred[prot_ok_test] if len(test_idx_omics) else np.array([])
     is_pd = cohort["is_pd_flag"].values.astype(bool)
     is_hc = cohort["is_control"].values.astype(bool)

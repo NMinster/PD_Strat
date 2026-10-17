@@ -26,7 +26,7 @@ locked confirmatory list (same-sign within-person effects in both cohorts).
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd

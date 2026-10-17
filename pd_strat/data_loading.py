@@ -22,20 +22,19 @@ import pandas as pd
 from .config import (
     CFG, TAB, TRAIN_PREFIX, TEST_PREFIX,
     PROTEOMICS_PANELS, PROT_QC_FILTER, PROT_COMPLETENESS_THRESHOLD,
-    HC_MODE, N_SVD, CFG_PROT_TARGET_N, SEED,
-    META_PATH, MANIFEST_PATH, CASE_CONTROL_PATH,
-    RNA_PATH, RNA_LOG1P,
-    FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
-    PROT_FEATURE_CAP, PROT_EXCLUDE, PROT_INCLUDE, PROTEOMICS_VISIT_MATCHING,
-    MULTI_TISSUE, PANEL_TISSUE,
-    RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES, RNA_SVD_NC,
+    HC_MODE, CFG_PROT_TARGET_N, META_PATH, MANIFEST_PATH,
+    CASE_CONTROL_PATH, RNA_PATH, RNA_LOG1P,
+    FEATURE_SELECTION, PROT_MIN_OBS_FRAC,
+    PROT_MIN_MAD, PROT_CORR_THRESH, PROT_FEATURE_CAP, PROT_EXCLUDE,
+    PROT_INCLUDE, PROTEOMICS_VISIT_MATCHING, MULTI_TISSUE, PANEL_TISSUE,
+    RNA_COMPLETENESS_THRESHOLD, RNA_TARGET_N_GENES,
     RNA_EXCLUDE_BATCHES, RNA_PREFILTER_GENES,
 )
 import warnings
 from .utils import (
     _to_str_index, choose_id, map_participant_id, infer_visit_code,
     resolve_column, short_sha, load_json, save_manifest,
-    apply_manifest, stable_top_features, flow_record, summary_update,
+    apply_manifest, stable_top_features, flow_record,
 )
 
 
@@ -638,12 +637,12 @@ def completeness_audit(z_prot: pd.DataFrame,
     print(f"  Total samples: {len(z_prot)}")
     print(f"  Total proteins: {z_prot.shape[1]}")
     print(f"  Overall missingness: {raw_miss.mean()*100:.1f}%")
-    print(f"\n  Per-sample completeness distribution:")
+    print("\n  Per-sample completeness distribution:")
     for q in [0, 10, 25, 50, 75, 90, 100]:
         val = np.nanpercentile(raw_obs.values, q)
         print(f"    P{q:3d}: {val*100:.1f}%")
 
-    print(f"\n  Samples passing completeness thresholds:")
+    print("\n  Samples passing completeness thresholds:")
     for thresh in [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
         n_pass_train = int((raw_obs[is_train] >= thresh).sum())
         n_pass_test  = int((raw_obs[is_test] >= thresh).sum())
@@ -652,7 +651,7 @@ def completeness_audit(z_prot: pd.DataFrame,
               f"TEST={n_pass_test}{marker}")
 
     if panel_presence:
-        print(f"\n  Per-panel presence:")
+        print("\n  Per-panel presence:")
         for pname, pseries in panel_presence.items():
             has_panel = (pseries > 0).sum()
             full_panel = (pseries >= 0.9).sum()

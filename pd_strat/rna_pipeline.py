@@ -16,13 +16,12 @@ from sklearn.model_selection import GroupKFold
 
 from .config import (
     CFG, TAB, LOCKED, RIDGE_ALPHAS, Y_LO, Y_HI, SEED,
-    RNA_COMPLETENESS_THRESHOLD, RNA_SVD_NC, PANEL_SVD_NC,
+    RNA_COMPLETENESS_THRESHOLD, RNA_SVD_NC,
 )
 from .utils import (
-    map_participant_id, full_metrics, spearman_np, summary_update,
+    full_metrics, summary_update,
 )
 from .features import svd_n_components
-from .calibration import participant_level_metrics
 
 
 def run_rna_pipeline(clin, X_rna, M_rna, d_rna, HAS_RNA,
@@ -40,7 +39,7 @@ def run_rna_pipeline(clin, X_rna, M_rna, d_rna, HAS_RNA,
 
     if not (HAS_RNA and d_rna >= 10 and len(train_idx_y) >= 20):
         if d_rna == 0:
-            print(f"\n[RNA pipeline SKIPPED -- no RNA data available]")
+            print("\n[RNA pipeline SKIPPED -- no RNA data available]")
         else:
             print(f"\n[RNA pipeline SKIPPED -- insufficient RNA (d_rna={d_rna})]")
         return {"rna_oof": rna_oof_results, "rna_test": rna_test_results,
@@ -146,7 +145,7 @@ def run_rna_pipeline(clin, X_rna, M_rna, d_rna, HAS_RNA,
 
     # Late Fusion
     if HAS_RNA_PIPELINE:
-        print(f"\n  --- Late Fusion: Protein + RNA Stacked ---")
+        print("\n  --- Late Fusion: Protein + RNA Stacked ---")
         prot_oof_full = np.full(len(clin), np.nan, dtype=np.float32)
         prot_oof_full[train_idx_y] = oof_pred
         rna_oof_full = np.full(len(clin), np.nan, dtype=np.float32)

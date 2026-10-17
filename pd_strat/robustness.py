@@ -6,10 +6,9 @@ coefficient stability, missingness diagnostics, confirmatory protein analysis.
 
 from __future__ import annotations
 
-import re
 import json
 import traceback
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -20,19 +19,17 @@ from sklearn.model_selection import GroupKFold
 from scipy.stats import chi2_contingency
 
 from .config import (
-    TAB, ROB, LOCKED, RIDGE_ALPHAS, ENET_L1_RATIOS,
-    Y_LO, Y_HI, N_SVD, PANEL_SVD_NC, SEED,
-    PROT_COMPLETENESS_THRESHOLD, CFG_PROT_TARGET_N, N_PERMUTATIONS,
-    FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD, PROT_CORR_THRESH,
-    PROT_FEATURE_CAP,
+    ROB, LOCKED, RIDGE_ALPHAS, Y_LO, Y_HI,
+    N_SVD, PANEL_SVD_NC, SEED, CFG_PROT_TARGET_N, N_PERMUTATIONS,
+    FEATURE_SELECTION, PROT_MIN_OBS_FRAC, PROT_MIN_MAD,
+    PROT_CORR_THRESH, PROT_FEATURE_CAP,
 )
 from .utils import (
-    map_participant_id, full_metrics, spearman_np, eta2, summary_update,
+    full_metrics, spearman_np, eta2, summary_update,
 )
 from .features import (
     svd_n_components, build_panel_aware_features, build_monolithic_features,
 )
-from .calibration import participant_level_metrics, participant_level_bootstrap_ci
 
 
 def _build_features_for_fold(X, M, train_pos,
@@ -120,7 +117,7 @@ def run_robustness(clin, z_prot, X_prot, M_prot, y_all,
 
     # ── 10c SVD dimension sweep ─────────────────────────────────────────
     sweep_dims = (8, 16, 32, 64) if (USE_PANEL_AWARE and not ROB_MONO) else (32, 64, 128, 256)
-    print(f"\n[10c] SVD dimension sweep")
+    print("\n[10c] SVD dimension sweep")
     for nd in sweep_dims:
         oof_d = np.full(len(train_idx_y), np.nan, dtype=np.float32)
         for _, (tr, va) in enumerate(gkf.split(train_idx_y, y_tr_nonan, groups_train)):
@@ -299,7 +296,7 @@ def run_robustness(clin, z_prot, X_prot, M_prot, y_all,
                 with contextlib.redirect_stdout(io.StringIO()):
                     Z_sel, _ = select_protein_features(
                         z_prot, fold_mask, PROT_MIN_OBS_FRAC, PROT_MIN_MAD,
-                        PROT_CORR_THRESH, PROT_FEATURE_CAP, f"PROT_fold")
+                        PROT_CORR_THRESH, PROT_FEATURE_CAP, "PROT_fold")
                 fold_ci = np.array([prot_cols_set[c] for c in Z_sel.columns])
             else:
                 z_ft = z_prot.iloc[fp]

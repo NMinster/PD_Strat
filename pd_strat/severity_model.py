@@ -5,12 +5,12 @@ and TRAIN->TEST evaluation for all candidate models.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
-from sklearn.linear_model import RidgeCV, ElasticNetCV, Ridge as RidgeModel
+from sklearn.linear_model import RidgeCV, ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD
 
@@ -20,8 +20,8 @@ from .config import (
     N_SVD, PANEL_SVD_NC, SEED,
 )
 from .utils import (
-    map_participant_id, full_metrics, spearman_np,
-    flow_record, summary_update,
+    map_participant_id, full_metrics, flow_record,
+    summary_update,
 )
 from .features import (
     svd_n_components, build_panel_aware_features, build_monolithic_features,
@@ -247,7 +247,7 @@ def run_primary_oof(X_prot, M_prot, y_all, train_idx_y, groups_train, gkf,
     # HistGradientBoosting baseline
     try:
         from sklearn.ensemble import HistGradientBoostingRegressor
-        print(f"\n  --- Hard baseline: HistGradientBoosting ---")
+        print("\n  --- Hard baseline: HistGradientBoosting ---")
         oof_gbt = np.full(len(train_idx_y), np.nan, dtype=np.float32)
         for fold, (tr, va) in enumerate(
                 gkf.split(train_idx_y, y_true_cv, groups_train), 1):
@@ -412,7 +412,7 @@ def run_covariate_baselines(clin, X_prot, M_prot, y_all,
     rho_cov = mets_cov.get("spearman", np.nan)
     rho_prot = covariate_results["proteomics_only"].get("spearman", np.nan)
     rho_comb = mets_comb.get("spearman", np.nan)
-    print(f"\n  INCREMENTAL GAIN (OOF):")
+    print("\n  INCREMENTAL GAIN (OOF):")
     print(f"    Covariates-only:  rho={rho_cov:.3f}")
     print(f"    Proteomics-only:  rho={rho_prot:.3f}")
     print(f"    Combined:         rho={rho_comb:.3f}")

@@ -14,7 +14,6 @@ establish it as a severity marker.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict, Any, List
 
 import numpy as np
