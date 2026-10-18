@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import re
 import json
-from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -17,10 +16,10 @@ from sklearn.metrics import silhouette_score, adjusted_mutual_info_score
 
 from .config import (
     TAB, LOCKED, SEED,
-    PROT_COMPLETENESS_THRESHOLD, K_SELECTION_METHOD, CLUSTER_ORDER_METHOD,
+    PROT_COMPLETENESS_THRESHOLD, K_SELECTION_METHOD,
 )
 from .utils import (
-    map_participant_id, spearman_np, eta2, flow_record, summary_update,
+    spearman_np, eta2, flow_record, summary_update,
 )
 from .features import svd_n_components
 from .data_loading import demographics_for
@@ -199,7 +198,7 @@ def run_msi_u_and_subtyping(clin, z_prot, X_prot, M_prot,
     Z_sub = Z_msi_tr.copy()
     y_sub = y_msi_train.copy()
     upsit_sub = upsit_all[msi_train_pos]
-    sub_demo = demo_msi_train.copy()
+    demo_msi_train.copy()
 
     ss = StandardScaler(with_mean=True, with_std=True)
     Zs = ss.fit_transform(Z_sub)

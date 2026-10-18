@@ -1,0 +1,53 @@
+# Curated PD plasma-proteomics literature proteins for the overlap analysis
+# (pd_strat/literature.py -> results/tables/literature_overlap.csv).
+#
+# Keys are UniProt accessions.  `verify: true` marks entries whose accession or
+# membership should be double-checked against the cited paper before use in
+# the manuscript.  Extend freely; the pipeline only needs `gene` and `source`.
+
+proteins:
+  # ── treatment-responsive: replication across cohorts is NOT evidence of severity
+  P20711:
+    gene: DDC
+    source: "Rutledge 2024 Acta Neuropathol (CSF); Pereira 2024 (plasma DDC rises with levodopa/DDCi); Minster & Jafri 2026 npj PD (PSI top protein)"
+    treatment_responsive: true
+    note: "Plasma elevation attributable to levodopa/DDC-inhibitor exposure"
+
+  # ── genetic / pQTL anchored
+  Q14956:
+    gene: GPNMB
+    source: "Diaz-Ortiz 2022 Science; npj PD 2026 bone-brain axis (MR/colocalization); CSF/plasma severity associations"
+  P28907:
+    gene: CD38
+    source: "pQTL-PD colocalization (manuscript evidence table)"
+  P15289:
+    gene: ARSA
+    source: "pQTL-PD colocalization (manuscript evidence table)"
+
+  # ── incumbent progression marker (only present if added via extra_biomarkers or on-panel)
+  P07196:
+    gene: NEFL
+    source: "Mollenhauer 2020 Mov Disord; EV-NfL 2025"
+    note: "Neurofilament light; blood progression comparator"
+
+  # ── replicated pre-diagnostic plasma proteins (medRxiv 2025.07.30.25332433, >=12 replicated in 3 cohorts)
+  P59282: {gene: TPPP2, source: "prediagnostic replicated set 2025"}
+  O60760: {gene: HPGDS, source: "prediagnostic replicated set 2025"}
+  P05186: {gene: ALPL, source: "prediagnostic replicated set 2025"}
+  Q13361: {gene: MFAP5, source: "prediagnostic replicated set 2025"}
+  Q9NZT2: {gene: OGFR, source: "prediagnostic replicated set 2025"}
+  Q9UKU7: {gene: ACAD8, source: "prediagnostic replicated set 2025"}
+  P56279: {gene: TCL1A, source: "prediagnostic replicated set 2025"}
+  O75487: {gene: GPC4, source: "prediagnostic replicated set 2025"}
+  Q16772: {gene: GSTA3, source: "prediagnostic replicated set 2025"}
+  P80188: {gene: LCN2, source: "prediagnostic replicated set 2025"}
+  P01116: {gene: KRAS, source: "prediagnostic replicated set 2025"}
+  P17302: {gene: GJA1, source: "prediagnostic replicated set 2025"}
+
+  # ── Hallqvist 2024 Nat Commun (iRBD 8-protein panel) — accessions to verify
+  P28799: {gene: GRN, source: "Hallqvist 2024 Nat Commun (8-protein panel)", verify: true}
+  P11021: {gene: HSPA5, source: "Hallqvist 2024 Nat Commun (8-protein panel)", verify: true}
+  P01024: {gene: C3, source: "Hallqvist 2024 (complement C3 correlates with UPDRS)", verify: true}
+
+  # ── proteins highlighted in the current manuscript (for cross-reference)
+  P06756: {gene: ITGAV, source: "this manuscript (top severity protein, integrin alpha-V)"}
